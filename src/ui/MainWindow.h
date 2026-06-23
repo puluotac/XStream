@@ -53,9 +53,11 @@ private:
     void browseSaveDir();
     void browseCameraSaveDir();
     void startCameraWorker();
-    void startCameraCapture();
-    void startCameraLivePreview();
-    void stopCameraCapture();
+    void snapCameraFrame();
+    void toggleCameraLivePreview();
+    void stopCameraLivePreview(bool restartAfterStop = false);
+    void applyCameraRoi();
+    void resetCameraRoiFullFrame();
     void updateCameraFrame(const CameraFrame& frame);
     void renderCameraPreviewWithCurrentWindow();
     void startReconstruction();
@@ -92,6 +94,8 @@ private:
     PreviewWindow currentReconPreviewWindow_;
     qint64 cameraPreviewFrameCount_ = 0;
     qint64 lastCameraPreviewRenderMs_ = 0;
+    bool cameraLiveRunning_ = false;
+    bool cameraRestartLiveAfterStop_ = false;
 
     QLineEdit* watchDirEdit_ = nullptr;
     QLineEdit* saveDirEdit_ = nullptr;
@@ -133,19 +137,16 @@ private:
 
     QDoubleSpinBox* cameraExposureSpin_ = nullptr;
     QComboBox* cameraExposureUnitCombo_ = nullptr;
+    QSpinBox* cameraRoiXSpin_ = nullptr;
+    QSpinBox* cameraRoiYSpin_ = nullptr;
     QSpinBox* cameraRoiWidthSpin_ = nullptr;
     QSpinBox* cameraRoiHeightSpin_ = nullptr;
-    QSpinBox* cameraFrameCountSpin_ = nullptr;
-    QSpinBox* cameraQueueCapacitySpin_ = nullptr;
-    QCheckBox* cameraFullFrameCheck_ = nullptr;
-    QCheckBox* cameraSaveRawCheck_ = nullptr;
-    QComboBox* cameraTriggerModeCombo_ = nullptr;
+    QPushButton* cameraApplyRoiButton_ = nullptr;
+    QPushButton* cameraResetRoiButton_ = nullptr;
     QLineEdit* cameraSaveDirEdit_ = nullptr;
     QLabel* cameraStateLabel_ = nullptr;
-    QLabel* cameraStatsLabel_ = nullptr;
-    QPushButton* cameraCaptureButton_ = nullptr;
+    QPushButton* cameraSnapButton_ = nullptr;
     QPushButton* cameraLiveButton_ = nullptr;
-    QPushButton* cameraStopButton_ = nullptr;
 
     ZoomPanImageView* cameraPreviewView_ = nullptr;
     ZoomPanImageView* reconPreviewView_ = nullptr;

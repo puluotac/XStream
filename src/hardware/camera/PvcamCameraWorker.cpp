@@ -257,12 +257,14 @@ int16 selectInternalExposureMode(int16 hcam)
     throw std::runtime_error("Camera does not report an internal timed exposure mode.");
 }
 
-rgn_type makeCenteredRoi(uns16 sensorWidth, uns16 sensorHeight, const PvcamCaptureSettings& settings)
+rgn_type makeExplicitRoi(uns16 sensorWidth, uns16 sensorHeight, const PvcamCaptureSettings& settings)
 {
-    const int roiWidth = settings.fullFrame ? sensorWidth : std::min<int>(settings.roiWidth, sensorWidth);
-    const int roiHeight = settings.fullFrame ? sensorHeight : std::min<int>(settings.roiHeight, sensorHeight);
-    const int x0 = (static_cast<int>(sensorWidth) - roiWidth) / 2;
-    const int y0 = (static_cast<int>(sensorHeight) - roiHeight) / 2;
+    const int maxX = std::max(0, static_cast<int>(sensorWidth) - 1);
+    const int maxY = std::max(0, static_cast<int>(sensorHeight) - 1);
+    const int x0 = std::clamp(settings.roiX, 0, maxX);
+    const int y0 = std::clamp(settings.roiY, 0, maxY);
+    const int roiWidth = std::clamp(settings.roiWidth, 1, static_cast<int>(sensorWidth) - x0);
+    const int roiHeight = std::clamp(settings.roiHeight, 1, static_cast<int>(sensorHeight) - y0);
 
     rgn_type roi {};
     roi.s1 = static_cast<uns16>(x0);
@@ -488,6 +490,8 @@ void PvcamCameraWorker::startCapture(const PvcamCaptureSettings& rawSettings)
     PvcamCaptureSettings settings = rawSettings;
     settings.frameCount = std::max(1, settings.frameCount);
     settings.exposureValue = std::max(0.001, settings.exposureValue);
+    settings.roiX = std::max(0, settings.roiX);
+    settings.roiY = std::max(0, settings.roiY);
     settings.roiWidth = std::max(1, settings.roiWidth);
     settings.roiHeight = std::max(1, settings.roiHeight);
     settings.queueCapacity = std::max(1, settings.queueCapacity);
@@ -514,7 +518,7 @@ void PvcamCameraWorker::startCapture(const PvcamCaptureSettings& rawSettings)
 
         const int cvType = cvTypeForImageFormat(imageFormat_);
         const int bytesPerPixel = bytesPerPixelForCvType(cvType);
-        const rgn_type roi = makeCenteredRoi(static_cast<uns16>(sensorWidth_), static_cast<uns16>(sensorHeight_), settings);
+        const rgn_type roi = makeExplicitRoi(static_cast<uns16>(sensorWidth_), static_cast<uns16>(sensorHeight_), settings);
         const int width = roiWidth(roi);
         const int height = roiHeight(roi);
         const int strideBytes = width * bytesPerPixel;
@@ -539,7 +543,9 @@ void PvcamCameraWorker::startCapture(const PvcamCaptureSettings& rawSettings)
             throw std::runtime_error("PVCAM returned fewer bytes than the selected ROI requires.");
         }
 
-        emit logMessage(QStringLiteral("Kinetix ROI %1x%2, bitDepth=%3, cvType=%4, stride=%5, frameBytes=%6.")
+        emit logMessage(QStringLiteral("Kinetix ROI x=%1 y=%2 w=%3 h=%4, bitDepth=%5, cvType=%6, stride=%7, frameBytes=%8.")
+            .arg(roi.s1)
+            .arg(roi.p1)
             .arg(width)
             .arg(height)
             .arg(bitDepth_)
@@ -608,7 +614,7 @@ void PvcamCameraWorker::startCapture(const PvcamCaptureSettings& rawSettings)
                 emit logMessage(QStringLiteral("Kinetix first frame acquired in %1 ms.").arg(acquisitionTimer.elapsed()));
             }
 
-            if (!settings.previewOnly && !queue_->push(frame))
+            if (!settings.previewOnly && !settings.saveRaw && !queue_->push(frame))
             {
                 ++droppedCount_;
                 throw std::runtime_error("Camera frame queue is full; capture stopped to avoid frame loss.");
@@ -644,7 +650,7 @@ void PvcamCameraWorker::startCapture(const PvcamCaptureSettings& rawSettings)
 
         capturing_.store(false);
         emit cameraStateChanged(QStringLiteral("Ready"));
-        emit captureFinished(!stopRequested_.load(), stopRequested_.load() ? QStringLiteral("Capture stopped.") : QStringLiteral("Capture completed."));
+        emit captureFinished(true, stopRequested_.load() ? QStringLiteral("Capture stopped.") : QStringLiteral("Capture completed."));
     }
     catch (const std::exception& ex)
     {

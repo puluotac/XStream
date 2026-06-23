@@ -25,9 +25,10 @@ struct PvcamCaptureSettings
     int frameCount = 10;
     double exposureValue = 10.0;
     PvcamExposureUnit exposureUnit = PvcamExposureUnit::Milliseconds;
-    int roiWidth = 512;
-    int roiHeight = 512;
-    bool fullFrame = false;
+    int roiX = 0;
+    int roiY = 0;
+    int roiWidth = 3200;
+    int roiHeight = 3200;
     int queueCapacity = 256;
     bool saveRaw = false;
     bool previewOnly = false;

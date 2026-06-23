@@ -122,7 +122,6 @@ MainWindow::MainWindow(QWidget* parent)
     cameraForm->setVerticalSpacing(4);
     cameraForm->setFieldGrowthPolicy(QFormLayout::AllNonFixedFieldsGrow);
     cameraStateLabel_ = new QLabel(QStringLiteral("Idle"), cameraGroup);
-    cameraStatsLabel_ = new QLabel(QStringLiteral("cap 0 / q 0 / use 0 / drop 0"), cameraGroup);
     cameraExposureSpin_ = makeSpin<QDoubleSpinBox>(cameraGroup, 0.001, 600000.0, 1.0);
     cameraExposureSpin_->setValue(10.0);
     cameraExposureSpin_->setDecimals(3);
@@ -135,19 +134,22 @@ MainWindow::MainWindow(QWidget* parent)
     cameraExposureLayout->addWidget(cameraExposureUnitCombo_);
     auto* cameraExposureWidget = new QWidget(cameraGroup);
     cameraExposureWidget->setLayout(cameraExposureLayout);
-    cameraRoiWidthSpin_ = makeSpin<QSpinBox>(cameraGroup, 1, 10000, 1);
-    cameraRoiWidthSpin_->setValue(512);
-    cameraRoiHeightSpin_ = makeSpin<QSpinBox>(cameraGroup, 1, 10000, 1);
-    cameraRoiHeightSpin_->setValue(512);
-    cameraFrameCountSpin_ = makeSpin<QSpinBox>(cameraGroup, 1, 1000000, 1);
-    cameraFrameCountSpin_->setValue(10);
-    cameraQueueCapacitySpin_ = makeSpin<QSpinBox>(cameraGroup, 1, 100000, 1);
-    cameraQueueCapacitySpin_->setValue(256);
-    cameraFullFrameCheck_ = new QCheckBox(QStringLiteral("Full Frame"), cameraGroup);
-    cameraSaveRawCheck_ = new QCheckBox(QStringLiteral("Save TIFF"), cameraGroup);
-    cameraTriggerModeCombo_ = new QComboBox(cameraGroup);
-    cameraTriggerModeCombo_->addItems({ "Internal", "External (reserved)" });
-    cameraTriggerModeCombo_->setCurrentText(QStringLiteral("Internal"));
+    cameraRoiXSpin_ = makeSpin<QSpinBox>(cameraGroup, 0, 3199, 1);
+    cameraRoiYSpin_ = makeSpin<QSpinBox>(cameraGroup, 0, 3199, 1);
+    cameraRoiWidthSpin_ = makeSpin<QSpinBox>(cameraGroup, 1, 3200, 1);
+    cameraRoiHeightSpin_ = makeSpin<QSpinBox>(cameraGroup, 1, 3200, 1);
+    cameraRoiXSpin_->setValue(0);
+    cameraRoiYSpin_->setValue(0);
+    cameraRoiWidthSpin_->setValue(3200);
+    cameraRoiHeightSpin_->setValue(3200);
+    cameraApplyRoiButton_ = new QPushButton(QStringLiteral("Apply ROI"), cameraGroup);
+    cameraResetRoiButton_ = new QPushButton(QStringLiteral("Reset Full"), cameraGroup);
+    auto* cameraRoiButtonLayout = new QHBoxLayout();
+    cameraRoiButtonLayout->setContentsMargins(0, 0, 0, 0);
+    cameraRoiButtonLayout->addWidget(cameraApplyRoiButton_);
+    cameraRoiButtonLayout->addWidget(cameraResetRoiButton_);
+    auto* cameraRoiButtonWidget = new QWidget(cameraGroup);
+    cameraRoiButtonWidget->setLayout(cameraRoiButtonLayout);
     cameraSaveDirEdit_ = new QLineEdit(QStringLiteral("E:/2026_Chun/2026_06_09/pvcam_capture_test"), cameraGroup);
     cameraSaveDirEdit_->setMinimumWidth(120);
     auto* cameraSaveBrowse = new QPushButton(QStringLiteral("..."), cameraGroup);
@@ -157,27 +159,21 @@ MainWindow::MainWindow(QWidget* parent)
     cameraSaveLayout->addWidget(cameraSaveBrowse);
     auto* cameraSaveWidget = new QWidget(cameraGroup);
     cameraSaveWidget->setLayout(cameraSaveLayout);
-    cameraCaptureButton_ = new QPushButton(QStringLiteral("Capture"), cameraGroup);
-    cameraLiveButton_ = new QPushButton(QStringLiteral("Live"), cameraGroup);
-    cameraStopButton_ = new QPushButton(QStringLiteral("Stop"), cameraGroup);
-    cameraStopButton_->setEnabled(false);
+    cameraSnapButton_ = new QPushButton(QStringLiteral("Snap"), cameraGroup);
+    cameraLiveButton_ = new QPushButton(QStringLiteral("Open Live"), cameraGroup);
     auto* cameraButtonLayout = new QHBoxLayout();
     cameraButtonLayout->setContentsMargins(0, 0, 0, 0);
-    cameraButtonLayout->addWidget(cameraCaptureButton_);
+    cameraButtonLayout->addWidget(cameraSnapButton_);
     cameraButtonLayout->addWidget(cameraLiveButton_);
-    cameraButtonLayout->addWidget(cameraStopButton_);
     auto* cameraButtonWidget = new QWidget(cameraGroup);
     cameraButtonWidget->setLayout(cameraButtonLayout);
     cameraForm->addRow(QStringLiteral("State"), cameraStateLabel_);
-    cameraForm->addRow(QStringLiteral("Stats"), cameraStatsLabel_);
     cameraForm->addRow(QStringLiteral("Exposure"), cameraExposureWidget);
-    cameraForm->addRow(QStringLiteral("ROI W"), cameraRoiWidthSpin_);
-    cameraForm->addRow(QStringLiteral("ROI H"), cameraRoiHeightSpin_);
-    cameraForm->addRow(QStringLiteral("Frames"), cameraFrameCountSpin_);
-    cameraForm->addRow(QStringLiteral("Queue"), cameraQueueCapacitySpin_);
-    cameraForm->addRow(cameraFullFrameCheck_);
-    cameraForm->addRow(QStringLiteral("Trigger"), cameraTriggerModeCombo_);
-    cameraForm->addRow(cameraSaveRawCheck_);
+    cameraForm->addRow(QStringLiteral("ROI X"), cameraRoiXSpin_);
+    cameraForm->addRow(QStringLiteral("ROI Y"), cameraRoiYSpin_);
+    cameraForm->addRow(QStringLiteral("Width"), cameraRoiWidthSpin_);
+    cameraForm->addRow(QStringLiteral("Height"), cameraRoiHeightSpin_);
+    cameraForm->addRow(cameraRoiButtonWidget);
     cameraForm->addRow(QStringLiteral("Save Dir"), cameraSaveWidget);
     cameraForm->addRow(cameraButtonWidget);
     hardwareLayout->addWidget(cameraGroup);
@@ -490,9 +486,10 @@ MainWindow::MainWindow(QWidget* parent)
     updateMotorUiEnabled();
     QTimer::singleShot(0, this, &MainWindow::requestMotorConnect);
 
-    connect(cameraCaptureButton_, &QPushButton::clicked, this, &MainWindow::startCameraCapture);
-    connect(cameraLiveButton_, &QPushButton::clicked, this, &MainWindow::startCameraLivePreview);
-    connect(cameraStopButton_, &QPushButton::clicked, this, &MainWindow::stopCameraCapture);
+    connect(cameraSnapButton_, &QPushButton::clicked, this, &MainWindow::snapCameraFrame);
+    connect(cameraLiveButton_, &QPushButton::clicked, this, &MainWindow::toggleCameraLivePreview);
+    connect(cameraApplyRoiButton_, &QPushButton::clicked, this, &MainWindow::applyCameraRoi);
+    connect(cameraResetRoiButton_, &QPushButton::clicked, this, &MainWindow::resetCameraRoiFullFrame);
     connect(startButton_, &QPushButton::clicked, this, &MainWindow::startReconstruction);
     connect(stopButton_, &QPushButton::clicked, this, &MainWindow::stopReconstruction);
     connect(saveButton_, &QPushButton::clicked, this, &MainWindow::saveSlices);
@@ -736,36 +733,32 @@ void MainWindow::startCameraWorker()
         cameraStateLabel_->setText(state);
     });
     connect(cameraWorker_, &PvcamCameraWorker::frameReady, this, &MainWindow::updateCameraFrame);
-    connect(cameraWorker_, &PvcamCameraWorker::captureStatsChanged, this, [this](qint64 captured, int queued, qint64 consumed, qint64 dropped) {
-        if (shuttingDown_) { return; }
-        cameraStatsLabel_->setText(QStringLiteral("cap %1 / q %2 / use %3 / drop %4")
-            .arg(captured)
-            .arg(queued)
-            .arg(consumed)
-            .arg(dropped));
-    });
     connect(cameraWorker_, &PvcamCameraWorker::logMessage, this, &MainWindow::appendLog);
     connect(cameraWorker_, &PvcamCameraWorker::captureFinished, this, [this](bool ok, const QString& message) {
         if (shuttingDown_) { return; }
-        cameraCaptureButton_->setEnabled(true);
+        const bool shouldRestartLive = cameraRestartLiveAfterStop_;
+        cameraRestartLiveAfterStop_ = false;
+        cameraLiveRunning_ = false;
+        cameraSnapButton_->setEnabled(true);
         cameraLiveButton_->setEnabled(true);
-        cameraStopButton_->setEnabled(false);
+        cameraLiveButton_->setText(QStringLiteral("Open Live"));
+        cameraApplyRoiButton_->setEnabled(true);
+        cameraResetRoiButton_->setEnabled(true);
         appendLog(QStringLiteral("Kinetix capture %1: %2").arg(ok ? QStringLiteral("ok") : QStringLiteral("failed"), message));
+        if (shouldRestartLive && ok)
+        {
+            toggleCameraLivePreview();
+        }
     });
     cameraThread_.start();
     QMetaObject::invokeMethod(cameraWorker_, "warmOpen", Qt::QueuedConnection);
 }
 
-void MainWindow::startCameraCapture()
+void MainWindow::snapCameraFrame()
 {
     if (!cameraWorker_)
     {
         appendLog(QStringLiteral("Kinetix worker is unavailable."));
-        return;
-    }
-    if (cameraTriggerModeCombo_->currentText().startsWith(QStringLiteral("External")))
-    {
-        appendLog(QStringLiteral("External trigger mode is reserved for the next integration step; using internal mode only now."));
         return;
     }
 
@@ -777,72 +770,28 @@ void MainWindow::startCameraCapture()
     cameraPreviewFitInitialized_ = false;
     cameraPreviewView_->setImage(QPixmap());
     cameraPreviewView_->resetTransform();
-    cameraCaptureButton_->setEnabled(false);
+    cameraSnapButton_->setEnabled(false);
     cameraLiveButton_->setEnabled(false);
-    cameraStopButton_->setEnabled(true);
-
-    PvcamCaptureSettings settings;
-    settings.frameCount = cameraFrameCountSpin_->value();
-    settings.exposureValue = cameraExposureSpin_->value();
-    settings.exposureUnit = cameraExposureUnitFromText(cameraExposureUnitCombo_->currentText());
-    settings.roiWidth = cameraRoiWidthSpin_->value();
-    settings.roiHeight = cameraRoiHeightSpin_->value();
-    settings.fullFrame = cameraFullFrameCheck_->isChecked();
-    settings.queueCapacity = cameraQueueCapacitySpin_->value();
-    settings.saveRaw = cameraSaveRawCheck_->isChecked();
-    settings.outputDir = cameraSaveDirEdit_->text();
-
-    appendLog(QStringLiteral("Starting Kinetix capture..."));
-    QMetaObject::invokeMethod(
-        cameraWorker_,
-        "startCapture",
-        Qt::QueuedConnection,
-        Q_ARG(ct::PvcamCaptureSettings, settings));
-}
-
-void MainWindow::startCameraLivePreview()
-{
-    if (!cameraWorker_)
-    {
-        appendLog(QStringLiteral("Kinetix worker is unavailable."));
-        return;
-    }
-    if (cameraTriggerModeCombo_->currentText().startsWith(QStringLiteral("External")))
-    {
-        appendLog(QStringLiteral("External trigger mode is reserved for the next integration step; using internal live preview now."));
-        return;
-    }
-
-    lastRawCameraFrame_.release();
-    currentCameraPreviewWindow_ = {};
-    cameraPreviewFrameCount_ = 0;
-    lastCameraPreviewRenderMs_ = 0;
-    cameraHistogramWidget_->resetWindow();
-    cameraPreviewFitInitialized_ = false;
-    cameraPreviewView_->setImage(QPixmap());
-    cameraPreviewView_->resetTransform();
-    cameraCaptureButton_->setEnabled(false);
-    cameraLiveButton_->setEnabled(false);
-    cameraStopButton_->setEnabled(true);
+    cameraApplyRoiButton_->setEnabled(false);
+    cameraResetRoiButton_->setEnabled(false);
 
     PvcamCaptureSettings settings;
     settings.frameCount = 1;
     settings.exposureValue = cameraExposureSpin_->value();
     settings.exposureUnit = cameraExposureUnitFromText(cameraExposureUnitCombo_->currentText());
+    settings.roiX = cameraRoiXSpin_->value();
+    settings.roiY = cameraRoiYSpin_->value();
     settings.roiWidth = cameraRoiWidthSpin_->value();
     settings.roiHeight = cameraRoiHeightSpin_->value();
-    settings.fullFrame = cameraFullFrameCheck_->isChecked();
     settings.queueCapacity = 1;
-    settings.saveRaw = false;
-    settings.previewOnly = true;
+    settings.saveRaw = true;
     settings.outputDir = cameraSaveDirEdit_->text();
 
-    appendLog(QStringLiteral("Starting Kinetix live preview: exposure=%1 %2, ROI=%3x%4%5.")
-        .arg(settings.exposureValue)
-        .arg(cameraExposureUnitCombo_->currentText())
+    appendLog(QStringLiteral("Snapping one Kinetix frame: ROI x=%1 y=%2 w=%3 h=%4.")
+        .arg(settings.roiX)
+        .arg(settings.roiY)
         .arg(settings.roiWidth)
-        .arg(settings.roiHeight)
-        .arg(settings.fullFrame ? QStringLiteral(", full frame") : QString()));
+        .arg(settings.roiHeight));
     QMetaObject::invokeMethod(
         cameraWorker_,
         "startCapture",
@@ -850,13 +799,102 @@ void MainWindow::startCameraLivePreview()
         Q_ARG(ct::PvcamCaptureSettings, settings));
 }
 
-void MainWindow::stopCameraCapture()
+void MainWindow::toggleCameraLivePreview()
+{
+    if (!cameraWorker_)
+    {
+        appendLog(QStringLiteral("Kinetix worker is unavailable."));
+        return;
+    }
+
+    if (cameraLiveRunning_)
+    {
+        stopCameraLivePreview(false);
+        return;
+    }
+
+    lastRawCameraFrame_.release();
+    currentCameraPreviewWindow_ = {};
+    cameraPreviewFrameCount_ = 0;
+    lastCameraPreviewRenderMs_ = 0;
+    cameraHistogramWidget_->resetWindow();
+    cameraPreviewFitInitialized_ = false;
+    cameraPreviewView_->setImage(QPixmap());
+    cameraPreviewView_->resetTransform();
+    cameraSnapButton_->setEnabled(false);
+    cameraLiveButton_->setEnabled(true);
+    cameraLiveButton_->setText(QStringLiteral("Close Live"));
+    cameraApplyRoiButton_->setEnabled(true);
+    cameraResetRoiButton_->setEnabled(true);
+    cameraLiveRunning_ = true;
+
+    PvcamCaptureSettings settings;
+    settings.frameCount = 1;
+    settings.exposureValue = cameraExposureSpin_->value();
+    settings.exposureUnit = cameraExposureUnitFromText(cameraExposureUnitCombo_->currentText());
+    settings.roiX = cameraRoiXSpin_->value();
+    settings.roiY = cameraRoiYSpin_->value();
+    settings.roiWidth = cameraRoiWidthSpin_->value();
+    settings.roiHeight = cameraRoiHeightSpin_->value();
+    settings.queueCapacity = 1;
+    settings.saveRaw = false;
+    settings.previewOnly = true;
+    settings.outputDir = cameraSaveDirEdit_->text();
+
+    appendLog(QStringLiteral("Opening Kinetix live preview: exposure=%1 %2, ROI x=%3 y=%4 w=%5 h=%6.")
+        .arg(settings.exposureValue)
+        .arg(cameraExposureUnitCombo_->currentText())
+        .arg(settings.roiX)
+        .arg(settings.roiY)
+        .arg(settings.roiWidth)
+        .arg(settings.roiHeight));
+    QMetaObject::invokeMethod(
+        cameraWorker_,
+        "startCapture",
+        Qt::QueuedConnection,
+        Q_ARG(ct::PvcamCaptureSettings, settings));
+}
+
+void MainWindow::stopCameraLivePreview(bool restartAfterStop)
 {
     if (!cameraWorker_)
     {
         return;
     }
+    cameraRestartLiveAfterStop_ = restartAfterStop;
+    cameraLiveButton_->setEnabled(false);
+    cameraSnapButton_->setEnabled(false);
+    cameraApplyRoiButton_->setEnabled(false);
+    cameraResetRoiButton_->setEnabled(false);
     QMetaObject::invokeMethod(cameraWorker_, "stopCapture", Qt::DirectConnection);
+}
+
+void MainWindow::applyCameraRoi()
+{
+    const int sensorWidth = 3200;
+    const int sensorHeight = 3200;
+    const int x = std::clamp(cameraRoiXSpin_->value(), 0, sensorWidth - 1);
+    const int y = std::clamp(cameraRoiYSpin_->value(), 0, sensorHeight - 1);
+    const int width = std::clamp(cameraRoiWidthSpin_->value(), 1, sensorWidth - x);
+    const int height = std::clamp(cameraRoiHeightSpin_->value(), 1, sensorHeight - y);
+    cameraRoiXSpin_->setValue(x);
+    cameraRoiYSpin_->setValue(y);
+    cameraRoiWidthSpin_->setValue(width);
+    cameraRoiHeightSpin_->setValue(height);
+    appendLog(QStringLiteral("Applied Kinetix ROI x=%1 y=%2 w=%3 h=%4.").arg(x).arg(y).arg(width).arg(height));
+    if (cameraLiveRunning_)
+    {
+        stopCameraLivePreview(true);
+    }
+}
+
+void MainWindow::resetCameraRoiFullFrame()
+{
+    cameraRoiXSpin_->setValue(0);
+    cameraRoiYSpin_->setValue(0);
+    cameraRoiWidthSpin_->setValue(3200);
+    cameraRoiHeightSpin_->setValue(3200);
+    applyCameraRoi();
 }
 
 void MainWindow::updateCameraFrame(const CameraFrame& frame)

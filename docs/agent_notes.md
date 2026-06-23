@@ -60,6 +60,7 @@ ctest --test-dir build\vs2022-release --output-on-failure -C Release
 - PVCAM internal capture now normalizes `PARAM_EXP_RES` to millisecond units before `pl_exp_setup_seq` and converts UI exposure milliseconds to the active PVCAM units. On the beamline Kinetix, leaving exposure resolution implicit can make sequence acquisition set up successfully but stay in `EXPOSURE_IN_PROGRESS` until timeout. The worker also logs the selected exposure mode and resolution.
 - Kinetix exposure UI is `value + unit` (`us/ms/s`). The worker preserves physical exposure time by selecting the requested PVCAM exposure resolution when available, otherwise falling back to milliseconds and converting units.
 - Kinetix camera worker now uses a hot-open PVCAM session. `warmOpen()` runs after the camera thread starts, normal Live/Capture completion only uninitializes the sequence and leaves the camera open, and `shutdown()` closes the camera in the worker thread. Errors close the hot session so the next run can reopen cleanly.
+- Kinetix UI is intentionally reduced for current production: explicit ROI (`X/Y/Width/Height`) defaults to full frame `0/0/3200/3200`; `Snap` saves one TIFF; Live is a single Open/Close toggle. Frames/Queue/Stats/Full Frame/Trigger/Save TIFF UI were removed, but low-level frame queue code remains for future real-time CT integration.
 
 ## Known Pitfall
 
