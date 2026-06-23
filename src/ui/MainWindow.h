@@ -89,11 +89,13 @@ private:
     bool shuttingDown_ = false;
     AppConfig sessionConfig_ = AppConfig::defaults();
     cv::Mat lastRawCameraFrame_;
+    cv::Mat lastCameraSaveFrame_;
     cv::Mat lastRawReconPreviewSlice_;
     PreviewWindow currentCameraPreviewWindow_;
     PreviewWindow currentReconPreviewWindow_;
     qint64 cameraPreviewFrameCount_ = 0;
     qint64 lastCameraPreviewRenderMs_ = 0;
+    qint64 cameraSnapSaveIndex_ = 0;
     bool cameraLiveRunning_ = false;
     bool cameraRestartLiveAfterStop_ = false;
 

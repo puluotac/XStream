@@ -35,8 +35,12 @@
 
 #include <cuda_runtime.h>
 
+#include <opencv2/imgcodecs.hpp>
+
 #include <algorithm>
 #include <cmath>
+#include <iomanip>
+#include <sstream>
 
 namespace ct
 {
@@ -89,6 +93,22 @@ PvcamExposureUnit cameraExposureUnitFromText(const QString& text)
         return PvcamExposureUnit::Seconds;
     }
     return PvcamExposureUnit::Milliseconds;
+}
+
+QString nextCameraSnapPath(const QString& outputDir, qint64& nextIndex)
+{
+    QDir dir(outputDir);
+    for (int attempt = 0; attempt < 1000000; ++attempt)
+    {
+        std::ostringstream name;
+        name << "kinetix_frame_" << std::setw(6) << std::setfill('0') << nextIndex++ << ".tiff";
+        const QString path = dir.filePath(QString::fromStdString(name.str()));
+        if (!QFileInfo::exists(path))
+        {
+            return path;
+        }
+    }
+    return dir.filePath(QStringLiteral("kinetix_frame_latest.tiff"));
 }
 
 } // namespace
@@ -762,7 +782,32 @@ void MainWindow::snapCameraFrame()
         return;
     }
 
+    if (cameraLiveRunning_)
+    {
+        if (lastCameraSaveFrame_.empty())
+        {
+            appendLog(QStringLiteral("No Kinetix live frame is available yet; wait for the first preview frame before Snap."));
+            return;
+        }
+        const QString outputDir = cameraSaveDirEdit_->text();
+        QDir().mkpath(outputDir);
+        if (!QFileInfo(outputDir).isDir())
+        {
+            appendLog(QStringLiteral("Kinetix snap failed: output directory is unavailable."));
+            return;
+        }
+        const QString framePath = nextCameraSnapPath(outputDir, cameraSnapSaveIndex_);
+        if (!cv::imwrite(framePath.toStdString(), lastCameraSaveFrame_))
+        {
+            appendLog(QStringLiteral("Kinetix snap failed: could not save %1.").arg(framePath));
+            return;
+        }
+        appendLog(QStringLiteral("Kinetix live snap saved: %1.").arg(framePath));
+        return;
+    }
+
     lastRawCameraFrame_.release();
+    lastCameraSaveFrame_.release();
     currentCameraPreviewWindow_ = {};
     cameraPreviewFrameCount_ = 0;
     lastCameraPreviewRenderMs_ = 0;
@@ -814,6 +859,7 @@ void MainWindow::toggleCameraLivePreview()
     }
 
     lastRawCameraFrame_.release();
+    lastCameraSaveFrame_.release();
     currentCameraPreviewWindow_ = {};
     cameraPreviewFrameCount_ = 0;
     lastCameraPreviewRenderMs_ = 0;
@@ -821,7 +867,7 @@ void MainWindow::toggleCameraLivePreview()
     cameraPreviewFitInitialized_ = false;
     cameraPreviewView_->setImage(QPixmap());
     cameraPreviewView_->resetTransform();
-    cameraSnapButton_->setEnabled(false);
+    cameraSnapButton_->setEnabled(true);
     cameraLiveButton_->setEnabled(true);
     cameraLiveButton_->setText(QStringLiteral("Close Live"));
     cameraApplyRoiButton_->setEnabled(true);
@@ -905,6 +951,7 @@ void MainWindow::updateCameraFrame(const CameraFrame& frame)
     }
 
     ++cameraPreviewFrameCount_;
+    lastCameraSaveFrame_ = frame.image.clone();
     frame.image.convertTo(lastRawCameraFrame_, CV_32F);
 
     const bool initializeWindow =
