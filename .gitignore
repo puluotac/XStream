@@ -1,0 +1,70 @@
+# Build outputs
+build/
+out/
+bin/
+lib/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+compile_commands.json
+install_manifest.txt
+
+# Visual Studio / IDE state
+.vs/
+.vscode/
+.idea/
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+*.VC.db
+*.VC.VC.opendb
+
+# Generated binaries and deployment artifacts
+*.exe
+*.dll
+*.lib
+*.pdb
+*.ilk
+*.obj
+*.exp
+*.manifest
+*.qmlc
+*.jsc
+platforms/
+imageformats/
+iconengines/
+styles/
+tls/
+generic/
+networkinformation/
+
+# CT data and reconstruction outputs
+*.tif
+*.tiff
+*.raw
+*.mhd
+*.nrrd
+*.h5
+*.hdf5
+*.nii
+*.nii.gz
+recon_params.json
+Slice_*/
+Tomo_*/
+Flat_*/
+Dark_*/
+output/
+outputs/
+captures/
+
+# Logs and temporary files
+*.log
+*.tmp
+*.bak
+*.cache
+cmake_configure.log
+
+# OS files
+Thumbs.db
+Desktop.ini

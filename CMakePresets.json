@@ -1,0 +1,62 @@
+{
+  "version": 6,
+  "cmakeMinimumRequired": {
+    "major": 3,
+    "minor": 26,
+    "patch": 0
+  },
+  "configurePresets": [
+    {
+      "name": "vs2022-base",
+      "hidden": true,
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/${presetName}",
+      "cacheVariables": {
+        "CMAKE_MAKE_PROGRAM": "E:/Qt/Tools/Ninja/ninja.exe",
+        "CMAKE_PREFIX_PATH": "E:/Qt/6.10.1/msvc2022_64;E:/OpenCV/build",
+        "OpenCV_DIR": "E:/OpenCV/build",
+        "CMAKE_CUDA_ARCHITECTURES": "native",
+        "CMAKE_CXX_FLAGS": "/utf-8",
+        "CMAKE_CUDA_FLAGS": "-Xcompiler=/utf-8"
+      }
+    },
+    {
+      "name": "vs2022-debug",
+      "inherits": "vs2022-base",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug"
+      }
+    },
+    {
+      "name": "vs2022-release",
+      "inherits": "vs2022-base",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release"
+      }
+    }
+  ],
+  "buildPresets": [
+    {
+      "name": "build-debug",
+      "configurePreset": "vs2022-debug",
+      "configuration": "Debug"
+    },
+    {
+      "name": "build-release",
+      "configurePreset": "vs2022-release",
+      "configuration": "Release"
+    }
+  ],
+  "testPresets": [
+    {
+      "name": "test-debug",
+      "configurePreset": "vs2022-debug",
+      "configuration": "Debug"
+    },
+    {
+      "name": "test-release",
+      "configurePreset": "vs2022-release",
+      "configuration": "Release"
+    }
+  ]
+}
