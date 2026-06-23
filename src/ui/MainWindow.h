@@ -90,6 +90,8 @@ private:
     cv::Mat lastRawReconPreviewSlice_;
     PreviewWindow currentCameraPreviewWindow_;
     PreviewWindow currentReconPreviewWindow_;
+    qint64 cameraPreviewFrameCount_ = 0;
+    qint64 lastCameraPreviewRenderMs_ = 0;
 
     QLineEdit* watchDirEdit_ = nullptr;
     QLineEdit* saveDirEdit_ = nullptr;

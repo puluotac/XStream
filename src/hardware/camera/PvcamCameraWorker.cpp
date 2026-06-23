@@ -26,6 +26,8 @@ namespace
 
 #ifdef CT_HAS_PVCAM
 
+constexpr qint64 kPreviewSignalMinIntervalMs = 33;
+
 QString pvcamError()
 {
     char message[ERROR_MSG_LEN] = {};
@@ -296,6 +298,14 @@ void PvcamCameraWorker::startCapture(const PvcamCaptureSettings& rawSettings)
             throw std::runtime_error("PVCAM returned fewer bytes than the selected ROI requires.");
         }
 
+        emit logMessage(QStringLiteral("Kinetix ROI %1x%2, bitDepth=%3, cvType=%4, stride=%5, frameBytes=%6.")
+            .arg(width)
+            .arg(height)
+            .arg(bitDepth)
+            .arg(cvType)
+            .arg(strideBytes)
+            .arg(exposureBytes));
+
         if (settings.saveRaw)
         {
             QDir().mkpath(settings.outputDir);
@@ -307,6 +317,7 @@ void PvcamCameraWorker::startCapture(const PvcamCaptureSettings& rawSettings)
 
         std::vector<unsigned char> frameBuffer(exposureBytes);
         emit cameraStateChanged(settings.previewOnly ? QStringLiteral("Live") : QStringLiteral("Capturing"));
+        qint64 lastPreviewEmitMs = -kPreviewSignalMinIntervalMs;
 
         for (int frameIndex = 0; (settings.previewOnly || frameIndex < settings.frameCount) && !stopRequested_.load(); ++frameIndex)
         {
@@ -359,7 +370,16 @@ void PvcamCameraWorker::startCapture(const PvcamCaptureSettings& rawSettings)
                 }
             }
 
-            emit frameReady(frame);
+            const bool isLastFiniteCaptureFrame = !settings.previewOnly && (frameIndex + 1) >= settings.frameCount;
+            const bool shouldEmitPreview =
+                frameIndex == 0
+                || isLastFiniteCaptureFrame
+                || frame.timestampMs - lastPreviewEmitMs >= kPreviewSignalMinIntervalMs;
+            if (shouldEmitPreview)
+            {
+                lastPreviewEmitMs = frame.timestampMs;
+                emit frameReady(frame);
+            }
             emit captureStatsChanged(frame.frameIndex + 1, queue_->size(), queue_->consumedCount(), droppedCount_);
         }
 

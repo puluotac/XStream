@@ -9,3 +9,4 @@
 - Offline FBP/Gridrec convert reconstructed float32 chunks to uint16 on GPU before device-to-host transfer.
 - Fixed offline TIFF writer shutdown so repeated `finish()` calls do not cause a completion-time crash.
 - Verified after clean Release rebuild: `ctest --output-on-failure -C Release`, offline FBP smoke, and offline Gridrec smoke passed with `--tiff-threads 4`.
+- Fixed Kinetix live/capture preview initialization: the first camera frame now rebuilds the preview histogram/window from real image data, logs frame metadata, and UI preview signals are throttled to avoid full-frame event backlog.

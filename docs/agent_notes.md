@@ -56,6 +56,7 @@ ctest --test-dir build\vs2022-release --output-on-failure -C Release
 - `IO.TIFF_THREADS` controls TIFF writer thread count. UI range is `1..64`, default `16`.
 - Offline FBP/Gridrec use GPU-side `float32 -> uint16` conversion through `launchConvertFloatVolumeToUint16()` before downloading chunk data to CPU.
 - Save window is calibrated from the center zChunk using fixed percentiles, then reused for the whole dataset. This avoids per-slice contrast changes in Avizo.
+- Kinetix preview is intentionally throttled before the UI signal path. Full 3200x3200 frames are too large to emit/render at every exposure; capture queues still receive every non-preview frame, while the UI receives enough frames for live display.
 
 ## Known Pitfall
 

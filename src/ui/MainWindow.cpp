@@ -745,6 +745,8 @@ void MainWindow::startCameraCapture()
 
     lastRawCameraFrame_.release();
     currentCameraPreviewWindow_ = {};
+    cameraPreviewFrameCount_ = 0;
+    lastCameraPreviewRenderMs_ = 0;
     cameraHistogramWidget_->resetWindow();
     cameraPreviewFitInitialized_ = false;
     cameraPreviewView_->setImage(QPixmap());
@@ -786,6 +788,8 @@ void MainWindow::startCameraLivePreview()
 
     lastRawCameraFrame_.release();
     currentCameraPreviewWindow_ = {};
+    cameraPreviewFrameCount_ = 0;
+    lastCameraPreviewRenderMs_ = 0;
     cameraHistogramWidget_->resetWindow();
     cameraPreviewFitInitialized_ = false;
     cameraPreviewView_->setImage(QPixmap());
@@ -824,18 +828,39 @@ void MainWindow::stopCameraCapture()
 
 void MainWindow::updateCameraFrame(const CameraFrame& frame)
 {
-    if (frame.image.empty())
+    if (shuttingDown_ || frame.image.empty())
     {
         return;
     }
 
+    ++cameraPreviewFrameCount_;
     frame.image.convertTo(lastRawCameraFrame_, CV_32F);
-    if (!cameraHistogramWidget_->hasWindow())
+
+    const bool initializeWindow =
+        cameraPreviewFrameCount_ == 1 || !cameraHistogramWidget_->isInitializedFromData();
+    if (initializeWindow)
     {
+        const QSignalBlocker blocker(cameraHistogramWidget_);
         cameraHistogramWidget_->updateData(lastRawCameraFrame_);
         currentCameraPreviewWindow_ = cameraHistogramWidget_->window();
     }
-    renderCameraPreviewWithCurrentWindow();
+
+    if (cameraPreviewFrameCount_ == 1)
+    {
+        appendLog(QStringLiteral("Kinetix preview first frame: %1x%2, bitDepth=%3, cvType=%4, stride=%5.")
+            .arg(frame.width)
+            .arg(frame.height)
+            .arg(frame.bitDepth)
+            .arg(frame.cvType)
+            .arg(frame.strideBytes));
+    }
+
+    const qint64 nowMs = frame.timestampMs > 0 ? frame.timestampMs : lastCameraPreviewRenderMs_ + 33;
+    if (cameraPreviewFrameCount_ == 1 || nowMs - lastCameraPreviewRenderMs_ >= 33)
+    {
+        lastCameraPreviewRenderMs_ = nowMs;
+        renderCameraPreviewWithCurrentWindow();
+    }
 }
 
 void MainWindow::renderCameraPreviewWithCurrentWindow()
