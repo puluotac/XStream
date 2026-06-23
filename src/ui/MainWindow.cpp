@@ -85,7 +85,7 @@ const MotorAxisDefinition kMotorAxes[] = {
     { "U", "goniometer vertical beam", "SA10A-RM01", 1, "CH1-1", "deg", 11904.7619, 0.001, 0.1, -5.0, 5.0, 0.05, 0.2 },
     { "V", "goniometer parallel beam", "SA10A-RB01", 2, "CH1-2", "deg", 14925.3731, 0.001, 0.1, -5.0, 5.0, 0.05, 0.2 },
     { "Z", "sample height", "ZA16A-32F01", 18, "CH9-2", "um", 100.0, 1.0, 100.0, -10000.0, 10000.0, 20.0, 100.0 },
-    { "Y", "large horizontal stage", "XA16F-L2101", 3, "CH2-1", "um", 2.0, 10.0, 1000.0, -50000.0, 50000.0, 500.0, 2000.0 },
+    { "Y", "large horizontal stage", "XA16F-L2101", 3, "CH2-1", "um", 0.2, 10.0, 1000.0, -150000.0, 150000.0, 500.0, 2000.0 },
     { "Det_OT2_Z", "Kinetix detector vertical lift", "ZA16A-32F01", 22, "CH11-2", "um", 100.0, 1.0, 100.0, -10000.0, 10000.0, 20.0, 100.0 },
     { "Det_OT2_Y", "Kinetix detector horizontal travel", "XA16F-L2301", 9, "CH5-1", "um", 2.0, 10.0, 1000.0, -50000.0, 50000.0, 500.0, 2000.0 },
 };
