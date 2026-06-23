@@ -33,6 +33,10 @@ struct PvcamCaptureSettings
     bool saveRaw = false;
     bool previewOnly = false;
     QString outputDir;
+    QString filePrefix = QStringLiteral("kinetix_frame_");
+    int filePadding = 6;
+    QString singleFramePath;
+    qint64 previewIntervalMs = 33;
 };
 
 class PvcamCameraWorker : public QObject

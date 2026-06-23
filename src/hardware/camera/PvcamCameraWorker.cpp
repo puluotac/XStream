@@ -28,8 +28,6 @@ namespace
 
 #ifdef CT_HAS_PVCAM
 
-constexpr qint64 kPreviewSignalMinIntervalMs = 33;
-
 QString pvcamError()
 {
     char message[ERROR_MSG_LEN] = {};
@@ -345,10 +343,11 @@ bool waitForReadout(int16 hcam, uns32 timeoutMs, std::atomic_bool& stopRequested
     return false;
 }
 
-QString makeFramePath(const QString& outputDir, qint64 frameIndex)
+QString makeFramePath(const QString& outputDir, const QString& filePrefix, int filePadding, qint64 frameIndex)
 {
+    const int padding = std::clamp(filePadding, 1, 12);
     std::ostringstream name;
-    name << "kinetix_frame_" << std::setw(6) << std::setfill('0') << frameIndex << ".tiff";
+    name << filePrefix.toStdString() << std::setw(padding) << std::setfill('0') << frameIndex << ".tiff";
     return QDir(outputDir).filePath(QString::fromStdString(name.str()));
 }
 
@@ -495,6 +494,12 @@ void PvcamCameraWorker::startCapture(const PvcamCaptureSettings& rawSettings)
     settings.roiWidth = std::max(1, settings.roiWidth);
     settings.roiHeight = std::max(1, settings.roiHeight);
     settings.queueCapacity = std::max(1, settings.queueCapacity);
+    settings.filePadding = std::clamp(settings.filePadding, 1, 12);
+    settings.previewIntervalMs = std::clamp<qint64>(settings.previewIntervalMs, 33, 1000);
+    if (settings.filePrefix.isEmpty())
+    {
+        settings.filePrefix = QStringLiteral("kinetix_frame_");
+    }
     const double exposureMs = std::max(0.001, exposureMilliseconds(settings.exposureValue, settings.exposureUnit));
 
     stopRequested_.store(false);
@@ -572,7 +577,7 @@ void PvcamCameraWorker::startCapture(const PvcamCaptureSettings& rawSettings)
         std::vector<unsigned char> frameBuffer(exposureBytes);
         emit cameraStateChanged(settings.previewOnly ? QStringLiteral("Live") : QStringLiteral("Capturing"));
         emit logMessage(QStringLiteral("Kinetix setup ready in %1 ms.").arg(acquisitionTimer.elapsed()));
-        qint64 lastPreviewEmitMs = -kPreviewSignalMinIntervalMs;
+        qint64 lastPreviewEmitMs = -settings.previewIntervalMs;
 
         for (int frameIndex = 0; (settings.previewOnly || frameIndex < settings.frameCount) && !stopRequested_.load(); ++frameIndex)
         {
@@ -622,18 +627,21 @@ void PvcamCameraWorker::startCapture(const PvcamCaptureSettings& rawSettings)
 
             if (!settings.previewOnly && settings.saveRaw)
             {
-                const QString framePath = makeFramePath(settings.outputDir, frame.frameIndex);
+                const QString framePath = settings.singleFramePath.isEmpty()
+                    ? makeFramePath(settings.outputDir, settings.filePrefix, settings.filePadding, frame.frameIndex)
+                    : settings.singleFramePath;
                 if (!cv::imwrite(framePath.toStdString(), frame.image))
                 {
                     throw std::runtime_error("Failed to save camera frame.");
                 }
+                emit logMessage(QStringLiteral("Kinetix snap saved: %1.").arg(framePath));
             }
 
             const bool isLastFiniteCaptureFrame = !settings.previewOnly && (frameIndex + 1) >= settings.frameCount;
             const bool shouldEmitPreview =
                 frameIndex == 0
                 || isLastFiniteCaptureFrame
-                || frame.timestampMs - lastPreviewEmitMs >= kPreviewSignalMinIntervalMs;
+                || frame.timestampMs - lastPreviewEmitMs >= settings.previewIntervalMs;
             if (shouldEmitPreview)
             {
                 lastPreviewEmitMs = frame.timestampMs;

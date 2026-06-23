@@ -76,8 +76,10 @@ private:
     void requestMotorConnect();
     void updateMotorAxisPosition(int axis, qint64 positionPulse, const QString& statusRaw);
     void updateMotorAxisActive(int axis, bool active);
-    void jogMotorAxis(const QString& name, int direction);
+    void moveMotorAxis(const QString& name);
     void stopMotorAxis(const QString& name);
+    void stopAllMotorAxes();
+    void toggleMotorSpeedMode();
     void updateMotorUiEnabled();
 
     ReconstructionController controller_;
@@ -95,9 +97,10 @@ private:
     PreviewWindow currentReconPreviewWindow_;
     qint64 cameraPreviewFrameCount_ = 0;
     qint64 lastCameraPreviewRenderMs_ = 0;
-    qint64 cameraSnapSaveIndex_ = 0;
+    int pendingSingleSnapIndex_ = -1;
     bool cameraLiveRunning_ = false;
     bool cameraRestartLiveAfterStop_ = false;
+    bool cameraSnapSaveInProgress_ = false;
 
     QLineEdit* watchDirEdit_ = nullptr;
     QLineEdit* saveDirEdit_ = nullptr;
@@ -145,6 +148,9 @@ private:
     QSpinBox* cameraRoiHeightSpin_ = nullptr;
     QPushButton* cameraApplyRoiButton_ = nullptr;
     QPushButton* cameraResetRoiButton_ = nullptr;
+    QLineEdit* cameraSnapPrefixEdit_ = nullptr;
+    QSpinBox* cameraSnapPaddingSpin_ = nullptr;
+    QSpinBox* cameraSnapIndexSpin_ = nullptr;
     QLineEdit* cameraSaveDirEdit_ = nullptr;
     QLabel* cameraStateLabel_ = nullptr;
     QPushButton* cameraSnapButton_ = nullptr;
@@ -170,18 +176,31 @@ private:
         int axis = 0;
         double pulsePerUnit = 1.0;
         QString unit;
+        double currentValue = 0.0;
+        bool hasPosition = false;
+        double softMin = 0.0;
+        double softMax = 0.0;
+        QLabel* nameLabel = nullptr;
         QLabel* positionLabel = nullptr;
         QLabel* statusLabel = nullptr;
-        QDoubleSpinBox* stepSpin = nullptr;
-        QPushButton* minusButton = nullptr;
-        QPushButton* plusButton = nullptr;
-        QPushButton* stopButton = nullptr;
+        QLabel* unitLabel = nullptr;
+        QDoubleSpinBox* relativeSpin = nullptr;
+        QDoubleSpinBox* absoluteSpin = nullptr;
+        QPushButton* goButton = nullptr;
+        QLabel* speedUnitLabel = nullptr;
+        QDoubleSpinBox* speedSpin = nullptr;
+        QDoubleSpinBox* accelSpin = nullptr;
         bool active = false;
     };
 
     QLineEdit* motorHostEdit_ = nullptr;
     QSpinBox* motorPortSpin_ = nullptr;
     QLabel* motorConnectionLabel_ = nullptr;
+    QWidget* motorMotionHeader_ = nullptr;
+    QWidget* motorSpeedHeader_ = nullptr;
+    QPushButton* motorModeButton_ = nullptr;
+    QPushButton* motorStopAllButton_ = nullptr;
+    bool motorSpeedMode_ = false;
     QMap<QString, MotorAxisUi> motorAxes_;
     QMap<int, QString> motorAxisNamesByNumber_;
 };

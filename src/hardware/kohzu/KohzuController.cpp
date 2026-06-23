@@ -138,6 +138,59 @@ void KohzuController::jogRelativePulse(int axis, qint64 pulse, int speedTable, c
     }
 }
 
+void KohzuController::moveAbsolutePulse(int axis, qint64 pulse, int speedTable, const QString& label)
+{
+    if (!isConnected())
+    {
+        emit commandFinished(label, false, QStringLiteral("Kohzu is not connected."));
+        emit axisActiveChanged(axis, false);
+        return;
+    }
+
+    const QString command = QStringLiteral("APS%1/%2/%3/1").arg(axis).arg(speedTable).arg(pulse);
+    QString error;
+    const QString response = query(command, &error);
+    const bool ok = !response.isEmpty() && response.startsWith(QLatin1Char('C'));
+    emit commandFinished(label, ok, ok ? response : QStringLiteral("%1 %2").arg(error, response).trimmed());
+    if (ok)
+    {
+        markAxisActive(axis);
+    }
+    else
+    {
+        emit axisActiveChanged(axis, false);
+    }
+}
+
+void KohzuController::writeSpeedTable(int axis,
+                                      int speedTable,
+                                      int startPps,
+                                      int maxPps,
+                                      int accelTime10Ms,
+                                      int decelTime10Ms,
+                                      int pattern,
+                                      const QString& label)
+{
+    if (!isConnected())
+    {
+        emit commandFinished(label, false, QStringLiteral("Kohzu is not connected."));
+        return;
+    }
+
+    const QString command = QStringLiteral("WTB%1/%2/%3/%4/%5/%6/%7")
+        .arg(axis)
+        .arg(speedTable)
+        .arg(startPps)
+        .arg(maxPps)
+        .arg(accelTime10Ms)
+        .arg(decelTime10Ms)
+        .arg(pattern);
+    QString error;
+    const QString response = query(command, &error);
+    const bool ok = !response.isEmpty() && response.startsWith(QLatin1Char('C'));
+    emit commandFinished(label, ok, ok ? response : QStringLiteral("%1 %2").arg(error, response).trimmed());
+}
+
 void KohzuController::stopAxis(int axis, const QString& label)
 {
     if (!isConnected())
@@ -158,6 +211,30 @@ void KohzuController::stopAxis(int axis, const QString& label)
     if (activeAxes_.isEmpty())
     {
         activePollTimer_.stop();
+    }
+}
+
+void KohzuController::stopAllAxes()
+{
+    if (!isConnected())
+    {
+        emit commandFinished(QStringLiteral("Kohzu stop all"), false, QStringLiteral("Kohzu is not connected."));
+        return;
+    }
+
+    QString error;
+    const QString response = query(QStringLiteral("STP0/0"), &error);
+    const bool ok = !response.isEmpty() && response.startsWith(QLatin1Char('C'));
+    emit commandFinished(QStringLiteral("Kohzu stop all"), ok, ok ? response : QStringLiteral("%1 %2").arg(error, response).trimmed());
+
+    const QList<int> activeAxes = activeAxes_.values();
+    activeAxes_.clear();
+    lastActivePosition_.clear();
+    activeStableCount_.clear();
+    activePollTimer_.stop();
+    for (int axis : activeAxes)
+    {
+        emit axisActiveChanged(axis, false);
     }
 }
 
