@@ -7,6 +7,7 @@
 #include <QString>
 
 #include <atomic>
+#include <cstdint>
 #include <memory>
 
 namespace ct
@@ -42,6 +43,7 @@ public:
     ~PvcamCameraWorker() override = default;
 
 public slots:
+    void warmOpen();
     void startCapture(const ct::PvcamCaptureSettings& settings);
     void stopCapture();
     void shutdown();
@@ -54,10 +56,24 @@ signals:
     void captureFinished(bool ok, const QString& message);
 
 private:
+    void openCameraIfNeeded();
+    void closeCamera();
+
     std::shared_ptr<BoundedFrameQueue> queue_;
     std::atomic_bool stopRequested_ { false };
     std::atomic_bool capturing_ { false };
     qint64 droppedCount_ = 0;
+
+#ifdef CT_HAS_PVCAM
+    int16_t hcam_ = -1;
+    bool pvcamInitialized_ = false;
+    bool cameraOpened_ = false;
+    QString cameraName_;
+    int sensorWidth_ = 0;
+    int sensorHeight_ = 0;
+    int imageFormat_ = 0;
+    int bitDepth_ = 0;
+#endif
 };
 
 } // namespace ct

@@ -753,6 +753,7 @@ void MainWindow::startCameraWorker()
         appendLog(QStringLiteral("Kinetix capture %1: %2").arg(ok ? QStringLiteral("ok") : QStringLiteral("failed"), message));
     });
     cameraThread_.start();
+    QMetaObject::invokeMethod(cameraWorker_, "warmOpen", Qt::QueuedConnection);
 }
 
 void MainWindow::startCameraCapture()
@@ -1356,7 +1357,10 @@ void MainWindow::shutdownWorkers()
         disconnect(cameraWorker_, nullptr, this, nullptr);
         PvcamCameraWorker* worker = cameraWorker_;
         QThread* guiThread = thread();
-        worker->shutdown();
+        worker->stopCapture();
+        QMetaObject::invokeMethod(worker, [worker]() {
+            worker->shutdown();
+        }, Qt::BlockingQueuedConnection);
         QMetaObject::invokeMethod(worker, [worker, guiThread]() {
             worker->moveToThread(guiThread);
         }, Qt::BlockingQueuedConnection);

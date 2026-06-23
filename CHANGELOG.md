@@ -12,3 +12,4 @@
 - Fixed Kinetix live/capture preview initialization: the first camera frame now rebuilds the preview histogram/window from real image data, logs frame metadata, and UI preview signals are throttled to avoid full-frame event backlog.
 - Fixed Kinetix PVCAM sequence timeout by normalizing `PARAM_EXP_RES` to millisecond exposure units before `pl_exp_setup_seq`; added exposure mode/status diagnostics for future readout timeouts.
 - Added a Kinetix exposure unit selector (`us/ms/s`) next to the exposure value and logs PVCAM setup/first-frame timing for Live startup diagnosis.
+- Added Kinetix hot-open camera sessions: the app warms the PVCAM camera on startup, keeps the camera open between Live/Capture runs, and releases it on shutdown or camera error.
