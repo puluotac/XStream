@@ -1,6 +1,7 @@
 #pragma once
 
 #include <QJsonObject>
+#include <QMap>
 #include <QString>
 
 namespace ct
@@ -102,6 +103,12 @@ struct IoConfig
     int tiffThreads = 16;
 };
 
+struct MotorAxisConfig
+{
+    double speed = 0.0;
+    double accel = 0.0;
+};
+
 struct AppConfig
 {
     GeometryConfig geometry;
@@ -110,6 +117,7 @@ struct AppConfig
     ComputeConfig compute;
     PreviewConfig preview;
     IoConfig io;
+    QMap<QString, MotorAxisConfig> motorAxes;
 
     static AppConfig defaults();
     static AppConfig fromJsonObject(const QJsonObject& object);

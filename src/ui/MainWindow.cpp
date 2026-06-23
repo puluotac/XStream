@@ -81,7 +81,7 @@ struct MotorAxisDefinition
 const MotorAxisDefinition kMotorAxes[] = {
     { "X90", "parallel sample trim", "XA04A-R102", 16, "CH8-2", "um", 20.0, 10.0, 500.0, -2000.0, 2000.0, 100.0, 500.0 },
     { "X0", "vertical sample trim", "XA04A-R102", 15, "CH8-1", "um", 20.0, 10.0, 500.0, -2000.0, 2000.0, 100.0, 500.0 },
-    { "R", "CT rotation", "RA10A-W01", 17, "CH9-1", "deg", 10000.0, 0.01, 1.0, -360.0, 360.0, 1.0, 5.0 },
+    { "R", "CT rotation", "RA10A-W01", 17, "CH9-1", "deg", 20000.0, 0.01, 1.0, -360.0, 360.0, 1.0, 5.0 },
     { "U", "goniometer vertical beam", "SA10A-RM01", 1, "CH1-1", "deg", 11904.7619, 0.001, 0.1, -5.0, 5.0, 0.05, 0.2 },
     { "V", "goniometer parallel beam", "SA10A-RB01", 2, "CH1-2", "deg", 14925.3731, 0.001, 0.1, -5.0, 5.0, 0.05, 0.2 },
     { "Z", "sample height", "ZA16A-32F01", 18, "CH9-2", "um", 100.0, 1.0, 100.0, -10000.0, 10000.0, 20.0, 100.0 },
@@ -118,14 +118,12 @@ void configureMotorSpinBox(QDoubleSpinBox* spin, int decimals, int width)
     spin->setFixedWidth(width);
 }
 
-int accelTime10MsFromUi(double speedPerSecond, double accelPerSecond2)
+QPushButton* makeCompactMotorButton(const QString& text, QWidget* parent)
 {
-    if (speedPerSecond <= 0.0 || accelPerSecond2 <= 0.0)
-    {
-        return 1;
-    }
-    const double seconds = speedPerSecond / accelPerSecond2;
-    return std::clamp(static_cast<int>(std::llround(seconds * 100.0)), 1, 1000);
+    auto* button = new QPushButton(text, parent);
+    button->setFixedSize(24, 24);
+    button->setSizePolicy(QSizePolicy::Fixed, QSizePolicy::Fixed);
+    return button;
 }
 
 PvcamExposureUnit cameraExposureUnitFromText(const QString& text)
@@ -201,7 +199,7 @@ MainWindow::MainWindow(QWidget* parent)
 
     auto* hardwareScroll = new QScrollArea(central);
     hardwareScroll->setWidgetResizable(true);
-    hardwareScroll->setFixedWidth(430);
+    hardwareScroll->setFixedWidth(470);
     hardwareScroll->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
     auto* hardwareHost = new QWidget(hardwareScroll);
     auto* hardwareLayout = new QVBoxLayout(hardwareHost);
@@ -301,7 +299,7 @@ MainWindow::MainWindow(QWidget* parent)
     axisLayout->setColumnMinimumWidth(0, 70);
     axisLayout->setColumnMinimumWidth(1, 78);
     axisLayout->setColumnMinimumWidth(2, 34);
-    axisLayout->setColumnMinimumWidth(3, 76);
+    axisLayout->setColumnMinimumWidth(3, 126);
     axisLayout->setColumnMinimumWidth(4, 76);
     axisLayout->setColumnMinimumWidth(5, 40);
     motorMotionHeader_ = new QWidget(axisGroup);
@@ -311,7 +309,7 @@ MainWindow::MainWindow(QWidget* parent)
     motionHeaderLayout->setColumnMinimumWidth(0, 70);
     motionHeaderLayout->setColumnMinimumWidth(1, 78);
     motionHeaderLayout->setColumnMinimumWidth(2, 34);
-    motionHeaderLayout->setColumnMinimumWidth(3, 76);
+    motionHeaderLayout->setColumnMinimumWidth(3, 126);
     motionHeaderLayout->setColumnMinimumWidth(4, 76);
     motionHeaderLayout->setColumnMinimumWidth(5, 40);
     motionHeaderLayout->addWidget(new QLabel(QString(), motorMotionHeader_), 0, 0);
@@ -327,13 +325,16 @@ MainWindow::MainWindow(QWidget* parent)
     speedHeaderLayout->setContentsMargins(0, 0, 0, 0);
     speedHeaderLayout->setHorizontalSpacing(4);
     speedHeaderLayout->setColumnMinimumWidth(0, 70);
-    speedHeaderLayout->setColumnMinimumWidth(1, 34);
-    speedHeaderLayout->setColumnMinimumWidth(2, 76);
-    speedHeaderLayout->setColumnMinimumWidth(3, 76);
+    speedHeaderLayout->setColumnMinimumWidth(1, 78);
+    speedHeaderLayout->setColumnMinimumWidth(2, 34);
+    speedHeaderLayout->setColumnMinimumWidth(3, 126);
+    speedHeaderLayout->setColumnMinimumWidth(4, 76);
+    speedHeaderLayout->setColumnMinimumWidth(5, 40);
     speedHeaderLayout->addWidget(new QLabel(QString(), motorSpeedHeader_), 0, 0);
     speedHeaderLayout->addWidget(new QLabel(QString(), motorSpeedHeader_), 0, 1);
-    speedHeaderLayout->addWidget(makeCenteredHeader(QStringLiteral("Speed"), motorSpeedHeader_), 0, 2);
-    speedHeaderLayout->addWidget(makeCenteredHeader(QStringLiteral("Accel"), motorSpeedHeader_), 0, 3);
+    speedHeaderLayout->addWidget(new QLabel(QString(), motorSpeedHeader_), 0, 2);
+    speedHeaderLayout->addWidget(makeCenteredHeader(QStringLiteral("Speed (/s)"), motorSpeedHeader_), 0, 3);
+    speedHeaderLayout->addWidget(makeCenteredHeader(QStringLiteral("Accel (/s^2)"), motorSpeedHeader_), 0, 4);
     axisLayout->addWidget(motorSpeedHeader_, 0, 0, 1, 6);
     motorSpeedHeader_->hide();
 
@@ -366,9 +367,11 @@ MainWindow::MainWindow(QWidget* parent)
         axisUi.unitLabel->setFixedWidth(34);
         axisUi.statusLabel = new QLabel(QStringLiteral(""), axisGroup);
         axisUi.statusLabel->setVisible(false);
-        axisUi.relativeSpin = makeSpin<QDoubleSpinBox>(axisGroup, -def.maxStep, def.maxStep, def.defaultStep);
+        axisUi.relativeMinusButton = makeCompactMotorButton(QStringLiteral("-"), axisGroup);
+        axisUi.relativeSpin = makeSpin<QDoubleSpinBox>(axisGroup, 0.0, std::abs(def.softMax - def.softMin), def.defaultStep);
         configureMotorSpinBox(axisUi.relativeSpin, 4, 76);
         axisUi.relativeSpin->setValue(def.defaultStep);
+        axisUi.relativePlusButton = makeCompactMotorButton(QStringLiteral("+"), axisGroup);
         axisUi.absoluteSpin = makeSpin<QDoubleSpinBox>(axisGroup, def.softMin, def.softMax, def.defaultStep);
         configureMotorSpinBox(axisUi.absoluteSpin, 4, 76);
         axisUi.absoluteSpin->setValue(0.0);
@@ -390,14 +393,30 @@ MainWindow::MainWindow(QWidget* parent)
         axisLayout->addWidget(axisName, axisRow, 0);
         axisLayout->addWidget(axisUi.positionLabel, axisRow, 1);
         axisLayout->addWidget(axisUi.unitLabel, axisRow, 2);
-        axisLayout->addWidget(axisUi.relativeSpin, axisRow, 3);
+        auto* relativeLayout = new QHBoxLayout();
+        relativeLayout->setContentsMargins(0, 0, 0, 0);
+        relativeLayout->setSpacing(0);
+        relativeLayout->addWidget(axisUi.relativeMinusButton);
+        relativeLayout->addWidget(axisUi.relativeSpin);
+        relativeLayout->addWidget(axisUi.relativePlusButton);
+        auto* relativeWidget = new QWidget(axisGroup);
+        relativeWidget->setLayout(relativeLayout);
+        relativeWidget->setFixedWidth(124);
+        axisUi.relativeWidget = relativeWidget;
+        axisLayout->addWidget(relativeWidget, axisRow, 3);
         axisLayout->addWidget(axisUi.absoluteSpin, axisRow, 4);
         axisLayout->addWidget(axisUi.goButton, axisRow, 5);
-        axisLayout->addWidget(axisUi.speedUnitLabel, axisRow, 1);
-        axisLayout->addWidget(axisUi.speedSpin, axisRow, 2);
-        axisLayout->addWidget(axisUi.accelSpin, axisRow, 3);
+        axisLayout->addWidget(axisUi.speedUnitLabel, axisRow, 2);
+        axisLayout->addWidget(axisUi.speedSpin, axisRow, 3);
+        axisLayout->addWidget(axisUi.accelSpin, axisRow, 4);
 
         const QString axisKey = axisUi.name;
+        connect(axisUi.relativeMinusButton, &QPushButton::clicked, this, [this, axisKey]() {
+            moveMotorAxisRelative(axisKey, -1);
+        });
+        connect(axisUi.relativePlusButton, &QPushButton::clicked, this, [this, axisKey]() {
+            moveMotorAxisRelative(axisKey, 1);
+        });
         connect(axisUi.goButton, &QPushButton::clicked, this, [this, axisKey]() {
             moveMotorAxis(axisKey);
         });
@@ -773,6 +792,22 @@ void MainWindow::applyConfig(const AppConfig& config)
     livePreviewCheck_->setChecked(config.preview.enableLive);
     setPreviewSliceRange(config.geometry.volH);
     syncPreviewSliceControls(config.preview.liveSliceIndex);
+    for (auto it = motorAxes_.begin(); it != motorAxes_.end(); ++it)
+    {
+        const auto motorIt = config.motorAxes.constFind(it.key());
+        if (motorIt == config.motorAxes.constEnd())
+        {
+            continue;
+        }
+        if (it->speedSpin)
+        {
+            it->speedSpin->setValue(motorIt.value().speed);
+        }
+        if (it->accelSpin)
+        {
+            it->accelSpin->setValue(motorIt.value().accel);
+        }
+    }
     updateReconMethodUiState();
 }
 
@@ -820,6 +855,14 @@ AppConfig MainWindow::configFromUi() const
     cfg.compute.zBlockSplit = zBlockSpin_->value();
     cfg.preview.enableLive = livePreviewCheck_->isChecked();
     cfg.preview.liveSliceIndex = liveSliceSpin_->value();
+    cfg.motorAxes.clear();
+    for (auto it = motorAxes_.cbegin(); it != motorAxes_.cend(); ++it)
+    {
+        MotorAxisConfig motorCfg;
+        motorCfg.speed = it->speedSpin ? it->speedSpin->value() : 0.0;
+        motorCfg.accel = it->accelSpin ? it->accelSpin->value() : 0.0;
+        cfg.motorAxes.insert(it.key(), motorCfg);
+    }
     return cfg;
 }
 
@@ -903,7 +946,7 @@ void MainWindow::startCameraWorker()
         cameraResetRoiButton_->setEnabled(true);
         if (ok && completedSingleSnap)
         {
-            cameraSnapIndexSpin_->setValue(std::min(cameraSnapIndexSpin_->maximum(), completedSingleSnapIndex + 1));
+            cameraSnapIndexSpin_->setValue(completedSingleSnapIndex);
         }
         appendLog(QStringLiteral("Kinetix capture %1: %2").arg(ok ? QStringLiteral("ok") : QStringLiteral("failed"), message));
         if (shouldRestartLive && ok)
@@ -960,7 +1003,7 @@ void MainWindow::snapCameraFrame()
                 cameraSnapButton_->setEnabled(true);
                 if (ok)
                 {
-                    cameraSnapIndexSpin_->setValue(std::min(cameraSnapIndexSpin_->maximum(), snapIndex + 1));
+                    cameraSnapIndexSpin_->setValue(snapIndex);
                 }
                 appendLog(ok
                     ? QStringLiteral("Kinetix live snap saved: %1.").arg(framePath)
@@ -1537,6 +1580,8 @@ void MainWindow::updateMotorAxisActive(int axis, bool active)
     MotorAxisUi& axisUi = motorAxes_[name];
     axisUi.active = active;
     axisUi.goButton->setEnabled(motorConnected_ && !active);
+    axisUi.relativeMinusButton->setEnabled(motorConnected_ && !active && !motorSpeedMode_);
+    axisUi.relativePlusButton->setEnabled(motorConnected_ && !active && !motorSpeedMode_);
 }
 
 void MainWindow::moveMotorAxis(const QString& name)
@@ -1557,47 +1602,16 @@ void MainWindow::moveMotorAxis(const QString& name)
         return;
     }
 
-    if (motorSpeedMode_)
-    {
-        const double speed = it->speedSpin->value();
-        const double accel = it->accelSpin->value();
-        const int maxPps = std::max(2, static_cast<int>(std::llround(speed * it->pulsePerUnit)));
-        const int startPps = std::max(1, static_cast<int>(std::llround(static_cast<double>(maxPps) * 0.1)));
-        const int accelTime10Ms = accelTime10MsFromUi(speed, accel);
-        const int pattern = 2;
-        const QString label = QStringLiteral("%1 speed table 0 max=%2 pps accel=%3x10ms")
-            .arg(name)
-            .arg(maxPps)
-            .arg(accelTime10Ms);
-        QMetaObject::invokeMethod(
-            kohzuController_,
-            "writeSpeedTable",
-            Qt::QueuedConnection,
-            Q_ARG(int, it->axis),
-            Q_ARG(int, 0),
-            Q_ARG(int, startPps),
-            Q_ARG(int, maxPps),
-            Q_ARG(int, accelTime10Ms),
-            Q_ARG(int, accelTime10Ms),
-            Q_ARG(int, pattern),
-            Q_ARG(QString, label));
-        return;
-    }
-
     if (!it->hasPosition)
     {
         appendLog(QStringLiteral("%1 current position is not available yet; wait for position polling before moving.").arg(name));
         return;
     }
 
-    const double relative = it->relativeSpin->value();
     const double absolute = it->absoluteSpin->value();
-    const bool useRelative = std::abs(relative) > 1e-9;
-    const bool useAbsolute = !useRelative;
-    const double target = useAbsolute ? absolute : it->currentValue + relative;
+    const double target = absolute;
     if (target < it->softMin || target > it->softMax)
     {
-        it->relativeSpin->setValue(0.0);
         it->absoluteSpin->setValue(it->currentValue);
         appendLog(QStringLiteral("%1 move exceeds UI soft limit: target %2 %3, allowed [%4, %5] %3. Input reset.")
             .arg(name)
@@ -1608,45 +1622,99 @@ void MainWindow::moveMotorAxis(const QString& name)
         return;
     }
 
-    const double motionValue = useRelative ? relative : target;
-    const qint64 pulse = static_cast<qint64>(std::llround(motionValue * it->pulsePerUnit));
+    const qint64 pulse = static_cast<qint64>(std::llround(target * it->pulsePerUnit));
     if (pulse == 0)
     {
-        appendLog(QStringLiteral("%1 move is too small for pulse conversion.").arg(name));
+        appendLog(QStringLiteral("%1 absolute move is too small for pulse conversion.").arg(name));
         return;
     }
 
-    const QString label = QStringLiteral("%1 %2 %3 pulse (%4 -> %5 %6)")
+    const QString label = QStringLiteral("%1 absolute %2 pulse (%3 -> %4 %5)")
         .arg(name)
-        .arg(useRelative ? QStringLiteral("relative") : QStringLiteral("absolute"))
         .arg(pulse)
         .arg(it->currentValue, 0, 'f', 4)
         .arg(target, 0, 'f', 4)
         .arg(it->unit);
     it->active = true;
     it->goButton->setEnabled(false);
-    if (useRelative)
+    QMetaObject::invokeMethod(
+        kohzuController_,
+        "moveAbsolutePulse",
+        Qt::QueuedConnection,
+        Q_ARG(int, it->axis),
+        Q_ARG(qint64, pulse),
+        Q_ARG(int, 0),
+        Q_ARG(QString, label));
+}
+
+void MainWindow::moveMotorAxisRelative(const QString& name, int direction)
+{
+    auto it = motorAxes_.find(name);
+    if (it == motorAxes_.end())
     {
-        QMetaObject::invokeMethod(
-            kohzuController_,
-            "jogRelativePulse",
-            Qt::QueuedConnection,
-            Q_ARG(int, it->axis),
-            Q_ARG(qint64, pulse),
-            Q_ARG(int, 0),
-            Q_ARG(QString, label));
+        return;
     }
-    else
+    if (!motorConnected_)
     {
-        QMetaObject::invokeMethod(
-            kohzuController_,
-            "moveAbsolutePulse",
-            Qt::QueuedConnection,
-            Q_ARG(int, it->axis),
-            Q_ARG(qint64, pulse),
-            Q_ARG(int, 0),
-            Q_ARG(QString, label));
+        appendLog(QStringLiteral("Kohzu is not connected."));
+        return;
     }
+    if (it->active)
+    {
+        appendLog(QStringLiteral("%1 is still moving or settling.").arg(name));
+        return;
+    }
+    if (!it->hasPosition)
+    {
+        appendLog(QStringLiteral("%1 current position is not available yet; wait for position polling before moving.").arg(name));
+        return;
+    }
+
+    const double step = std::abs(it->relativeSpin->value());
+    if (step <= 0.0)
+    {
+        appendLog(QStringLiteral("%1 relative move is zero.").arg(name));
+        return;
+    }
+    const double relative = step * (direction < 0 ? -1.0 : 1.0);
+    const double target = it->currentValue + relative;
+    if (target < it->softMin || target > it->softMax)
+    {
+        it->relativeSpin->setValue(0.0);
+        appendLog(QStringLiteral("%1 relative move exceeds UI soft limit: target %2 %3, allowed [%4, %5] %3. Input reset.")
+            .arg(name)
+            .arg(target, 0, 'f', 4)
+            .arg(it->unit)
+            .arg(it->softMin, 0, 'f', 4)
+            .arg(it->softMax, 0, 'f', 4));
+        return;
+    }
+
+    const qint64 pulse = static_cast<qint64>(std::llround(relative * it->pulsePerUnit));
+    if (pulse == 0)
+    {
+        appendLog(QStringLiteral("%1 relative move is too small for pulse conversion.").arg(name));
+        return;
+    }
+
+    const QString label = QStringLiteral("%1 relative %2 pulse (%3 -> %4 %5)")
+        .arg(name)
+        .arg(pulse)
+        .arg(it->currentValue, 0, 'f', 4)
+        .arg(target, 0, 'f', 4)
+        .arg(it->unit);
+    it->active = true;
+    it->relativeMinusButton->setEnabled(false);
+    it->relativePlusButton->setEnabled(false);
+    it->goButton->setEnabled(false);
+    QMetaObject::invokeMethod(
+        kohzuController_,
+        "jogRelativePulse",
+        Qt::QueuedConnection,
+        Q_ARG(int, it->axis),
+        Q_ARG(qint64, pulse),
+        Q_ARG(int, 0),
+        Q_ARG(QString, label));
 }
 
 void MainWindow::stopMotorAxis(const QString& name)
@@ -1691,9 +1759,12 @@ void MainWindow::toggleMotorSpeedMode()
     {
         it->positionLabel->setVisible(!motorSpeedMode_);
         it->unitLabel->setVisible(!motorSpeedMode_);
+        it->relativeWidget->setVisible(!motorSpeedMode_);
+        it->relativeMinusButton->setVisible(!motorSpeedMode_);
         it->relativeSpin->setVisible(!motorSpeedMode_);
+        it->relativePlusButton->setVisible(!motorSpeedMode_);
         it->absoluteSpin->setVisible(!motorSpeedMode_);
-        it->goButton->setVisible(true);
+        it->goButton->setVisible(!motorSpeedMode_);
         it->speedUnitLabel->setVisible(motorSpeedMode_);
         it->speedSpin->setVisible(motorSpeedMode_);
         it->accelSpin->setVisible(motorSpeedMode_);
@@ -1710,10 +1781,12 @@ void MainWindow::updateMotorUiEnabled()
     for (auto it = motorAxes_.begin(); it != motorAxes_.end(); ++it)
     {
         it->goButton->setEnabled(motorConnected_ && !it->active);
+        it->relativeMinusButton->setEnabled(motorConnected_ && !it->active && !motorSpeedMode_);
+        it->relativePlusButton->setEnabled(motorConnected_ && !it->active && !motorSpeedMode_);
         it->relativeSpin->setEnabled(!it->active && !motorSpeedMode_);
         it->absoluteSpin->setEnabled(!it->active && !motorSpeedMode_);
-        it->speedSpin->setEnabled(motorConnected_ && motorSpeedMode_);
-        it->accelSpin->setEnabled(motorConnected_ && motorSpeedMode_);
+        it->speedSpin->setEnabled(motorSpeedMode_);
+        it->accelSpin->setEnabled(motorSpeedMode_);
     }
 }
 

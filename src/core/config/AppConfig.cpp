@@ -102,6 +102,20 @@ AppConfig AppConfig::fromJsonObject(const QJsonObject& object)
     cfg.io.saveFormat = readValue(ioObj, "SAVE_FMT", cfg.io.saveFormat);
     cfg.io.tiffThreads = std::clamp(readValue(ioObj, "TIFF_THREADS", cfg.io.tiffThreads), 1, 64);
 
+    const auto motorObj = object.value("MOTOR").toObject();
+    for (auto it = motorObj.begin(); it != motorObj.end(); ++it)
+    {
+        const QJsonObject axisObj = it.value().toObject();
+        if (axisObj.isEmpty())
+        {
+            continue;
+        }
+        MotorAxisConfig axisCfg;
+        axisCfg.speed = axisObj.value("SPEED").toDouble(axisCfg.speed);
+        axisCfg.accel = axisObj.value("ACCEL").toDouble(axisCfg.accel);
+        cfg.motorAxes.insert(it.key(), axisCfg);
+    }
+
     return cfg;
 }
 
@@ -227,6 +241,16 @@ QJsonObject AppConfig::toJsonObject() const
     ioObj["SAVE_FMT"] = io.saveFormat;
     ioObj["TIFF_THREADS"] = io.tiffThreads;
     root["IO"] = ioObj;
+
+    QJsonObject motorObj;
+    for (auto it = motorAxes.begin(); it != motorAxes.end(); ++it)
+    {
+        QJsonObject axisObj;
+        axisObj["SPEED"] = it.value().speed;
+        axisObj["ACCEL"] = it.value().accel;
+        motorObj[it.key()] = axisObj;
+    }
+    root["MOTOR"] = motorObj;
 
     return root;
 }

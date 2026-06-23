@@ -26,14 +26,6 @@ public slots:
     void shutdown();
     void jogRelativePulse(int axis, qint64 pulse, int speedTable, const QString& label);
     void moveAbsolutePulse(int axis, qint64 pulse, int speedTable, const QString& label);
-    void writeSpeedTable(int axis,
-                         int speedTable,
-                         int startPps,
-                         int maxPps,
-                         int accelTime10Ms,
-                         int decelTime10Ms,
-                         int pattern,
-                         const QString& label);
     void stopAxis(int axis, const QString& label);
     void stopAllAxes();
 

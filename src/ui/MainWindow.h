@@ -77,6 +77,7 @@ private:
     void updateMotorAxisPosition(int axis, qint64 positionPulse, const QString& statusRaw);
     void updateMotorAxisActive(int axis, bool active);
     void moveMotorAxis(const QString& name);
+    void moveMotorAxisRelative(const QString& name, int direction);
     void stopMotorAxis(const QString& name);
     void stopAllMotorAxes();
     void toggleMotorSpeedMode();
@@ -184,7 +185,10 @@ private:
         QLabel* positionLabel = nullptr;
         QLabel* statusLabel = nullptr;
         QLabel* unitLabel = nullptr;
+        QWidget* relativeWidget = nullptr;
+        QPushButton* relativeMinusButton = nullptr;
         QDoubleSpinBox* relativeSpin = nullptr;
+        QPushButton* relativePlusButton = nullptr;
         QDoubleSpinBox* absoluteSpin = nullptr;
         QPushButton* goButton = nullptr;
         QLabel* speedUnitLabel = nullptr;

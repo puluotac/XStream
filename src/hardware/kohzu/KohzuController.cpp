@@ -162,35 +162,6 @@ void KohzuController::moveAbsolutePulse(int axis, qint64 pulse, int speedTable, 
     }
 }
 
-void KohzuController::writeSpeedTable(int axis,
-                                      int speedTable,
-                                      int startPps,
-                                      int maxPps,
-                                      int accelTime10Ms,
-                                      int decelTime10Ms,
-                                      int pattern,
-                                      const QString& label)
-{
-    if (!isConnected())
-    {
-        emit commandFinished(label, false, QStringLiteral("Kohzu is not connected."));
-        return;
-    }
-
-    const QString command = QStringLiteral("WTB%1/%2/%3/%4/%5/%6/%7")
-        .arg(axis)
-        .arg(speedTable)
-        .arg(startPps)
-        .arg(maxPps)
-        .arg(accelTime10Ms)
-        .arg(decelTime10Ms)
-        .arg(pattern);
-    QString error;
-    const QString response = query(command, &error);
-    const bool ok = !response.isEmpty() && response.startsWith(QLatin1Char('C'));
-    emit commandFinished(label, ok, ok ? response : QStringLiteral("%1 %2").arg(error, response).trimmed());
-}
-
 void KohzuController::stopAxis(int axis, const QString& label)
 {
     if (!isConnected())

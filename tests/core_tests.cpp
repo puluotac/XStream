@@ -51,6 +51,10 @@ int main()
     sessionConfig.preview.enableLive = false;
     sessionConfig.io.watchDir = "E:/demo/watch";
     sessionConfig.io.saveDir = "E:/demo/save";
+    sessionConfig.motorAxes["R"].speed = 2.5;
+    sessionConfig.motorAxes["R"].accel = 10.0;
+    sessionConfig.motorAxes["Y"].speed = 500.0;
+    sessionConfig.motorAxes["Y"].accel = 2000.0;
 
     QJsonObject legacyRoot = sessionConfig.toJsonObject();
     QJsonObject legacyCompute = legacyRoot.value("COMPUTE").toObject();
@@ -79,7 +83,11 @@ int main()
         || loadedConfig.compute.batchSize != sessionConfig.compute.batchSize
         || loadedConfig.io.watchDir != sessionConfig.io.watchDir
         || std::abs(loadedConfig.geometry.corShift - sessionConfig.geometry.corShift) > 1e-6f
-        || loadedConfig.preview.enableLive != sessionConfig.preview.enableLive)
+        || loadedConfig.preview.enableLive != sessionConfig.preview.enableLive
+        || std::abs(loadedConfig.motorAxes.value("R").speed - 2.5) > 1e-9
+        || std::abs(loadedConfig.motorAxes.value("R").accel - 10.0) > 1e-9
+        || std::abs(loadedConfig.motorAxes.value("Y").speed - 500.0) > 1e-9
+        || std::abs(loadedConfig.motorAxes.value("Y").accel - 2000.0) > 1e-9)
     {
         std::cerr << "Session config round-trip mismatch\n";
         return 7;
@@ -104,6 +112,12 @@ int main()
     {
         std::cerr << "Legacy BP kernel field was not stripped on save\n";
         return 14;
+    }
+    if (!cleanedDoc.object().value("MOTOR").toObject().contains("R")
+        || !cleanedDoc.object().value("MOTOR").toObject().contains("Y"))
+    {
+        std::cerr << "Motor speed/accel config was not saved\n";
+        return 21;
     }
 
     const QString invalidPath = tempDir.filePath("invalid.json");
