@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <filesystem>
 #include <iomanip>
 #include <iostream>
@@ -160,6 +161,12 @@ bool enumContains(int16 hcam, uns32 paramId, int32 wanted)
 
 int16 selectInternalExposureMode(int16 hcam)
 {
+    if (enumContains(hcam, PARAM_EXPOSURE_MODE, TIMED_MODE))
+    {
+        std::cout << "Selected exposure mode: TIMED_MODE\n";
+        return TIMED_MODE;
+    }
+
     if (enumContains(hcam, PARAM_EXPOSURE_MODE, EXT_TRIG_INTERNAL))
     {
         int16 exposeOut = EXPOSE_OUT_FIRST_ROW;
@@ -180,15 +187,101 @@ int16 selectInternalExposureMode(int16 hcam)
             }
         }
 
+        std::cout << "Selected exposure mode: EXT_TRIG_INTERNAL | exposeOut " << exposeOut << '\n';
         return static_cast<int16>(EXT_TRIG_INTERNAL | exposeOut);
     }
 
-    if (enumContains(hcam, PARAM_EXPOSURE_MODE, TIMED_MODE))
+    throw std::runtime_error("Camera does not report EXT_TRIG_INTERNAL or TIMED_MODE exposure support.");
+}
+
+const char* exposureResolutionName(int32 expRes)
+{
+    switch (expRes)
     {
-        return TIMED_MODE;
+    case EXP_RES_ONE_MILLISEC:
+        return "milliseconds";
+    case EXP_RES_ONE_MICROSEC:
+        return "microseconds";
+    case EXP_RES_ONE_SEC:
+        return "seconds";
+    default:
+        return "unknown";
+    }
+}
+
+struct ExposureResolution
+{
+    int32 mode = EXP_RES_ONE_MILLISEC;
+    double unitsPerMillisecond = 1.0;
+};
+
+ExposureResolution configureExposureResolution(int16 hcam)
+{
+    ExposureResolution result;
+
+    int32 current = EXP_RES_ONE_MILLISEC;
+    const bool hasCurrent = getParam(hcam, PARAM_EXP_RES, ATTR_CURRENT, current, "PARAM_EXP_RES", false);
+
+    uns32 count = 0;
+    if (PV_OK == pl_get_param(hcam, PARAM_EXP_RES, ATTR_COUNT, &count))
+    {
+        for (uns32 index = 0; index < count; ++index)
+        {
+            int32 value = 0;
+            uns32 length = 0;
+            if (PV_OK != pl_enum_str_length(hcam, PARAM_EXP_RES, index, &length) || length == 0)
+            {
+                continue;
+            }
+
+            std::vector<char> text(length + 1, '\0');
+            if (PV_OK == pl_get_enum_param(hcam, PARAM_EXP_RES, index, &value, text.data(), length))
+            {
+                std::cout << "Exposure resolution option " << index << ": value=" << value
+                          << ", text=" << text.data() << '\n';
+                if (value == EXP_RES_ONE_MILLISEC)
+                {
+                    uns16 expResIndex = static_cast<uns16>(index);
+                    if (PV_OK == pl_set_param(hcam, PARAM_EXP_RES_INDEX, &expResIndex))
+                    {
+                        current = EXP_RES_ONE_MILLISEC;
+                        std::cout << "Selected exposure resolution: milliseconds\n";
+                    }
+                    else
+                    {
+                        std::cout << "Failed to set millisecond exposure resolution: " << pvcamError() << '\n';
+                    }
+                    break;
+                }
+            }
+        }
+    }
+    else if (hasCurrent)
+    {
+        std::cout << "Exposure resolution options unavailable; current is " << exposureResolutionName(current) << '\n';
+    }
+    else
+    {
+        std::cout << "Exposure resolution unavailable; assuming milliseconds.\n";
     }
 
-    throw std::runtime_error("Camera does not report EXT_TRIG_INTERNAL or TIMED_MODE exposure support.");
+    result.mode = current;
+    switch (current)
+    {
+    case EXP_RES_ONE_MICROSEC:
+        result.unitsPerMillisecond = 1000.0;
+        break;
+    case EXP_RES_ONE_SEC:
+        result.unitsPerMillisecond = 0.001;
+        break;
+    case EXP_RES_ONE_MILLISEC:
+    default:
+        result.unitsPerMillisecond = 1.0;
+        break;
+    }
+    std::cout << "Exposure resolution in use: " << exposureResolutionName(current)
+              << ", units/ms=" << result.unitsPerMillisecond << '\n';
+    return result;
 }
 
 rgn_type makeCenteredRoi(uns16 sensorWidth, uns16 sensorHeight, const Options& options)
@@ -240,6 +333,7 @@ bool waitForReadout(int16 hcam, uns32 timeoutMs, uns32& bytesArrived)
 {
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeoutMs);
     int16 status = 0;
+    int16 lastStatus = -1;
     bytesArrived = 0;
 
     while (std::chrono::steady_clock::now() < deadline)
@@ -261,10 +355,12 @@ bool waitForReadout(int16 hcam, uns32 timeoutMs, uns32& bytesArrived)
             return false;
         }
 
+        lastStatus = status;
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
 
-    std::cerr << "Timed out waiting for frame readout.\n";
+    std::cerr << "Timed out waiting for frame readout. Last status=" << lastStatus
+              << ", bytes arrived=" << bytesArrived << '\n';
     return false;
 }
 
@@ -335,17 +431,22 @@ int main(int argc, char** argv)
         const rgn_type roi = makeCenteredRoi(sensorWidth, sensorHeight, options);
         const int width = roiWidth(roi);
         const int height = roiHeight(roi);
+        const ExposureResolution expResolution = configureExposureResolution(hcam);
+        const uns32 exposureUnits = std::max<uns32>(
+            1,
+            static_cast<uns32>(std::llround(static_cast<double>(options.exposureMs) * expResolution.unitsPerMillisecond)));
         const int16 expMode = selectInternalExposureMode(hcam);
 
         std::cout << "Sensor: " << sensorWidth << "x" << sensorHeight << '\n';
         std::cout << "ROI: s=[" << roi.s1 << "," << roi.s2 << "], p=[" << roi.p1 << "," << roi.p2
                   << "], output=" << width << "x" << height << '\n';
-        std::cout << "Frames: " << options.frames << ", exposure: " << options.exposureMs << " ms\n";
+        std::cout << "Frames: " << options.frames << ", exposure: " << options.exposureMs
+                  << " ms (" << exposureUnits << " PVCAM units)\n";
         std::cout << "Output: " << options.outputDir.string() << '\n';
 
         uns32 exposureBytes = 0;
         if (!check(PV_OK == pl_exp_setup_seq(hcam, 1, 1, const_cast<rgn_type*>(&roi), expMode,
-                       options.exposureMs, &exposureBytes),
+                       exposureUnits, &exposureBytes),
                 "pl_exp_setup_seq"))
         {
             return 1;

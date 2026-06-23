@@ -545,6 +545,9 @@ MainWindow::MainWindow(QWidget* parent)
             appendLog(QStringLiteral("Failed to load last_session.json: %1").arg(loadError));
         }
     }
+    appendLog(QStringLiteral("App executable: %1").arg(QCoreApplication::applicationFilePath()));
+    appendLog(QStringLiteral("Build stamp: %1 %2")
+        .arg(QString::fromLatin1(__DATE__), QString::fromLatin1(__TIME__)));
 }
 
 MainWindow::~MainWindow()
@@ -809,7 +812,11 @@ void MainWindow::startCameraLivePreview()
     settings.previewOnly = true;
     settings.outputDir = cameraSaveDirEdit_->text();
 
-    appendLog(QStringLiteral("Starting Kinetix live preview..."));
+    appendLog(QStringLiteral("Starting Kinetix live preview: exposure=%1 ms, ROI=%2x%3%4.")
+        .arg(settings.exposureMs)
+        .arg(settings.roiWidth)
+        .arg(settings.roiHeight)
+        .arg(settings.fullFrame ? QStringLiteral(", full frame") : QString()));
     QMetaObject::invokeMethod(
         cameraWorker_,
         "startCapture",

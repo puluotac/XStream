@@ -10,3 +10,4 @@
 - Fixed offline TIFF writer shutdown so repeated `finish()` calls do not cause a completion-time crash.
 - Verified after clean Release rebuild: `ctest --output-on-failure -C Release`, offline FBP smoke, and offline Gridrec smoke passed with `--tiff-threads 4`.
 - Fixed Kinetix live/capture preview initialization: the first camera frame now rebuilds the preview histogram/window from real image data, logs frame metadata, and UI preview signals are throttled to avoid full-frame event backlog.
+- Fixed Kinetix PVCAM sequence timeout by normalizing `PARAM_EXP_RES` to millisecond exposure units before `pl_exp_setup_seq`; added exposure mode/status diagnostics for future readout timeouts.

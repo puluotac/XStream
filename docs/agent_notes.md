@@ -57,10 +57,13 @@ ctest --test-dir build\vs2022-release --output-on-failure -C Release
 - Offline FBP/Gridrec use GPU-side `float32 -> uint16` conversion through `launchConvertFloatVolumeToUint16()` before downloading chunk data to CPU.
 - Save window is calibrated from the center zChunk using fixed percentiles, then reused for the whole dataset. This avoids per-slice contrast changes in Avizo.
 - Kinetix preview is intentionally throttled before the UI signal path. Full 3200x3200 frames are too large to emit/render at every exposure; capture queues still receive every non-preview frame, while the UI receives enough frames for live display.
+- PVCAM internal capture now normalizes `PARAM_EXP_RES` to millisecond units before `pl_exp_setup_seq` and converts UI exposure milliseconds to the active PVCAM units. On the beamline Kinetix, leaving exposure resolution implicit can make sequence acquisition set up successfully but stay in `EXPOSURE_IN_PROGRESS` until timeout. The worker also logs the selected exposure mode and resolution.
 
 ## Known Pitfall
 
 After adding `AppConfig::io.tiffThreads`, an incremental Release build produced an ABI mismatch: headless printed `tiffThreads=4`, but offline reconstruction received `1` or writer logged `64`, and the process exited with `0xC0000005` after finishing. A clean Release rebuild fixed this. If a shared config structure changes again, prefer a clean rebuild before trusting smoke results.
+
+The old nested Debug executable can remain at `build\vs2022-debug\Debug\ct_workstation_app.exe` from an older Visual Studio-generator build. Current CMake presets generate Ninja executables directly at `build\vs2022-debug\ct_workstation_app.exe` and `build\vs2022-release\ct_workstation_app.exe`. If camera logs do not show `App executable`, `Build stamp`, or PVCAM exposure-resolution diagnostics, the user is likely running an obsolete exe path.
 
 ## Smoke Verification From 2026-06-23
 

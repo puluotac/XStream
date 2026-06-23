@@ -8,6 +8,7 @@
 #include <opencv2/imgcodecs.hpp>
 
 #include <algorithm>
+#include <cmath>
 #include <iomanip>
 #include <sstream>
 #include <stdexcept>
@@ -69,8 +70,109 @@ bool enumContains(int16 hcam, uns32 paramId, int32 wanted)
     return false;
 }
 
+QString exposureModeLabel(int16 expMode)
+{
+    if (expMode == TIMED_MODE)
+    {
+        return QStringLiteral("TIMED_MODE");
+    }
+    if ((expMode & EXT_TRIG_INTERNAL) == EXT_TRIG_INTERNAL)
+    {
+        return QStringLiteral("EXT_TRIG_INTERNAL | exposeOut %1").arg(expMode & ~EXT_TRIG_INTERNAL);
+    }
+    return QStringLiteral("mode %1").arg(expMode);
+}
+
+QString exposureResolutionLabel(int32 expRes)
+{
+    switch (expRes)
+    {
+    case EXP_RES_ONE_MILLISEC:
+        return QStringLiteral("milliseconds");
+    case EXP_RES_ONE_MICROSEC:
+        return QStringLiteral("microseconds");
+    case EXP_RES_ONE_SEC:
+        return QStringLiteral("seconds");
+    default:
+        return QStringLiteral("unknown(%1)").arg(expRes);
+    }
+}
+
+struct ExposureResolution
+{
+    int32 mode = EXP_RES_ONE_MILLISEC;
+    double unitsPerMillisecond = 1.0;
+    QString logText;
+};
+
+ExposureResolution configureExposureResolution(int16 hcam)
+{
+    ExposureResolution result;
+
+    int32 current = EXP_RES_ONE_MILLISEC;
+    const bool hasCurrent = getParam(hcam, PARAM_EXP_RES, ATTR_CURRENT, current);
+
+    uns32 count = 0;
+    if (PV_OK == pl_get_param(hcam, PARAM_EXP_RES, ATTR_COUNT, &count))
+    {
+        for (uns32 index = 0; index < count; ++index)
+        {
+            int32 value = 0;
+            uns32 length = 0;
+            if (PV_OK != pl_enum_str_length(hcam, PARAM_EXP_RES, index, &length) || length == 0)
+            {
+                continue;
+            }
+
+            std::vector<char> text(length + 1, '\0');
+            if (PV_OK == pl_get_enum_param(hcam, PARAM_EXP_RES, index, &value, text.data(), length)
+                && value == EXP_RES_ONE_MILLISEC)
+            {
+                uns16 expResIndex = static_cast<uns16>(index);
+                if (PV_OK == pl_set_param(hcam, PARAM_EXP_RES_INDEX, &expResIndex))
+                {
+                    current = EXP_RES_ONE_MILLISEC;
+                    result.logText = QStringLiteral("Exposure resolution set to milliseconds.");
+                }
+                break;
+            }
+        }
+    }
+
+    if (result.logText.isEmpty() && hasCurrent)
+    {
+        result.logText = QStringLiteral("Using existing exposure resolution: %1.")
+            .arg(exposureResolutionLabel(current));
+    }
+    else if (result.logText.isEmpty())
+    {
+        result.logText = QStringLiteral("Exposure resolution unavailable; assuming milliseconds.");
+    }
+
+    result.mode = current;
+    switch (current)
+    {
+    case EXP_RES_ONE_MICROSEC:
+        result.unitsPerMillisecond = 1000.0;
+        break;
+    case EXP_RES_ONE_SEC:
+        result.unitsPerMillisecond = 0.001;
+        break;
+    case EXP_RES_ONE_MILLISEC:
+    default:
+        result.unitsPerMillisecond = 1.0;
+        break;
+    }
+    return result;
+}
+
 int16 selectInternalExposureMode(int16 hcam)
 {
+    if (enumContains(hcam, PARAM_EXPOSURE_MODE, TIMED_MODE))
+    {
+        return TIMED_MODE;
+    }
+
     if (enumContains(hcam, PARAM_EXPOSURE_MODE, EXT_TRIG_INTERNAL))
     {
         int16 exposeOut = EXPOSE_OUT_FIRST_ROW;
@@ -90,11 +192,6 @@ int16 selectInternalExposureMode(int16 hcam)
             }
         }
         return static_cast<int16>(EXT_TRIG_INTERNAL | exposeOut);
-    }
-
-    if (enumContains(hcam, PARAM_EXPOSURE_MODE, TIMED_MODE))
-    {
-        return TIMED_MODE;
     }
 
     throw std::runtime_error("Camera does not report an internal timed exposure mode.");
@@ -154,6 +251,7 @@ bool waitForReadout(int16 hcam, uns32 timeoutMs, std::atomic_bool& stopRequested
 {
     const qint64 deadline = QDateTime::currentMSecsSinceEpoch() + timeoutMs;
     int16 status = 0;
+    int16 lastStatus = -1;
     bytesArrived = 0;
 
     while (QDateTime::currentMSecsSinceEpoch() < deadline)
@@ -165,6 +263,7 @@ bool waitForReadout(int16 hcam, uns32 timeoutMs, std::atomic_bool& stopRequested
 
         if (PV_OK != pl_exp_check_status(hcam, &status, &bytesArrived))
         {
+            qWarning("pl_exp_check_status failed: %s", qPrintable(pvcamError()));
             return false;
         }
 
@@ -175,9 +274,12 @@ bool waitForReadout(int16 hcam, uns32 timeoutMs, std::atomic_bool& stopRequested
 
         if (status != EXPOSURE_IN_PROGRESS && status != READOUT_IN_PROGRESS)
         {
+            qWarning("Unexpected PVCAM acquisition status: %d, bytes=%u", static_cast<int>(status), bytesArrived);
             return false;
         }
+        lastStatus = status;
     }
+    qWarning("PVCAM readout timeout: lastStatus=%d, bytes=%u", static_cast<int>(lastStatus), bytesArrived);
     return false;
 }
 
@@ -282,11 +384,15 @@ void PvcamCameraWorker::startCapture(const PvcamCaptureSettings& rawSettings)
         const int height = roiHeight(roi);
         const int strideBytes = width * bytesPerPixel;
 
+        const ExposureResolution expResolution = configureExposureResolution(hcam);
+        const uns32 exposureUnits = std::max<uns32>(
+            1,
+            static_cast<uns32>(std::llround(static_cast<double>(settings.exposureMs) * expResolution.unitsPerMillisecond)));
         const int16 expMode = selectInternalExposureMode(hcam);
         uns32 exposureBytes = 0;
         rgn_type mutableRoi = roi;
         if (PV_OK != pl_exp_setup_seq(hcam, 1, 1, &mutableRoi, expMode,
-                static_cast<uns32>(settings.exposureMs), &exposureBytes))
+                exposureUnits, &exposureBytes))
         {
             throw std::runtime_error(pvcamError().toStdString());
         }
@@ -305,6 +411,10 @@ void PvcamCameraWorker::startCapture(const PvcamCaptureSettings& rawSettings)
             .arg(cvType)
             .arg(strideBytes)
             .arg(exposureBytes));
+        emit logMessage(QStringLiteral("Kinetix %1").arg(expResolution.logText));
+        emit logMessage(QStringLiteral("Kinetix exposure mode: %1 (%2 ms).")
+            .arg(exposureModeLabel(expMode))
+            .arg(settings.exposureMs));
 
         if (settings.saveRaw)
         {
@@ -335,7 +445,7 @@ void PvcamCameraWorker::startCapture(const PvcamCaptureSettings& rawSettings)
                 {
                     break;
                 }
-                throw std::runtime_error("Timed out waiting for Kinetix frame.");
+                throw std::runtime_error("Timed out waiting for Kinetix frame; check trigger mode/camera state.");
             }
 
             cv::Mat wrapped(height, width, cvType, frameBuffer.data(), static_cast<size_t>(strideBytes));
