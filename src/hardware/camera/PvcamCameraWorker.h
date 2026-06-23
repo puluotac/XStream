@@ -32,6 +32,7 @@ struct PvcamCaptureSettings
     int queueCapacity = 256;
     bool saveRaw = false;
     bool previewOnly = false;
+    bool enqueueFrames = true;
     QString outputDir;
     QString filePrefix = QStringLiteral("kinetix_frame_");
     int filePadding = 6;

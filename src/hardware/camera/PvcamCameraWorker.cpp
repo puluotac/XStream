@@ -495,7 +495,10 @@ void PvcamCameraWorker::startCapture(const PvcamCaptureSettings& rawSettings)
     settings.roiHeight = std::max(1, settings.roiHeight);
     settings.queueCapacity = std::max(1, settings.queueCapacity);
     settings.filePadding = std::clamp(settings.filePadding, 1, 12);
-    settings.previewIntervalMs = std::clamp<qint64>(settings.previewIntervalMs, 33, 1000);
+    if (settings.previewIntervalMs > 0)
+    {
+        settings.previewIntervalMs = std::clamp<qint64>(settings.previewIntervalMs, 33, 1000);
+    }
     if (settings.filePrefix.isEmpty())
     {
         settings.filePrefix = QStringLiteral("kinetix_frame_");
@@ -577,7 +580,7 @@ void PvcamCameraWorker::startCapture(const PvcamCaptureSettings& rawSettings)
         std::vector<unsigned char> frameBuffer(exposureBytes);
         emit cameraStateChanged(settings.previewOnly ? QStringLiteral("Live") : QStringLiteral("Capturing"));
         emit logMessage(QStringLiteral("Kinetix setup ready in %1 ms.").arg(acquisitionTimer.elapsed()));
-        qint64 lastPreviewEmitMs = -settings.previewIntervalMs;
+        qint64 lastPreviewEmitMs = settings.previewIntervalMs > 0 ? -settings.previewIntervalMs : 0;
 
         for (int frameIndex = 0; (settings.previewOnly || frameIndex < settings.frameCount) && !stopRequested_.load(); ++frameIndex)
         {
@@ -619,7 +622,7 @@ void PvcamCameraWorker::startCapture(const PvcamCaptureSettings& rawSettings)
                 emit logMessage(QStringLiteral("Kinetix first frame acquired in %1 ms.").arg(acquisitionTimer.elapsed()));
             }
 
-            if (!settings.previewOnly && !settings.saveRaw && !queue_->push(frame))
+            if (!settings.previewOnly && !settings.saveRaw && settings.enqueueFrames && !queue_->push(frame))
             {
                 ++droppedCount_;
                 throw std::runtime_error("Camera frame queue is full; capture stopped to avoid frame loss.");
@@ -641,6 +644,7 @@ void PvcamCameraWorker::startCapture(const PvcamCaptureSettings& rawSettings)
             const bool shouldEmitPreview =
                 frameIndex == 0
                 || isLastFiniteCaptureFrame
+                || settings.previewIntervalMs <= 0
                 || frame.timestampMs - lastPreviewEmitMs >= settings.previewIntervalMs;
             if (shouldEmitPreview)
             {

@@ -70,6 +70,9 @@ target_compile_options(ct_workstation_cuda
 add_library(ct_workstation_core STATIC
     src/app/ReconstructionController.h
     src/app/ReconstructionController.cpp
+    src/core/acq/CtAcquisitionTypes.h
+    src/core/acq/CtTiffWriter.h
+    src/core/acq/CtTiffWriter.cpp
     src/core/config/AppConfig.h
     src/core/config/AppConfig.cpp
     src/core/common/GeometryVectorGenerator.h

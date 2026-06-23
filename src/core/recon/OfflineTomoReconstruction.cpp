@@ -62,6 +62,81 @@ QString formatMiBPerSecond(qint64 bytes, qint64 ms)
     return QString::number((static_cast<double>(bytes) / mib) / (static_cast<double>(ms) / 1000.0), 'f', 1);
 }
 
+void validateGeometryImageSize(const cv::Mat& image, const QString& label, const AppConfig& config)
+{
+    if (image.empty())
+    {
+        return;
+    }
+    if (image.rows != config.geometry.volH || image.cols != config.geometry.volW || image.channels() != 1)
+    {
+        throw std::runtime_error(QStringLiteral("%1 image size mismatch: got %2x%3x%4, expected %5x%6x1 from JSON geometry.")
+                .arg(label)
+                .arg(image.cols)
+                .arg(image.rows)
+                .arg(image.channels())
+                .arg(config.geometry.volW)
+                .arg(config.geometry.volH)
+                .toStdString());
+    }
+}
+
+void resolveOfflineGeometryFromConfigOrReferences(AppConfig& config,
+    const cv::Mat& flat,
+    const cv::Mat& dark,
+    const cv::Mat& ref0,
+    const cv::Mat& ref180,
+    const OfflineTomoReconstruction::LogCallback& log)
+{
+    if (config.geometry.volW <= 0 || config.geometry.volH <= 0)
+    {
+        const cv::Mat* source = nullptr;
+        QString sourceLabel;
+        if (!flat.empty())
+        {
+            source = &flat;
+            sourceLabel = QStringLiteral("flat");
+        }
+        else if (!ref0.empty())
+        {
+            source = &ref0;
+            sourceLabel = QStringLiteral("0 deg reference");
+        }
+        else if (!ref180.empty())
+        {
+            source = &ref180;
+            sourceLabel = QStringLiteral("180 deg reference");
+        }
+        else if (!dark.empty())
+        {
+            source = &dark;
+            sourceLabel = QStringLiteral("dark");
+        }
+
+        if (source == nullptr)
+        {
+            throw std::runtime_error("Offline geometry VOL_W/VOL_H are missing and no reference image is available to infer them.");
+        }
+        config.geometry.volH = source->rows;
+        config.geometry.volW = source->cols;
+        log(QStringLiteral("Offline geometry inferred from %1: VOL_W=%2, VOL_H=%3.")
+                .arg(sourceLabel)
+                .arg(config.geometry.volW)
+                .arg(config.geometry.volH));
+    }
+    else
+    {
+        log(QStringLiteral("Offline geometry uses JSON VOL_W=%1, VOL_H=%2; reference images are only used for correction/COR.")
+                .arg(config.geometry.volW)
+                .arg(config.geometry.volH));
+    }
+
+    validateGeometryImageSize(flat, QStringLiteral("Flat"), config);
+    validateGeometryImageSize(dark, QStringLiteral("Dark"), config);
+    validateGeometryImageSize(ref0, QStringLiteral("0 deg reference"), config);
+    validateGeometryImageSize(ref180, QStringLiteral("180 deg reference"), config);
+}
+
 int paddedLengthForWidth(int width)
 {
     int padded = 1;
@@ -1487,15 +1562,26 @@ OfflineTomoResult OfflineTomoReconstruction::run(const AppConfig& inputConfig,
     cv::Mat ref180;
     QString ref0Path;
     QString ref180Path;
-    log(QStringLiteral("Offline waiting for 0 deg and 180 deg reference files..."));
-    if (!source.waitForSpecificFile(config.io.filePattern0, QStringLiteral("0 Deg"), ref0, &ref0Path, stopRequested)
-        || !source.waitForSpecificFile(config.io.filePattern180, QStringLiteral("180 Deg"), ref180, &ref180Path, stopRequested))
+    if (config.geometry.corAuto)
     {
-        throw std::runtime_error("Failed to acquire COR reference files.");
+        log(QStringLiteral("Offline waiting for 0 deg and 180 deg reference files..."));
+        if (!source.waitForSpecificFile(config.io.filePattern0, QStringLiteral("0 Deg"), ref0, &ref0Path, stopRequested)
+            || !source.waitForSpecificFile(config.io.filePattern180, QStringLiteral("180 Deg"), ref180, &ref180Path, stopRequested))
+        {
+            throw std::runtime_error("Failed to acquire COR reference files.");
+        }
+    }
+    else if (flat.empty() && (config.geometry.volW <= 0 || config.geometry.volH <= 0))
+    {
+        log(QStringLiteral("Offline Auto COR disabled; loading first projection to resolve geometry."));
+        if (!source.waitForSpecificFile(config.io.filePattern0, QStringLiteral("0 Deg"), ref0, &ref0Path, stopRequested))
+        {
+            throw std::runtime_error("Failed to acquire first projection for geometry.");
+        }
     }
 
-    config.geometry.volH = !flat.empty() ? flat.rows : ref0.rows;
-    config.geometry.volW = !flat.empty() ? flat.cols : ref0.cols;
+    resolveOfflineGeometryFromConfigOrReferences(config, flat, dark, ref0, ref180, log);
+
     const size_t projectionStackBytes = static_cast<size_t>(config.geometry.totalAngles)
         * config.geometry.volH * config.geometry.volW * sizeof(float);
     const size_t chunkBytes = static_cast<size_t>(std::min(config.compute.zChunkSize, config.geometry.volH))
