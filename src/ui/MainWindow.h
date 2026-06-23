@@ -131,7 +131,8 @@ private:
     QSpinBox* tiffThreadsSpin_ = nullptr;
     QLineEdit* savePrefixEdit_ = nullptr;
 
-    QSpinBox* cameraExposureSpin_ = nullptr;
+    QDoubleSpinBox* cameraExposureSpin_ = nullptr;
+    QComboBox* cameraExposureUnitCombo_ = nullptr;
     QSpinBox* cameraRoiWidthSpin_ = nullptr;
     QSpinBox* cameraRoiHeightSpin_ = nullptr;
     QSpinBox* cameraFrameCountSpin_ = nullptr;

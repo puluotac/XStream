@@ -58,6 +58,7 @@ ctest --test-dir build\vs2022-release --output-on-failure -C Release
 - Save window is calibrated from the center zChunk using fixed percentiles, then reused for the whole dataset. This avoids per-slice contrast changes in Avizo.
 - Kinetix preview is intentionally throttled before the UI signal path. Full 3200x3200 frames are too large to emit/render at every exposure; capture queues still receive every non-preview frame, while the UI receives enough frames for live display.
 - PVCAM internal capture now normalizes `PARAM_EXP_RES` to millisecond units before `pl_exp_setup_seq` and converts UI exposure milliseconds to the active PVCAM units. On the beamline Kinetix, leaving exposure resolution implicit can make sequence acquisition set up successfully but stay in `EXPOSURE_IN_PROGRESS` until timeout. The worker also logs the selected exposure mode and resolution.
+- Kinetix exposure UI is `value + unit` (`us/ms/s`). The worker preserves physical exposure time by selecting the requested PVCAM exposure resolution when available, otherwise falling back to milliseconds and converting units. Live startup currently still opens/configures/closes the camera per run; vendor software feels instant because it keeps the camera opened and preconfigured. A future fast-live pass should introduce a persistent camera session/state machine instead of repeating `pl_pvcam_init/pl_cam_open/pl_exp_setup_seq` for every Live click.
 
 ## Known Pitfall
 

@@ -12,10 +12,18 @@
 namespace ct
 {
 
+enum class PvcamExposureUnit
+{
+    Microseconds,
+    Milliseconds,
+    Seconds
+};
+
 struct PvcamCaptureSettings
 {
     int frameCount = 10;
-    int exposureMs = 10;
+    double exposureValue = 10.0;
+    PvcamExposureUnit exposureUnit = PvcamExposureUnit::Milliseconds;
     int roiWidth = 512;
     int roiHeight = 512;
     bool fullFrame = false;

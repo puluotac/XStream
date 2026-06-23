@@ -2,6 +2,7 @@
 
 #include <QDateTime>
 #include <QDir>
+#include <QElapsedTimer>
 #include <QFileInfo>
 #include <QMetaType>
 
@@ -105,16 +106,61 @@ struct ExposureResolution
     QString logText;
 };
 
-ExposureResolution configureExposureResolution(int16 hcam)
+int32 pvcamResolutionForUnit(PvcamExposureUnit unit)
+{
+    switch (unit)
+    {
+    case PvcamExposureUnit::Microseconds:
+        return EXP_RES_ONE_MICROSEC;
+    case PvcamExposureUnit::Seconds:
+        return EXP_RES_ONE_SEC;
+    case PvcamExposureUnit::Milliseconds:
+    default:
+        return EXP_RES_ONE_MILLISEC;
+    }
+}
+
+QString exposureUnitLabel(PvcamExposureUnit unit)
+{
+    switch (unit)
+    {
+    case PvcamExposureUnit::Microseconds:
+        return QStringLiteral("us");
+    case PvcamExposureUnit::Seconds:
+        return QStringLiteral("s");
+    case PvcamExposureUnit::Milliseconds:
+    default:
+        return QStringLiteral("ms");
+    }
+}
+
+double exposureMilliseconds(double value, PvcamExposureUnit unit)
+{
+    switch (unit)
+    {
+    case PvcamExposureUnit::Microseconds:
+        return value / 1000.0;
+    case PvcamExposureUnit::Seconds:
+        return value * 1000.0;
+    case PvcamExposureUnit::Milliseconds:
+    default:
+        return value;
+    }
+}
+
+ExposureResolution configureExposureResolution(int16 hcam, PvcamExposureUnit requestedUnit)
 {
     ExposureResolution result;
 
     int32 current = EXP_RES_ONE_MILLISEC;
     const bool hasCurrent = getParam(hcam, PARAM_EXP_RES, ATTR_CURRENT, current);
+    const int32 requestedResolution = pvcamResolutionForUnit(requestedUnit);
 
     uns32 count = 0;
     if (PV_OK == pl_get_param(hcam, PARAM_EXP_RES, ATTR_COUNT, &count))
     {
+        int preferredIndex = -1;
+        int millisecondIndex = -1;
         for (uns32 index = 0; index < count; ++index)
         {
             int32 value = 0;
@@ -125,16 +171,30 @@ ExposureResolution configureExposureResolution(int16 hcam)
             }
 
             std::vector<char> text(length + 1, '\0');
-            if (PV_OK == pl_get_enum_param(hcam, PARAM_EXP_RES, index, &value, text.data(), length)
-                && value == EXP_RES_ONE_MILLISEC)
+            if (PV_OK == pl_get_enum_param(hcam, PARAM_EXP_RES, index, &value, text.data(), length))
             {
-                uns16 expResIndex = static_cast<uns16>(index);
-                if (PV_OK == pl_set_param(hcam, PARAM_EXP_RES_INDEX, &expResIndex))
+                if (value == requestedResolution)
                 {
-                    current = EXP_RES_ONE_MILLISEC;
-                    result.logText = QStringLiteral("Exposure resolution set to milliseconds.");
+                    preferredIndex = static_cast<int>(index);
                 }
-                break;
+                if (value == EXP_RES_ONE_MILLISEC)
+                {
+                    millisecondIndex = static_cast<int>(index);
+                }
+            }
+        }
+
+        const int selectedIndex = preferredIndex >= 0 ? preferredIndex : millisecondIndex;
+        if (selectedIndex >= 0)
+        {
+            uns16 expResIndex = static_cast<uns16>(selectedIndex);
+            if (PV_OK == pl_set_param(hcam, PARAM_EXP_RES_INDEX, &expResIndex))
+            {
+                current = preferredIndex >= 0 ? requestedResolution : EXP_RES_ONE_MILLISEC;
+                result.logText = preferredIndex >= 0
+                    ? QStringLiteral("Exposure resolution set to %1.").arg(exposureResolutionLabel(current))
+                    : QStringLiteral("Requested %1 exposure units unavailable; using milliseconds.")
+                          .arg(exposureResolutionLabel(requestedResolution));
             }
         }
     }
@@ -312,10 +372,11 @@ void PvcamCameraWorker::startCapture(const PvcamCaptureSettings& rawSettings)
 
     PvcamCaptureSettings settings = rawSettings;
     settings.frameCount = std::max(1, settings.frameCount);
-    settings.exposureMs = std::max(1, settings.exposureMs);
+    settings.exposureValue = std::max(0.001, settings.exposureValue);
     settings.roiWidth = std::max(1, settings.roiWidth);
     settings.roiHeight = std::max(1, settings.roiHeight);
     settings.queueCapacity = std::max(1, settings.queueCapacity);
+    const double exposureMs = std::max(0.001, exposureMilliseconds(settings.exposureValue, settings.exposureUnit));
 
     stopRequested_.store(false);
     droppedCount_ = 0;
@@ -335,6 +396,8 @@ void PvcamCameraWorker::startCapture(const PvcamCaptureSettings& rawSettings)
 
     try
     {
+        QElapsedTimer acquisitionTimer;
+        acquisitionTimer.start();
         emit cameraStateChanged(QStringLiteral("Opening"));
         if (PV_OK != pl_pvcam_init())
         {
@@ -384,10 +447,10 @@ void PvcamCameraWorker::startCapture(const PvcamCaptureSettings& rawSettings)
         const int height = roiHeight(roi);
         const int strideBytes = width * bytesPerPixel;
 
-        const ExposureResolution expResolution = configureExposureResolution(hcam);
+        const ExposureResolution expResolution = configureExposureResolution(hcam, settings.exposureUnit);
         const uns32 exposureUnits = std::max<uns32>(
             1,
-            static_cast<uns32>(std::llround(static_cast<double>(settings.exposureMs) * expResolution.unitsPerMillisecond)));
+            static_cast<uns32>(std::llround(exposureMs * expResolution.unitsPerMillisecond)));
         const int16 expMode = selectInternalExposureMode(hcam);
         uns32 exposureBytes = 0;
         rgn_type mutableRoi = roi;
@@ -412,9 +475,12 @@ void PvcamCameraWorker::startCapture(const PvcamCaptureSettings& rawSettings)
             .arg(strideBytes)
             .arg(exposureBytes));
         emit logMessage(QStringLiteral("Kinetix %1").arg(expResolution.logText));
-        emit logMessage(QStringLiteral("Kinetix exposure mode: %1 (%2 ms).")
+        emit logMessage(QStringLiteral("Kinetix exposure mode: %1 (%2 %3 = %4 ms, %5 PVCAM units).")
             .arg(exposureModeLabel(expMode))
-            .arg(settings.exposureMs));
+            .arg(settings.exposureValue)
+            .arg(exposureUnitLabel(settings.exposureUnit))
+            .arg(exposureMs, 0, 'f', 3)
+            .arg(exposureUnits));
 
         if (settings.saveRaw)
         {
@@ -427,6 +493,7 @@ void PvcamCameraWorker::startCapture(const PvcamCaptureSettings& rawSettings)
 
         std::vector<unsigned char> frameBuffer(exposureBytes);
         emit cameraStateChanged(settings.previewOnly ? QStringLiteral("Live") : QStringLiteral("Capturing"));
+        emit logMessage(QStringLiteral("Kinetix setup ready in %1 ms.").arg(acquisitionTimer.elapsed()));
         qint64 lastPreviewEmitMs = -kPreviewSignalMinIntervalMs;
 
         for (int frameIndex = 0; (settings.previewOnly || frameIndex < settings.frameCount) && !stopRequested_.load(); ++frameIndex)
@@ -437,7 +504,7 @@ void PvcamCameraWorker::startCapture(const PvcamCaptureSettings& rawSettings)
             }
 
             uns32 bytesArrived = 0;
-            const uns32 timeoutMs = std::max<uns32>(5000, static_cast<uns32>(settings.exposureMs + 5000));
+            const uns32 timeoutMs = std::max<uns32>(5000, static_cast<uns32>(std::ceil(exposureMs + 5000.0)));
             if (!waitForReadout(hcam, timeoutMs, stopRequested_, bytesArrived))
             {
                 pl_exp_abort(hcam, CCS_HALT);
@@ -463,6 +530,10 @@ void PvcamCameraWorker::startCapture(const PvcamCaptureSettings& rawSettings)
             if (PV_OK != pl_exp_finish_seq(hcam, frameBuffer.data(), 0))
             {
                 emit logMessage(QStringLiteral("pl_exp_finish_seq warning: %1").arg(pvcamError()));
+            }
+            if (frameIndex == 0)
+            {
+                emit logMessage(QStringLiteral("Kinetix first frame acquired in %1 ms.").arg(acquisitionTimer.elapsed()));
             }
 
             if (!settings.previewOnly && !queue_->push(frame))

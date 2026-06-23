@@ -78,6 +78,19 @@ const MotorAxisDefinition kMotorAxes[] = {
     { "Det_OT2_Y", "Kinetix detector horizontal travel", "XA16F-L2301", 9, "CH5-1", "mm", 2000.0, 0.01, 1.0 },
 };
 
+PvcamExposureUnit cameraExposureUnitFromText(const QString& text)
+{
+    if (text == QStringLiteral("us"))
+    {
+        return PvcamExposureUnit::Microseconds;
+    }
+    if (text == QStringLiteral("s"))
+    {
+        return PvcamExposureUnit::Seconds;
+    }
+    return PvcamExposureUnit::Milliseconds;
+}
+
 } // namespace
 
 MainWindow::MainWindow(QWidget* parent)
@@ -110,9 +123,18 @@ MainWindow::MainWindow(QWidget* parent)
     cameraForm->setFieldGrowthPolicy(QFormLayout::AllNonFixedFieldsGrow);
     cameraStateLabel_ = new QLabel(QStringLiteral("Idle"), cameraGroup);
     cameraStatsLabel_ = new QLabel(QStringLiteral("cap 0 / q 0 / use 0 / drop 0"), cameraGroup);
-    cameraExposureSpin_ = makeSpin<QSpinBox>(cameraGroup, 1, 600000, 1);
-    cameraExposureSpin_->setValue(10);
-    cameraExposureSpin_->setSuffix(QStringLiteral(" ms"));
+    cameraExposureSpin_ = makeSpin<QDoubleSpinBox>(cameraGroup, 0.001, 600000.0, 1.0);
+    cameraExposureSpin_->setValue(10.0);
+    cameraExposureSpin_->setDecimals(3);
+    cameraExposureUnitCombo_ = new QComboBox(cameraGroup);
+    cameraExposureUnitCombo_->addItems({ "us", "ms", "s" });
+    cameraExposureUnitCombo_->setCurrentText(QStringLiteral("ms"));
+    auto* cameraExposureLayout = new QHBoxLayout();
+    cameraExposureLayout->setContentsMargins(0, 0, 0, 0);
+    cameraExposureLayout->addWidget(cameraExposureSpin_, 1);
+    cameraExposureLayout->addWidget(cameraExposureUnitCombo_);
+    auto* cameraExposureWidget = new QWidget(cameraGroup);
+    cameraExposureWidget->setLayout(cameraExposureLayout);
     cameraRoiWidthSpin_ = makeSpin<QSpinBox>(cameraGroup, 1, 10000, 1);
     cameraRoiWidthSpin_->setValue(512);
     cameraRoiHeightSpin_ = makeSpin<QSpinBox>(cameraGroup, 1, 10000, 1);
@@ -148,7 +170,7 @@ MainWindow::MainWindow(QWidget* parent)
     cameraButtonWidget->setLayout(cameraButtonLayout);
     cameraForm->addRow(QStringLiteral("State"), cameraStateLabel_);
     cameraForm->addRow(QStringLiteral("Stats"), cameraStatsLabel_);
-    cameraForm->addRow(QStringLiteral("Exposure"), cameraExposureSpin_);
+    cameraForm->addRow(QStringLiteral("Exposure"), cameraExposureWidget);
     cameraForm->addRow(QStringLiteral("ROI W"), cameraRoiWidthSpin_);
     cameraForm->addRow(QStringLiteral("ROI H"), cameraRoiHeightSpin_);
     cameraForm->addRow(QStringLiteral("Frames"), cameraFrameCountSpin_);
@@ -760,7 +782,8 @@ void MainWindow::startCameraCapture()
 
     PvcamCaptureSettings settings;
     settings.frameCount = cameraFrameCountSpin_->value();
-    settings.exposureMs = cameraExposureSpin_->value();
+    settings.exposureValue = cameraExposureSpin_->value();
+    settings.exposureUnit = cameraExposureUnitFromText(cameraExposureUnitCombo_->currentText());
     settings.roiWidth = cameraRoiWidthSpin_->value();
     settings.roiHeight = cameraRoiHeightSpin_->value();
     settings.fullFrame = cameraFullFrameCheck_->isChecked();
@@ -803,7 +826,8 @@ void MainWindow::startCameraLivePreview()
 
     PvcamCaptureSettings settings;
     settings.frameCount = 1;
-    settings.exposureMs = cameraExposureSpin_->value();
+    settings.exposureValue = cameraExposureSpin_->value();
+    settings.exposureUnit = cameraExposureUnitFromText(cameraExposureUnitCombo_->currentText());
     settings.roiWidth = cameraRoiWidthSpin_->value();
     settings.roiHeight = cameraRoiHeightSpin_->value();
     settings.fullFrame = cameraFullFrameCheck_->isChecked();
@@ -812,8 +836,9 @@ void MainWindow::startCameraLivePreview()
     settings.previewOnly = true;
     settings.outputDir = cameraSaveDirEdit_->text();
 
-    appendLog(QStringLiteral("Starting Kinetix live preview: exposure=%1 ms, ROI=%2x%3%4.")
-        .arg(settings.exposureMs)
+    appendLog(QStringLiteral("Starting Kinetix live preview: exposure=%1 %2, ROI=%3x%4%5.")
+        .arg(settings.exposureValue)
+        .arg(cameraExposureUnitCombo_->currentText())
         .arg(settings.roiWidth)
         .arg(settings.roiHeight)
         .arg(settings.fullFrame ? QStringLiteral(", full frame") : QString()));
