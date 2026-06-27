@@ -10,6 +10,7 @@
 
 #include <QMainWindow>
 #include <QMap>
+#include <QStringList>
 #include <QThread>
 
 #include <opencv2/core.hpp>
@@ -26,6 +27,8 @@ class QComboBox;
 class QCheckBox;
 class QCloseEvent;
 class QListWidget;
+class QFileSystemWatcher;
+class QTimer;
 
 namespace ct
 {
@@ -83,11 +86,21 @@ private:
     void writeCtManifest(bool completed, const QString& errorMessage);
     void enqueueCtReconJob();
     QString reconQueueRoot() const;
+    void ensureReconQueueDirs();
+    void recoverStaleRunningReconJobs();
+    void scheduleReconQueueRefresh();
     void refreshReconQueue();
+    void normalizePendingReconQueue(bool scheduleRefresh = true);
+    void moveSelectedReconQueueJob(int direction);
+    void removeSelectedReconQueueJob();
     void startNextQueuedReconstruction();
     bool startQueuedReconstruction(const QString& jobPath);
-    void finishQueuedReconstruction(bool ok, const QString& message);
+    void finishQueuedReconstruction(bool ok, const QString& message, const QString& failedStage = QString(), const QString& errorCode = QString());
     void updateActiveQueueCor(double shift);
+    QString writeReconResultJson(const QString& jobPath, const QJsonObject& job, const QString& status,
+        const QString& failedStage, const QString& errorCode, const QString& message,
+        const QString& projectionDir, const QString& outputDir, const QString& startedAt,
+        const QString& finishedAt, double initialCor, double autoCor, bool hasAutoCor, double finalCor);
     void stopReconstruction();
     void saveSlices();
     void updatePreviewSlice(const cv::Mat& slice, bool updateHistogram);
@@ -152,6 +165,16 @@ private:
     double ctCurrentAngleDeg_ = 0.0;
     QString ctManifestPath_;
     QString activeQueueJobPath_;
+    QString activeQueueProjectionDir_;
+    QString activeQueueOutputDir_;
+    QString activeQueueStartedAt_;
+    QString activeQueueFinishedStatusOverride_;
+    QString activeQueueFinishedStageOverride_;
+    QString activeQueueFinishedCodeOverride_;
+    double activeQueueInitialCorShift_ = 0.0;
+    double activeQueueAutoCorShift_ = 0.0;
+    bool activeQueueHasAutoCorShift_ = false;
+    QStringList recentLogLines_;
     CtAcquisitionSettings ctSettings_;
     QVector<CtFlatGroup> ctFlatGroups_;
 
@@ -193,6 +216,12 @@ private:
     QSpinBox* tiffThreadsSpin_ = nullptr;
     QLineEdit* savePrefixEdit_ = nullptr;
     QListWidget* reconQueueList_ = nullptr;
+    QPushButton* reconQueueUpButton_ = nullptr;
+    QPushButton* reconQueueDownButton_ = nullptr;
+    QPushButton* reconQueueRemoveButton_ = nullptr;
+    QFileSystemWatcher* reconQueueWatcher_ = nullptr;
+    QTimer* reconQueueRefreshTimer_ = nullptr;
+    QTimer* reconQueuePollTimer_ = nullptr;
 
     QDoubleSpinBox* cameraExposureSpin_ = nullptr;
     QComboBox* cameraExposureUnitCombo_ = nullptr;

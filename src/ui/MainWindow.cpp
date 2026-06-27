@@ -14,6 +14,7 @@
 #include <QFileDialog>
 #include <QFileInfo>
 #include <QFile>
+#include <QFileSystemWatcher>
 #include <QFormLayout>
 #include <QGridLayout>
 #include <QGroupBox>
@@ -25,6 +26,7 @@
 #include <QLabel>
 #include <QLineEdit>
 #include <QListWidget>
+#include <QListWidgetItem>
 #include <QMetaObject>
 #include <QPixmap>
 #include <QProgressBar>
@@ -49,6 +51,7 @@
 #include <algorithm>
 #include <cmath>
 #include <iomanip>
+#include <limits>
 #include <sstream>
 #include <thread>
 
@@ -197,6 +200,39 @@ bool writeJsonFileAtomic(const QString& path, const QJsonObject& object)
     return QFile::rename(tmpPath, path);
 }
 
+bool readJsonFile(const QString& path, QJsonObject* object, QString* errorMessage = nullptr)
+{
+    if (object == nullptr)
+    {
+        if (errorMessage)
+        {
+            *errorMessage = QStringLiteral("Output JSON pointer is null.");
+        }
+        return false;
+    }
+    QFile file(path);
+    if (!file.open(QIODevice::ReadOnly))
+    {
+        if (errorMessage)
+        {
+            *errorMessage = QStringLiteral("Failed to open JSON: %1").arg(path);
+        }
+        return false;
+    }
+    QJsonParseError parseError;
+    const QJsonDocument doc = QJsonDocument::fromJson(file.readAll(), &parseError);
+    if (parseError.error != QJsonParseError::NoError || !doc.isObject())
+    {
+        if (errorMessage)
+        {
+            *errorMessage = QStringLiteral("Invalid JSON %1: %2").arg(path, parseError.errorString());
+        }
+        return false;
+    }
+    *object = doc.object();
+    return true;
+}
+
 QString sanitizeQueueName(QString value)
 {
     value = value.trimmed();
@@ -212,6 +248,189 @@ QString sanitizeQueueName(QString value)
         }
     }
     return value.left(80);
+}
+
+QString queueFileName(int queueIndex, const QString& baseName)
+{
+    return QStringLiteral("%1_%2.json")
+        .arg(std::max(0, queueIndex), 6, 10, QLatin1Char('0'))
+        .arg(sanitizeQueueName(baseName));
+}
+
+int queueIndexFromFileName(const QString& fileName)
+{
+    const int underscore = fileName.indexOf(QLatin1Char('_'));
+    if (underscore <= 0)
+    {
+        return std::numeric_limits<int>::max();
+    }
+    bool ok = false;
+    const int index = fileName.left(underscore).toInt(&ok);
+    return ok ? index : std::numeric_limits<int>::max();
+}
+
+QString queueBaseNameFromPath(const QString& path)
+{
+    QString fileName = QFileInfo(path).fileName();
+    if (fileName.endsWith(QStringLiteral(".renaming")))
+    {
+        fileName.chop(QStringLiteral(".renaming").size());
+    }
+    if (fileName.endsWith(QStringLiteral(".reorder")))
+    {
+        fileName.chop(QStringLiteral(".reorder").size());
+    }
+    if (fileName.endsWith(QStringLiteral(".json")))
+    {
+        fileName.chop(QStringLiteral(".json").size());
+    }
+    QString base = fileName;
+    const int underscore = base.indexOf(QLatin1Char('_'));
+    bool numericPrefix = false;
+    base.left(underscore).toInt(&numericPrefix);
+    if (underscore >= 0 && numericPrefix)
+    {
+        base = base.mid(underscore + 1);
+    }
+    return sanitizeQueueName(base);
+}
+
+QString manifestPathForProjectionDir(const QString& projectionDir)
+{
+    return QDir(projectionDir).filePath(QStringLiteral("scan_manifest.json"));
+}
+
+QString projectionDirFromJob(const QJsonObject& job)
+{
+    QString projectionDir = job.value(QStringLiteral("PROJECTION_DIR")).toString();
+    if (!projectionDir.isEmpty())
+    {
+        return projectionDir;
+    }
+    const QString manifestPath = job.value(QStringLiteral("MANIFEST_PATH")).toString();
+    if (!manifestPath.isEmpty())
+    {
+        return QFileInfo(manifestPath).absolutePath();
+    }
+    return {};
+}
+
+QJsonObject appConfigToJobObject(const AppConfig& cfg)
+{
+    QJsonObject job;
+    job["RECON_METHOD"] = toString(cfg.io.reconMethod);
+
+    QJsonObject geometry;
+    geometry["COR_SHIFT"] = cfg.geometry.corShift;
+    geometry["COR_AUTO"] = cfg.geometry.corAuto;
+    job["GEOMETRY"] = geometry;
+
+    QJsonObject preprocess;
+    preprocess["METHOD"] = toString(cfg.preprocess.method);
+    preprocess["AVE"] = cfg.preprocess.airValue;
+    preprocess["TAPER_WIDTH"] = cfg.preprocess.taperWidth;
+    preprocess["FILTER_TYPE"] = toString(cfg.preprocess.filterType);
+    job["PREPROCESS"] = preprocess;
+
+    QJsonObject compute;
+    compute["BATCH_SIZE"] = cfg.compute.batchSize;
+    compute["Z_CHUNK_SIZE"] = cfg.compute.zChunkSize;
+    compute["GPU_INDEX"] = cfg.compute.gpuIndex;
+    compute["Z_BLOCK_SPLIT"] = cfg.compute.zBlockSplit;
+    job["COMPUTE"] = compute;
+
+    QJsonObject io;
+    io["CORRECTION_MODE"] = toString(cfg.io.correctionMode);
+    io["DARK_PREFIX"] = cfg.io.darkPrefix;
+    io["FILE_PREFIX"] = cfg.io.filePrefix;
+    io["SAVE_DEPTH"] = toString(cfg.io.saveDepth);
+    io["SAVE_FMT"] = cfg.io.saveFormat;
+    io["TIFF_THREADS"] = cfg.io.tiffThreads;
+    job["IO"] = io;
+
+    return job;
+}
+
+void applyJobObjectToConfig(const QJsonObject& job, AppConfig& cfg)
+{
+    const QJsonObject legacyRecon = job.value(QStringLiteral("RECON_CONFIG")).toObject();
+    if (!legacyRecon.isEmpty())
+    {
+        cfg = AppConfig::fromJsonObject(legacyRecon);
+    }
+
+    if (job.contains(QStringLiteral("RECON_METHOD")))
+    {
+        cfg.io.reconMethod = reconMethodFromString(job.value(QStringLiteral("RECON_METHOD")).toString(toString(cfg.io.reconMethod)));
+    }
+    const QJsonObject geometry = job.value(QStringLiteral("GEOMETRY")).toObject();
+    if (!geometry.isEmpty())
+    {
+        cfg.geometry.corShift = static_cast<float>(geometry.value(QStringLiteral("COR_SHIFT")).toDouble(cfg.geometry.corShift));
+        cfg.geometry.corAuto = geometry.value(QStringLiteral("COR_AUTO")).toBool(cfg.geometry.corAuto);
+    }
+    const QJsonObject preprocess = job.value(QStringLiteral("PREPROCESS")).toObject();
+    if (!preprocess.isEmpty())
+    {
+        cfg.preprocess.method = preprocessMethodFromString(preprocess.value(QStringLiteral("METHOD")).toString(toString(cfg.preprocess.method)));
+        cfg.preprocess.airValue = static_cast<float>(preprocess.value(QStringLiteral("AVE")).toDouble(cfg.preprocess.airValue));
+        cfg.preprocess.taperWidth = preprocess.value(QStringLiteral("TAPER_WIDTH")).toInt(cfg.preprocess.taperWidth);
+        cfg.preprocess.filterType = filterTypeFromString(preprocess.value(QStringLiteral("FILTER_TYPE")).toString(toString(cfg.preprocess.filterType)));
+    }
+    const QJsonObject compute = job.value(QStringLiteral("COMPUTE")).toObject();
+    if (!compute.isEmpty())
+    {
+        cfg.compute.batchSize = compute.value(QStringLiteral("BATCH_SIZE")).toInt(cfg.compute.batchSize);
+        cfg.compute.zChunkSize = compute.value(QStringLiteral("Z_CHUNK_SIZE")).toInt(cfg.compute.zChunkSize);
+        cfg.compute.gpuIndex = compute.value(QStringLiteral("GPU_INDEX")).toInt(cfg.compute.gpuIndex);
+        cfg.compute.zBlockSplit = compute.value(QStringLiteral("Z_BLOCK_SPLIT")).toInt(cfg.compute.zBlockSplit);
+    }
+    const QJsonObject io = job.value(QStringLiteral("IO")).toObject();
+    if (!io.isEmpty())
+    {
+        cfg.io.correctionMode = correctionModeFromString(io.value(QStringLiteral("CORRECTION_MODE")).toString(toString(cfg.io.correctionMode)));
+        cfg.io.darkPrefix = io.value(QStringLiteral("DARK_PREFIX")).toString(cfg.io.darkPrefix);
+        cfg.io.filePrefix = io.value(QStringLiteral("FILE_PREFIX")).toString(cfg.io.filePrefix);
+        cfg.io.saveDepth = saveDepthFromString(io.value(QStringLiteral("SAVE_DEPTH")).toString(toString(cfg.io.saveDepth)));
+        cfg.io.saveFormat = io.value(QStringLiteral("SAVE_FMT")).toString(cfg.io.saveFormat);
+        cfg.io.tiffThreads = std::clamp(io.value(QStringLiteral("TIFF_THREADS")).toInt(cfg.io.tiffThreads), 1, 64);
+    }
+}
+
+QString reconResultFileName(const QString& jobPath)
+{
+    return QFileInfo(jobPath).completeBaseName() + QStringLiteral("_recon_result.json");
+}
+
+QString numberedFileName(const QString& prefix, int padding, int index, const QString& ext)
+{
+    return QStringLiteral("%1%2.%3")
+        .arg(prefix)
+        .arg(std::max(0, index), std::clamp(padding, 1, 12), 10, QLatin1Char('0'))
+        .arg(ext);
+}
+
+void moveJobToFailed(const QString& jobPath, QJsonObject job, const QString& resultPath,
+    const QString& stage, const QString& code, const QString& message, const QString& queueRoot)
+{
+    if (!job.contains(QStringLiteral("TYPE")))
+    {
+        job["TYPE"] = "CT_STREAM_RECON_JOB";
+    }
+    job["STATUS"] = "failed";
+    job["JOB_PATH"] = jobPath;
+    job["FINISHED_AT"] = QDateTime::currentDateTime().toString(Qt::ISODate);
+    job["FAILED_STAGE"] = stage;
+    job["ERROR_CODE"] = code;
+    job["ERROR_MESSAGE"] = message;
+    job["RESULT_PATH"] = resultPath;
+    writeJsonFileAtomic(jobPath, job);
+
+    const QString failedDir = QDir(queueRoot).filePath(QStringLiteral("failed"));
+    QDir().mkpath(failedDir);
+    const QString targetPath = QDir(failedDir).filePath(QFileInfo(jobPath).fileName());
+    QFile::remove(targetPath);
+    QFile::rename(jobPath, targetPath);
 }
 
 qint64 previewIntervalForRoi(int width, int height)
@@ -573,6 +792,14 @@ MainWindow::MainWindow(QWidget* parent)
     reconQueueList_->setMinimumHeight(80);
     reconQueueList_->setMaximumHeight(140);
     reconQueueLayout->addWidget(reconQueueList_);
+    auto* reconQueueButtonLayout = new QHBoxLayout();
+    reconQueueUpButton_ = new QPushButton(QStringLiteral("Up"), reconQueueGroup);
+    reconQueueDownButton_ = new QPushButton(QStringLiteral("Down"), reconQueueGroup);
+    reconQueueRemoveButton_ = new QPushButton(QStringLiteral("Remove"), reconQueueGroup);
+    reconQueueButtonLayout->addWidget(reconQueueUpButton_);
+    reconQueueButtonLayout->addWidget(reconQueueDownButton_);
+    reconQueueButtonLayout->addWidget(reconQueueRemoveButton_);
+    reconQueueLayout->addLayout(reconQueueButtonLayout);
     settingsLayout->addWidget(reconQueueGroup);
 
     auto* ioGroup = new QGroupBox(QStringLiteral("IO"), settingsHost);
@@ -795,6 +1022,9 @@ MainWindow::MainWindow(QWidget* parent)
     connect(cameraResetRoiButton_, &QPushButton::clicked, this, &MainWindow::resetCameraRoiFullFrame);
     connect(ctStartButton_, &QPushButton::clicked, this, &MainWindow::startCtAcquisition);
     connect(ctStopButton_, &QPushButton::clicked, this, &MainWindow::stopCtAcquisition);
+    connect(reconQueueUpButton_, &QPushButton::clicked, this, [this]() { moveSelectedReconQueueJob(-1); });
+    connect(reconQueueDownButton_, &QPushButton::clicked, this, [this]() { moveSelectedReconQueueJob(1); });
+    connect(reconQueueRemoveButton_, &QPushButton::clicked, this, &MainWindow::removeSelectedReconQueueJob);
     connect(startButton_, &QPushButton::clicked, this, &MainWindow::startReconstruction);
     connect(stopButton_, &QPushButton::clicked, this, &MainWindow::stopReconstruction);
     connect(saveButton_, &QPushButton::clicked, this, &MainWindow::saveSlices);
@@ -857,10 +1087,31 @@ MainWindow::MainWindow(QWidget* parent)
     });
 
     const QString sessionConfigFile = sessionConfigPath();
-    QDir().mkpath(QDir(reconQueueRoot()).filePath(QStringLiteral("pending")));
-    QDir().mkpath(QDir(reconQueueRoot()).filePath(QStringLiteral("running")));
-    QDir().mkpath(QDir(reconQueueRoot()).filePath(QStringLiteral("done")));
-    QDir().mkpath(QDir(reconQueueRoot()).filePath(QStringLiteral("failed")));
+    ensureReconQueueDirs();
+    recoverStaleRunningReconJobs();
+    reconQueueWatcher_ = new QFileSystemWatcher(this);
+    const QString queueRoot = reconQueueRoot();
+    const QStringList watchDirs = {
+        QDir(queueRoot).filePath(QStringLiteral("pending")),
+        QDir(queueRoot).filePath(QStringLiteral("running")),
+        QDir(queueRoot).filePath(QStringLiteral("done")),
+        QDir(queueRoot).filePath(QStringLiteral("failed")),
+    };
+    reconQueueWatcher_->addPaths(watchDirs);
+    connect(reconQueueWatcher_, &QFileSystemWatcher::directoryChanged, this, [this](const QString&) {
+        scheduleReconQueueRefresh();
+    });
+    reconQueueRefreshTimer_ = new QTimer(this);
+    reconQueueRefreshTimer_->setSingleShot(true);
+    reconQueueRefreshTimer_->setInterval(300);
+    connect(reconQueueRefreshTimer_, &QTimer::timeout, this, &MainWindow::refreshReconQueue);
+    reconQueuePollTimer_ = new QTimer(this);
+    reconQueuePollTimer_->setInterval(3000);
+    connect(reconQueuePollTimer_, &QTimer::timeout, this, [this]() {
+        refreshReconQueue();
+        startNextQueuedReconstruction();
+    });
+    reconQueuePollTimer_->start();
     refreshReconQueue();
     AppConfig loadedConfig = AppConfig::defaults();
     QString loadError;
@@ -1034,6 +1285,11 @@ void MainWindow::setBusy(bool busy)
 void MainWindow::appendLog(const QString& text)
 {
     logEdit_->append(text);
+    recentLogLines_.append(text);
+    while (recentLogLines_.size() > 200)
+    {
+        recentLogLines_.removeFirst();
+    }
 
     QFile file(QDir(QCoreApplication::applicationDirPath()).filePath(QStringLiteral("ct_workstation_run.log")));
     if (file.open(QIODevice::WriteOnly | QIODevice::Append | QIODevice::Text))
@@ -1987,11 +2243,9 @@ void MainWindow::writeCtManifest(bool completed, const QString& errorMessage)
     }
     QJsonObject root;
     root["TYPE"] = "CT_STREAM_SCAN_MANIFEST";
-    root["VERSION"] = 1;
+    root["VERSION"] = 2;
     root["COMPLETED"] = completed;
     root["ERROR"] = errorMessage;
-    root["SAVE_PATH"] = ctSettings_.savePath;
-    root["RECON_OUTPUT_DIR"] = ctSettings_.reconConfig.io.saveDir;
     root["CREATED_AT"] = QDateTime::currentDateTime().toString(Qt::ISODate);
 
     QJsonObject acq;
@@ -2011,15 +2265,13 @@ void MainWindow::writeCtManifest(bool completed, const QString& errorMessage)
     root["CAMERA"] = pvcamSettingsToJson(ctSettings_.camera);
 
     QJsonObject io;
-    io["WATCH_DIR"] = ctSettings_.savePath;
-    io["SAVE_DIR"] = ctSettings_.reconConfig.io.saveDir;
     io["TOMO_PREFIX"] = ctSettings_.tomoPrefix;
     io["FLAT_PREFIX"] = ctSettings_.flatPrefix;
+    io["DARK_PREFIX"] = ctSettings_.reconConfig.io.darkPrefix;
     io["INPUT_PADDING"] = ctSettings_.padding;
     io["INPUT_EXT"] = ctSettings_.extension;
     io["FILE_PATTERN_0"] = ctSettings_.reconConfig.io.filePattern0;
     io["FILE_PATTERN_180"] = ctSettings_.reconConfig.io.filePattern180;
-    io["TIFF_THREADS"] = ctSettings_.tiffThreads;
     root["IO"] = io;
     root["FLAT_GROUPS"] = flatGroupsToJson(ctFlatGroups_);
 
@@ -2029,7 +2281,6 @@ void MainWindow::writeCtManifest(bool completed, const QString& errorMessage)
     motor["Y_AXIS"] = ctSettings_.yAxis;
     motor["Y_PULSE_PER_UM"] = ctSettings_.yPulsePerUm;
     root["MOTOR"] = motor;
-    root["RECON_CONFIG"] = ctSettings_.reconConfig.toJsonObject();
     if (writeJsonFileAtomic(ctManifestPath_, root))
     {
         appendLog(QStringLiteral("CT manifest written: %1").arg(ctManifestPath_));
@@ -2045,15 +2296,31 @@ void MainWindow::enqueueCtReconJob()
     const QString pendingDir = QDir(reconQueueRoot()).filePath(QStringLiteral("pending"));
     QDir().mkpath(pendingDir);
     const QString base = sanitizeQueueName(QFileInfo(ctSettings_.savePath).fileName());
-    const QString stamp = QDateTime::currentDateTime().toString(QStringLiteral("yyyyMMdd_HHmmss_zzz"));
-    const QString jobPath = QDir(pendingDir).filePath(QStringLiteral("%1_%2.json").arg(stamp, base));
-    QJsonObject job;
+    int maxIndex = 0;
+    const QStringList existing = QDir(pendingDir).entryList({ QStringLiteral("*.json") }, QDir::Files, QDir::Name);
+    for (const QString& fileName : existing)
+    {
+        maxIndex = std::max(maxIndex, queueIndexFromFileName(fileName));
+    }
+    if (maxIndex == std::numeric_limits<int>::max())
+    {
+        maxIndex = existing.size() * 10;
+    }
+    const int queueIndex = maxIndex + 10;
+    const QString jobPath = QDir(pendingDir).filePath(queueFileName(queueIndex, base));
+    QJsonObject job = appConfigToJobObject(ctSettings_.reconConfig);
     job["TYPE"] = "CT_STREAM_RECON_JOB";
-    job["VERSION"] = 1;
+    job["VERSION"] = 2;
     job["STATUS"] = "pending";
+    job["QUEUE_INDEX"] = queueIndex;
     job["CREATED_AT"] = QDateTime::currentDateTime().toString(Qt::ISODate);
-    job["MANIFEST_PATH"] = ctManifestPath_;
-    job["RECON_CONFIG"] = ctSettings_.reconConfig.toJsonObject();
+    job["PROJECTION_DIR"] = ctSettings_.savePath;
+    job["OUTPUT_DIR"] = ctSettings_.reconConfig.io.saveDir;
+    const QJsonObject jobParams = appConfigToJobObject(ctSettings_.reconConfig);
+    for (auto it = jobParams.begin(); it != jobParams.end(); ++it)
+    {
+        job[it.key()] = it.value();
+    }
     if (writeJsonFileAtomic(jobPath, job))
     {
         appendLog(QStringLiteral("Recon job queued: %1").arg(jobPath));
@@ -2069,12 +2336,56 @@ QString MainWindow::reconQueueRoot() const
     return QDir(QCoreApplication::applicationDirPath()).filePath(QStringLiteral("recon_queue"));
 }
 
+void MainWindow::ensureReconQueueDirs()
+{
+    QDir().mkpath(QDir(reconQueueRoot()).filePath(QStringLiteral("pending")));
+    QDir().mkpath(QDir(reconQueueRoot()).filePath(QStringLiteral("running")));
+    QDir().mkpath(QDir(reconQueueRoot()).filePath(QStringLiteral("done")));
+    QDir().mkpath(QDir(reconQueueRoot()).filePath(QStringLiteral("failed")));
+}
+
+void MainWindow::recoverStaleRunningReconJobs()
+{
+    const QString runningDirPath = QDir(reconQueueRoot()).filePath(QStringLiteral("running"));
+    const QString failedDirPath = QDir(reconQueueRoot()).filePath(QStringLiteral("failed"));
+    QDir runningDir(runningDirPath);
+    QDir().mkpath(failedDirPath);
+    const QStringList files = runningDir.entryList({ QStringLiteral("*.json") }, QDir::Files, QDir::Name);
+    for (const QString& fileName : files)
+    {
+        const QString path = runningDir.filePath(fileName);
+        QJsonObject job;
+        readJsonFile(path, &job);
+        job["STATUS"] = "failed";
+        job["FAILED_STAGE"] = "JobParse";
+        job["ERROR_CODE"] = "StaleRunningJob";
+        job["ERROR_MESSAGE"] = "Job was left in running/ from a previous application exit.";
+        job["FINISHED_AT"] = QDateTime::currentDateTime().toString(Qt::ISODate);
+        writeJsonFileAtomic(path, job);
+        const QString target = QDir(failedDirPath).filePath(fileName);
+        QFile::remove(target);
+        QFile::rename(path, target);
+        appendLog(QStringLiteral("Recovered stale running recon job to failed: %1").arg(target));
+    }
+}
+
+void MainWindow::scheduleReconQueueRefresh()
+{
+    if (reconQueueRefreshTimer_)
+    {
+        reconQueueRefreshTimer_->start();
+    }
+}
+
 void MainWindow::refreshReconQueue()
 {
     if (!reconQueueList_)
     {
         return;
     }
+    const QString selectedPath = reconQueueList_->currentItem()
+        ? reconQueueList_->currentItem()->data(Qt::UserRole).toString()
+        : QString();
     reconQueueList_->clear();
     const QString root = reconQueueRoot();
     const QStringList buckets = { QStringLiteral("running"), QStringLiteral("pending"), QStringLiteral("failed"), QStringLiteral("done") };
@@ -2084,9 +2395,207 @@ void MainWindow::refreshReconQueue()
         const QStringList files = dir.entryList({ QStringLiteral("*.json") }, QDir::Files, QDir::Name);
         for (const QString& file : files)
         {
-            reconQueueList_->addItem(QStringLiteral("%1/%2").arg(bucket, file));
+            const QString path = dir.filePath(file);
+            QString status = bucket;
+            QJsonObject job;
+            if (readJsonFile(path, &job))
+            {
+                status = job.value(QStringLiteral("STATUS")).toString(bucket);
+            }
+            auto* item = new QListWidgetItem(QStringLiteral("%1/%2").arg(bucket, file), reconQueueList_);
+            item->setData(Qt::UserRole, path);
+            item->setData(Qt::UserRole + 1, bucket);
+            item->setToolTip(QStringLiteral("%1\nSTATUS=%2").arg(path, status));
+            if (path == selectedPath)
+            {
+                item->setSelected(true);
+                reconQueueList_->setCurrentItem(item);
+            }
         }
     }
+}
+
+void MainWindow::normalizePendingReconQueue(bool scheduleRefresh)
+{
+    const QString pendingDirPath = QDir(reconQueueRoot()).filePath(QStringLiteral("pending"));
+    QDir pendingDir(pendingDirPath);
+    QStringList files = pendingDir.entryList({ QStringLiteral("*.json") }, QDir::Files, QDir::Name);
+    std::sort(files.begin(), files.end(), [](const QString& a, const QString& b) {
+        const int ia = queueIndexFromFileName(a);
+        const int ib = queueIndexFromFileName(b);
+        if (ia != ib)
+        {
+            return ia < ib;
+        }
+        return a < b;
+    });
+
+    QVector<QPair<QString, QJsonObject>> jobs;
+    jobs.reserve(files.size());
+    int nextIndex = 10;
+    for (const QString& file : files)
+    {
+        const QString oldPath = pendingDir.filePath(file);
+        QJsonObject job;
+        QString error;
+        if (!readJsonFile(oldPath, &job, &error))
+        {
+            appendLog(QStringLiteral("Pending queue normalize skipped invalid job: %1").arg(error));
+            continue;
+        }
+        job["STATUS"] = "pending";
+        job["QUEUE_INDEX"] = nextIndex;
+        jobs.append({ oldPath, job });
+        nextIndex += 10;
+    }
+    QVector<QPair<QString, QJsonObject>> stagedJobs;
+    stagedJobs.reserve(jobs.size());
+    for (const auto& pair : jobs)
+    {
+        const QString stagedPath = pair.first + QStringLiteral(".renaming");
+        QFile::remove(stagedPath);
+        if (!QFile::rename(pair.first, stagedPath))
+        {
+            appendLog(QStringLiteral("Failed to stage pending job rename: %1").arg(pair.first));
+            continue;
+        }
+        stagedJobs.append({ stagedPath, pair.second });
+    }
+    for (const auto& pair : stagedJobs)
+    {
+        const QJsonObject job = pair.second;
+        const int queueIndex = job.value(QStringLiteral("QUEUE_INDEX")).toInt(10);
+        const QString newPath = pendingDir.filePath(queueFileName(queueIndex, queueBaseNameFromPath(pair.first)));
+        writeJsonFileAtomic(newPath, job);
+        QFile::remove(pair.first);
+    }
+    if (scheduleRefresh)
+    {
+        scheduleReconQueueRefresh();
+    }
+}
+
+void MainWindow::moveSelectedReconQueueJob(int direction)
+{
+    if (!reconQueueList_ || direction == 0)
+    {
+        return;
+    }
+    QListWidgetItem* selected = reconQueueList_->currentItem();
+    if (!selected || selected->data(Qt::UserRole + 1).toString() != QStringLiteral("pending"))
+    {
+        appendLog(QStringLiteral("Only pending recon jobs can be reordered."));
+        return;
+    }
+    const QString selectedPath = selected->data(Qt::UserRole).toString();
+    const QString selectedBase = queueBaseNameFromPath(selectedPath);
+    const QString pendingDirPath = QDir(reconQueueRoot()).filePath(QStringLiteral("pending"));
+    QDir pendingDir(pendingDirPath);
+    QStringList files = pendingDir.entryList({ QStringLiteral("*.json") }, QDir::Files, QDir::Name);
+    std::sort(files.begin(), files.end(), [](const QString& a, const QString& b) {
+        const int ia = queueIndexFromFileName(a);
+        const int ib = queueIndexFromFileName(b);
+        return ia == ib ? a < b : ia < ib;
+    });
+    const QString selectedFile = QFileInfo(selectedPath).fileName();
+    const int index = files.indexOf(selectedFile);
+    const int target = index + direction;
+    if (index < 0 || target < 0 || target >= files.size())
+    {
+        return;
+    }
+    files.swapItemsAt(index, target);
+
+    QVector<QPair<QString, QJsonObject>> jobs;
+    jobs.reserve(files.size());
+    for (const QString& file : files)
+    {
+        QJsonObject job;
+        if (readJsonFile(pendingDir.filePath(file), &job))
+        {
+            jobs.append({ pendingDir.filePath(file), job });
+        }
+    }
+    QVector<QPair<QString, QJsonObject>> stagedJobs;
+    stagedJobs.reserve(jobs.size());
+    for (const auto& pair : jobs)
+    {
+        const QString stagedPath = pair.first + QStringLiteral(".reorder");
+        QFile::remove(stagedPath);
+        if (QFile::rename(pair.first, stagedPath))
+        {
+            stagedJobs.append({ stagedPath, pair.second });
+        }
+        else
+        {
+            appendLog(QStringLiteral("Failed to stage pending reorder: %1").arg(pair.first));
+        }
+    }
+    int nextIndex = 10;
+    QString restoredSelection;
+    for (const auto& pair : stagedJobs)
+    {
+        QJsonObject job = pair.second;
+        job["STATUS"] = "pending";
+        job["QUEUE_INDEX"] = nextIndex;
+        const QString oldBase = queueBaseNameFromPath(pair.first);
+        const QString newPath = pendingDir.filePath(queueFileName(nextIndex, oldBase));
+        writeJsonFileAtomic(newPath, job);
+        QFile::remove(pair.first);
+        if (queueBaseNameFromPath(pair.first) == selectedBase)
+        {
+            restoredSelection = newPath;
+        }
+        nextIndex += 10;
+    }
+    refreshReconQueue();
+    if (!restoredSelection.isEmpty())
+    {
+        for (int i = 0; i < reconQueueList_->count(); ++i)
+        {
+            QListWidgetItem* item = reconQueueList_->item(i);
+            if (item && item->data(Qt::UserRole).toString() == restoredSelection)
+            {
+                reconQueueList_->setCurrentItem(item);
+                break;
+            }
+        }
+    }
+}
+
+void MainWindow::removeSelectedReconQueueJob()
+{
+    if (!reconQueueList_)
+    {
+        return;
+    }
+    QListWidgetItem* selected = reconQueueList_->currentItem();
+    if (!selected || selected->data(Qt::UserRole + 1).toString() != QStringLiteral("pending"))
+    {
+        appendLog(QStringLiteral("Only pending recon jobs can be removed."));
+        return;
+    }
+    const QString sourcePath = selected->data(Qt::UserRole).toString();
+    QJsonObject job;
+    readJsonFile(sourcePath, &job);
+    job["STATUS"] = "cancelled";
+    job["FAILED_STAGE"] = "UserStopped";
+    job["ERROR_CODE"] = "UserCancelled";
+    job["ERROR_MESSAGE"] = "Pending reconstruction job removed by user.";
+    job["FINISHED_AT"] = QDateTime::currentDateTime().toString(Qt::ISODate);
+    writeJsonFileAtomic(sourcePath, job);
+
+    const QString failedDir = QDir(reconQueueRoot()).filePath(QStringLiteral("failed"));
+    QDir().mkpath(failedDir);
+    const QString targetPath = QDir(failedDir).filePath(QFileInfo(sourcePath).fileName());
+    QFile::remove(targetPath);
+    if (!QFile::rename(sourcePath, targetPath))
+    {
+        appendLog(QStringLiteral("Failed to remove pending recon job: %1").arg(sourcePath));
+        return;
+    }
+    appendLog(QStringLiteral("Pending recon job cancelled: %1").arg(targetPath));
+    normalizePendingReconQueue(true);
 }
 
 void MainWindow::startNextQueuedReconstruction()
@@ -2095,6 +2604,7 @@ void MainWindow::startNextQueuedReconstruction()
     {
         return;
     }
+    normalizePendingReconQueue(false);
     const QDir pendingDir(QDir(reconQueueRoot()).filePath(QStringLiteral("pending")));
     const QStringList files = pendingDir.entryList({ QStringLiteral("*.json") }, QDir::Files, QDir::Name);
     if (files.isEmpty())
@@ -2107,68 +2617,172 @@ void MainWindow::startNextQueuedReconstruction()
 
 bool MainWindow::startQueuedReconstruction(const QString& jobPath)
 {
-    QFile file(jobPath);
-    if (!file.open(QIODevice::ReadOnly))
+    QJsonObject job;
+    QString error;
+    if (!readJsonFile(jobPath, &job, &error))
     {
-        appendLog(QStringLiteral("Failed to open recon job: %1").arg(jobPath));
+        appendLog(QStringLiteral("Failed to open recon job: %1").arg(error));
+        const QJsonObject emptyJob;
+        const QString resultPath = writeReconResultJson(jobPath, emptyJob, QStringLiteral("failed"), QStringLiteral("JobParse"),
+            QStringLiteral("InvalidJobJson"), error, {}, {}, {}, QDateTime::currentDateTime().toString(Qt::ISODate),
+            0.0, 0.0, false, 0.0);
+        moveJobToFailed(jobPath, emptyJob, resultPath, QStringLiteral("JobParse"), QStringLiteral("InvalidJobJson"),
+            error, reconQueueRoot());
         return false;
     }
-    const QJsonDocument doc = QJsonDocument::fromJson(file.readAll());
-    file.close();
-    if (!doc.isObject())
+    QString projectionDir = projectionDirFromJob(job);
+    QString outputDir = job.value(QStringLiteral("OUTPUT_DIR")).toString();
+    if (projectionDir.isEmpty())
     {
-        appendLog(QStringLiteral("Invalid recon job JSON: %1").arg(jobPath));
+        const QString resultPath = writeReconResultJson(jobPath, job, QStringLiteral("failed"), QStringLiteral("JobParse"),
+            QStringLiteral("MissingProjectionDir"), QStringLiteral("Recon job has no PROJECTION_DIR."),
+            projectionDir, outputDir, {}, QDateTime::currentDateTime().toString(Qt::ISODate),
+            0.0, 0.0, false, 0.0);
+        moveJobToFailed(jobPath, job, resultPath, QStringLiteral("JobParse"), QStringLiteral("MissingProjectionDir"),
+            QStringLiteral("Recon job has no PROJECTION_DIR."), reconQueueRoot());
         return false;
     }
-    const QJsonObject job = doc.object();
-    QJsonObject reconConfigObject = job.value(QStringLiteral("RECON_CONFIG")).toObject();
-    const QString manifestPath = job.value(QStringLiteral("MANIFEST_PATH")).toString();
+    const QString manifestPath = manifestPathForProjectionDir(projectionDir);
     QJsonObject manifest;
-    if (!manifestPath.isEmpty())
+    if (!readJsonFile(manifestPath, &manifest, &error))
     {
-        QFile manifestFile(manifestPath);
-        if (manifestFile.open(QIODevice::ReadOnly))
+        const QString resultPath = writeReconResultJson(jobPath, job, QStringLiteral("failed"), QStringLiteral("ManifestLoad"),
+            QStringLiteral("ManifestMissing"), error, projectionDir, outputDir, {},
+            QDateTime::currentDateTime().toString(Qt::ISODate), 0.0, 0.0, false, 0.0);
+        moveJobToFailed(jobPath, job, resultPath, QStringLiteral("ManifestLoad"), QStringLiteral("ManifestMissing"),
+            error, reconQueueRoot());
+        return false;
+    }
+    if (!manifest.value(QStringLiteral("COMPLETED")).toBool(false))
+    {
+        const QString message = QStringLiteral("scan_manifest.json COMPLETED=false.");
+        const QString resultPath = writeReconResultJson(jobPath, job, QStringLiteral("failed"), QStringLiteral("ManifestValidate"),
+            QStringLiteral("ManifestIncomplete"), QStringLiteral("scan_manifest.json COMPLETED=false."),
+            projectionDir, outputDir, {}, QDateTime::currentDateTime().toString(Qt::ISODate),
+            0.0, 0.0, false, 0.0);
+        moveJobToFailed(jobPath, job, resultPath, QStringLiteral("ManifestValidate"),
+            QStringLiteral("ManifestIncomplete"), message, reconQueueRoot());
+        return false;
+    }
+
+    AppConfig cfg = AppConfig::fromJsonObject(manifest.value(QStringLiteral("RECON_CONFIG")).toObject());
+    if (manifest.value(QStringLiteral("RECON_CONFIG")).toObject().isEmpty())
+    {
+        cfg = configFromUi();
+    }
+    applyJobObjectToConfig(job, cfg);
+    const QJsonObject io = manifest.value(QStringLiteral("IO")).toObject();
+    const QJsonObject acq = manifest.value(QStringLiteral("ACQUISITION")).toObject();
+    cfg.io.watchDir = projectionDir;
+    cfg.io.saveDir = outputDir.isEmpty() ? QDir(projectionDir).filePath(QStringLiteral("recon")) : outputDir;
+    cfg.io.tomoPrefix = io.value(QStringLiteral("TOMO_PREFIX")).toString(cfg.io.tomoPrefix);
+    cfg.io.flatPrefix = io.value(QStringLiteral("FLAT_PREFIX")).toString(cfg.io.flatPrefix);
+    cfg.io.darkPrefix = io.value(QStringLiteral("DARK_PREFIX")).toString(cfg.io.darkPrefix);
+    cfg.io.inputPadding = io.value(QStringLiteral("INPUT_PADDING")).toInt(cfg.io.inputPadding);
+    cfg.io.inputExt = io.value(QStringLiteral("INPUT_EXT")).toString(cfg.io.inputExt);
+    cfg.io.filePattern0 = io.value(QStringLiteral("FILE_PATTERN_0")).toString(cfg.io.filePattern0);
+    cfg.io.filePattern180 = io.value(QStringLiteral("FILE_PATTERN_180")).toString(cfg.io.filePattern180);
+    cfg.geometry.totalAngles = acq.value(QStringLiteral("PROJECTION_COUNT")).toInt(cfg.geometry.totalAngles);
+    cfg.geometry.volW = acq.value(QStringLiteral("IMAGE_WIDTH")).toInt(cfg.geometry.volW);
+    cfg.geometry.volH = acq.value(QStringLiteral("IMAGE_HEIGHT")).toInt(cfg.geometry.volH);
+    cfg.geometry.angleOffsetDeg = static_cast<float>(acq.value(QStringLiteral("BEGINNING_ANGLE_DEG")).toDouble(cfg.geometry.angleOffsetDeg));
+    if (!job.value(QStringLiteral("GEOMETRY")).toObject().contains(QStringLiteral("COR_SHIFT")))
+    {
+        cfg.geometry.corShift = static_cast<float>(acq.value(QStringLiteral("COR_SHIFT")).toDouble(cfg.geometry.corShift));
+    }
+    cfg.phase.enable = false;
+    if (cfg.io.reconMethod == ReconMethod::RealTimeFBP)
+    {
+        cfg.io.reconMethod = ReconMethod::OfflineFBP;
+    }
+    if (cfg.geometry.totalAngles <= 0 || cfg.geometry.volW <= 0 || cfg.geometry.volH <= 0)
+    {
+        const QString message = QStringLiteral("Manifest geometry or angle count is invalid.");
+        const QString resultPath = writeReconResultJson(jobPath, job, QStringLiteral("failed"), QStringLiteral("ManifestValidate"),
+            QStringLiteral("InvalidGeometry"), QStringLiteral("Manifest geometry or angle count is invalid."),
+            projectionDir, cfg.io.saveDir, {}, QDateTime::currentDateTime().toString(Qt::ISODate),
+            cfg.geometry.corShift, 0.0, false, cfg.geometry.corShift);
+        moveJobToFailed(jobPath, job, resultPath, QStringLiteral("ManifestValidate"),
+            QStringLiteral("InvalidGeometry"), message, reconQueueRoot());
+        return false;
+    }
+    const QString firstTomo = QDir(projectionDir).filePath(numberedFileName(cfg.io.tomoPrefix,
+        cfg.io.inputPadding, 0, cfg.io.inputExt));
+    const QString lastTomo = QDir(projectionDir).filePath(numberedFileName(cfg.io.tomoPrefix,
+        cfg.io.inputPadding, cfg.geometry.totalAngles - 1, cfg.io.inputExt));
+    if (!QFileInfo::exists(firstTomo) || !QFileInfo::exists(lastTomo))
+    {
+        const QString message = QStringLiteral("Projection files are incomplete. Missing first or last Tomo file.");
+        const QString resultPath = writeReconResultJson(jobPath, job, QStringLiteral("failed"), QStringLiteral("InputScan"),
+            QStringLiteral("ProjectionMissing"), message, projectionDir, cfg.io.saveDir, {},
+            QDateTime::currentDateTime().toString(Qt::ISODate),
+            cfg.geometry.corShift, 0.0, false, cfg.geometry.corShift);
+        moveJobToFailed(jobPath, job, resultPath, QStringLiteral("InputScan"),
+            QStringLiteral("ProjectionMissing"), message, reconQueueRoot());
+        return false;
+    }
+    if (cfg.io.correctionMode == CorrectionMode::Flat || cfg.io.correctionMode == CorrectionMode::FlatDark)
+    {
+        const QString firstFlat = QDir(projectionDir).filePath(numberedFileName(cfg.io.flatPrefix,
+            cfg.io.inputPadding, 0, cfg.io.inputExt));
+        if (!QFileInfo::exists(firstFlat))
         {
-            manifest = QJsonDocument::fromJson(manifestFile.readAll()).object();
-            manifestFile.close();
-            if (reconConfigObject.isEmpty())
-            {
-                reconConfigObject = manifest.value(QStringLiteral("RECON_CONFIG")).toObject();
-            }
+            const QString message = QStringLiteral("Flat correction requested but no first Flat file was found.");
+            const QString resultPath = writeReconResultJson(jobPath, job, QStringLiteral("failed"), QStringLiteral("ReferenceLoad"),
+                QStringLiteral("FlatMissing"), message, projectionDir, cfg.io.saveDir, {},
+                QDateTime::currentDateTime().toString(Qt::ISODate),
+                cfg.geometry.corShift, 0.0, false, cfg.geometry.corShift);
+            moveJobToFailed(jobPath, job, resultPath, QStringLiteral("ReferenceLoad"),
+                QStringLiteral("FlatMissing"), message, reconQueueRoot());
+            return false;
         }
     }
-    if (reconConfigObject.isEmpty())
+    if (cfg.geometry.corAuto)
     {
-        appendLog(QStringLiteral("Recon job has no RECON_CONFIG and no readable manifest RECON_CONFIG: %1").arg(jobPath));
-        return false;
+        const QString ref0 = QDir(projectionDir).filePath(cfg.io.filePattern0);
+        const QString ref180 = QDir(projectionDir).filePath(cfg.io.filePattern180);
+        if (!QFileInfo::exists(ref0) || !QFileInfo::exists(ref180))
+        {
+            const QString message = QStringLiteral("Auto COR requested but 0/180 reference files are missing.");
+            const QString resultPath = writeReconResultJson(jobPath, job, QStringLiteral("failed"), QStringLiteral("ReferenceLoad"),
+                QStringLiteral("AutoCorReferenceMissing"), message, projectionDir, cfg.io.saveDir, {},
+                QDateTime::currentDateTime().toString(Qt::ISODate),
+                cfg.geometry.corShift, 0.0, false, cfg.geometry.corShift);
+            moveJobToFailed(jobPath, job, resultPath, QStringLiteral("ReferenceLoad"),
+                QStringLiteral("AutoCorReferenceMissing"), message, reconQueueRoot());
+            return false;
+        }
     }
-    AppConfig cfg = AppConfig::fromJsonObject(reconConfigObject);
-    if (!manifest.isEmpty())
-    {
-        const QJsonObject io = manifest.value(QStringLiteral("IO")).toObject();
-        const QJsonObject acq = manifest.value(QStringLiteral("ACQUISITION")).toObject();
-        cfg.io.watchDir = io.value(QStringLiteral("WATCH_DIR")).toString(cfg.io.watchDir);
-        cfg.io.saveDir = io.value(QStringLiteral("SAVE_DIR")).toString(cfg.io.saveDir);
-        cfg.io.tomoPrefix = io.value(QStringLiteral("TOMO_PREFIX")).toString(cfg.io.tomoPrefix);
-        cfg.io.flatPrefix = io.value(QStringLiteral("FLAT_PREFIX")).toString(cfg.io.flatPrefix);
-        cfg.io.inputPadding = io.value(QStringLiteral("INPUT_PADDING")).toInt(cfg.io.inputPadding);
-        cfg.io.inputExt = io.value(QStringLiteral("INPUT_EXT")).toString(cfg.io.inputExt);
-        cfg.io.tiffThreads = io.value(QStringLiteral("TIFF_THREADS")).toInt(cfg.io.tiffThreads);
-        cfg.geometry.totalAngles = acq.value(QStringLiteral("PROJECTION_COUNT")).toInt(cfg.geometry.totalAngles);
-        cfg.geometry.volW = acq.value(QStringLiteral("IMAGE_WIDTH")).toInt(cfg.geometry.volW);
-        cfg.geometry.volH = acq.value(QStringLiteral("IMAGE_HEIGHT")).toInt(cfg.geometry.volH);
-        cfg.geometry.angleOffsetDeg = static_cast<float>(acq.value(QStringLiteral("BEGINNING_ANGLE_DEG")).toDouble(cfg.geometry.angleOffsetDeg));
-    }
+
     const QString runningDir = QDir(reconQueueRoot()).filePath(QStringLiteral("running"));
     QDir().mkpath(runningDir);
     const QString runningPath = QDir(runningDir).filePath(QFileInfo(jobPath).fileName());
     QFile::remove(runningPath);
+    job["STATUS"] = "running";
+    job["STARTED_AT"] = QDateTime::currentDateTime().toString(Qt::ISODate);
+    job["PROJECTION_DIR"] = projectionDir;
+    job["OUTPUT_DIR"] = cfg.io.saveDir;
+    QJsonObject normalizedParams = appConfigToJobObject(cfg);
+    for (auto it = normalizedParams.begin(); it != normalizedParams.end(); ++it)
+    {
+        job[it.key()] = it.value();
+    }
+    writeJsonFileAtomic(jobPath, job);
     if (!QFile::rename(jobPath, runningPath))
     {
         appendLog(QStringLiteral("Failed to move recon job to running: %1").arg(jobPath));
         return false;
     }
     activeQueueJobPath_ = runningPath;
+    activeQueueProjectionDir_ = projectionDir;
+    activeQueueOutputDir_ = cfg.io.saveDir;
+    activeQueueStartedAt_ = job.value(QStringLiteral("STARTED_AT")).toString();
+    activeQueueFinishedStatusOverride_.clear();
+    activeQueueFinishedStageOverride_.clear();
+    activeQueueFinishedCodeOverride_.clear();
+    activeQueueInitialCorShift_ = cfg.geometry.corShift;
+    activeQueueAutoCorShift_ = 0.0;
+    activeQueueHasAutoCorShift_ = false;
     applyConfig(cfg);
     appendLog(QStringLiteral("Starting queued reconstruction: %1").arg(runningPath));
     refreshReconQueue();
@@ -2182,6 +2796,8 @@ void MainWindow::updateActiveQueueCor(double shift)
     {
         return;
     }
+    activeQueueAutoCorShift_ = shift;
+    activeQueueHasAutoCorShift_ = true;
 
     QFile jobFile(activeQueueJobPath_);
     if (!jobFile.open(QIODevice::ReadOnly))
@@ -2190,11 +2806,8 @@ void MainWindow::updateActiveQueueCor(double shift)
     }
     QJsonObject job = QJsonDocument::fromJson(jobFile.readAll()).object();
     jobFile.close();
-    const QString manifestPath = job.value(QStringLiteral("MANIFEST_PATH")).toString();
-    if (manifestPath.isEmpty())
-    {
-        return;
-    }
+    const QString projectionDir = projectionDirFromJob(job).isEmpty() ? activeQueueProjectionDir_ : projectionDirFromJob(job);
+    const QString manifestPath = manifestPathForProjectionDir(projectionDir);
 
     QFile manifestFile(manifestPath);
     if (!manifestFile.open(QIODevice::ReadOnly))
@@ -2207,27 +2820,75 @@ void MainWindow::updateActiveQueueCor(double shift)
     acq["COR_SHIFT"] = shift;
     acq["COR_UPDATED_AT"] = QDateTime::currentDateTime().toString(Qt::ISODate);
     manifest["ACQUISITION"] = acq;
-    QJsonObject recon = manifest.value(QStringLiteral("RECON_CONFIG")).toObject();
-    QJsonObject geometry = recon.value(QStringLiteral("GEOMETRY")).toObject();
-    geometry["COR_SHIFT"] = shift;
-    geometry["COR_AUTO"] = false;
-    recon["GEOMETRY"] = geometry;
-    manifest["RECON_CONFIG"] = recon;
     if (writeJsonFileAtomic(manifestPath, manifest))
     {
         appendLog(QStringLiteral("Updated CT manifest COR_SHIFT=%1: %2").arg(shift, 0, 'f', 4).arg(manifestPath));
     }
 
-    QJsonObject jobRecon = job.value(QStringLiteral("RECON_CONFIG")).toObject();
-    QJsonObject jobGeometry = jobRecon.value(QStringLiteral("GEOMETRY")).toObject();
+    QJsonObject jobGeometry = job.value(QStringLiteral("GEOMETRY")).toObject();
     jobGeometry["COR_SHIFT"] = shift;
     jobGeometry["COR_AUTO"] = false;
-    jobRecon["GEOMETRY"] = jobGeometry;
-    job["RECON_CONFIG"] = jobRecon;
+    job["GEOMETRY"] = jobGeometry;
     writeJsonFileAtomic(activeQueueJobPath_, job);
+
+    saveSessionConfig();
 }
 
-void MainWindow::finishQueuedReconstruction(bool ok, const QString& message)
+QString MainWindow::writeReconResultJson(const QString& jobPath, const QJsonObject& job, const QString& status,
+    const QString& failedStage, const QString& errorCode, const QString& message,
+    const QString& projectionDir, const QString& outputDir, const QString& startedAt,
+    const QString& finishedAt, double initialCor, double autoCor, bool hasAutoCor, double finalCor)
+{
+    QJsonObject result;
+    result["TYPE"] = "CT_STREAM_RECON_RESULT";
+    result["VERSION"] = 1;
+    result["STATUS"] = status;
+    result["FAILED_STAGE"] = failedStage;
+    result["ERROR_CODE"] = errorCode;
+    result["ERROR_MESSAGE"] = message;
+    result["JOB_PATH"] = jobPath;
+    result["PROJECTION_DIR"] = projectionDir;
+    result["OUTPUT_DIR"] = outputDir;
+    result["STARTED_AT"] = startedAt;
+    result["FINISHED_AT"] = finishedAt;
+    result["INITIAL_COR_SHIFT"] = initialCor;
+    if (hasAutoCor)
+    {
+        result["AUTO_COR_SHIFT"] = autoCor;
+    }
+    result["FINAL_COR_SHIFT"] = finalCor;
+    result["RECON_METHOD"] = job.value(QStringLiteral("RECON_METHOD")).toString();
+
+    QJsonArray tail;
+    const int first = std::max(0, static_cast<int>(recentLogLines_.size()) - 40);
+    for (int i = first; i < recentLogLines_.size(); ++i)
+    {
+        tail.append(recentLogLines_[i]);
+    }
+    result["LOG_TAIL"] = tail;
+
+    QString resultPath;
+    if (!outputDir.isEmpty() && QDir().mkpath(outputDir))
+    {
+        resultPath = QDir(outputDir).filePath(QStringLiteral("recon_result.json"));
+    }
+    else
+    {
+        const QString failedDir = QDir(reconQueueRoot()).filePath(QStringLiteral("failed"));
+        QDir().mkpath(failedDir);
+        resultPath = QDir(failedDir).filePath(reconResultFileName(jobPath));
+    }
+    if (!writeJsonFileAtomic(resultPath, result))
+    {
+        const QString failedDir = QDir(reconQueueRoot()).filePath(QStringLiteral("failed"));
+        QDir().mkpath(failedDir);
+        resultPath = QDir(failedDir).filePath(reconResultFileName(jobPath));
+        writeJsonFileAtomic(resultPath, result);
+    }
+    return resultPath;
+}
+
+void MainWindow::finishQueuedReconstruction(bool ok, const QString& message, const QString& failedStage, const QString& errorCode)
 {
     if (activeQueueJobPath_.isEmpty())
     {
@@ -2237,7 +2898,23 @@ void MainWindow::finishQueuedReconstruction(bool ok, const QString& message)
         }
         return;
     }
-    const QString bucket = ok ? QStringLiteral("done") : QStringLiteral("failed");
+    QJsonObject job;
+    readJsonFile(activeQueueJobPath_, &job);
+    const bool cancelled = activeQueueFinishedStatusOverride_ == QStringLiteral("cancelled");
+    const QString status = cancelled ? QStringLiteral("cancelled") : (ok ? QStringLiteral("done") : QStringLiteral("failed"));
+    const QString stage = cancelled
+        ? (activeQueueFinishedStageOverride_.isEmpty() ? QStringLiteral("UserStopped") : activeQueueFinishedStageOverride_)
+        : (ok ? QString() : (failedStage.isEmpty() ? QStringLiteral("Reconstruction") : failedStage));
+    const QString code = cancelled
+        ? (activeQueueFinishedCodeOverride_.isEmpty() ? QStringLiteral("UserStopped") : activeQueueFinishedCodeOverride_)
+        : (ok ? QString() : (errorCode.isEmpty() ? QStringLiteral("ReconstructionFailed") : errorCode));
+    const QString finishedAt = QDateTime::currentDateTime().toString(Qt::ISODate);
+    const double finalCor = activeQueueHasAutoCorShift_ ? activeQueueAutoCorShift_ : activeQueueInitialCorShift_;
+    const QString resultPath = writeReconResultJson(activeQueueJobPath_, job, status, stage, code, message,
+        activeQueueProjectionDir_, activeQueueOutputDir_, activeQueueStartedAt_, finishedAt,
+        activeQueueInitialCorShift_, activeQueueAutoCorShift_, activeQueueHasAutoCorShift_, finalCor);
+
+    const QString bucket = status == QStringLiteral("done") ? QStringLiteral("done") : QStringLiteral("failed");
     const QString targetDir = QDir(reconQueueRoot()).filePath(bucket);
     QDir().mkpath(targetDir);
     const QString targetPath = QDir(targetDir).filePath(QFileInfo(activeQueueJobPath_).fileName());
@@ -2245,11 +2922,19 @@ void MainWindow::finishQueuedReconstruction(bool ok, const QString& message)
     QFile file(activeQueueJobPath_);
     if (file.open(QIODevice::ReadOnly))
     {
-        QJsonObject job = QJsonDocument::fromJson(file.readAll()).object();
+        job = QJsonDocument::fromJson(file.readAll()).object();
         file.close();
-        job["STATUS"] = ok ? "done" : "failed";
-        job["FINISHED_AT"] = QDateTime::currentDateTime().toString(Qt::ISODate);
+        job["STATUS"] = status;
+        job["FINISHED_AT"] = finishedAt;
         job["MESSAGE"] = message;
+        job["FAILED_STAGE"] = stage;
+        job["ERROR_CODE"] = code;
+        job["ERROR_MESSAGE"] = message;
+        job["RESULT_PATH"] = resultPath;
+        QJsonObject geometry = job.value(QStringLiteral("GEOMETRY")).toObject();
+        geometry["COR_SHIFT"] = finalCor;
+        geometry["COR_AUTO"] = false;
+        job["GEOMETRY"] = geometry;
         writeJsonFileAtomic(activeQueueJobPath_, job);
     }
     QFile::remove(targetPath);
@@ -2258,8 +2943,17 @@ void MainWindow::finishQueuedReconstruction(bool ok, const QString& message)
         appendLog(QStringLiteral("Failed to move recon job to %1: %2").arg(bucket, activeQueueJobPath_));
     }
     activeQueueJobPath_.clear();
+    activeQueueProjectionDir_.clear();
+    activeQueueOutputDir_.clear();
+    activeQueueStartedAt_.clear();
+    activeQueueFinishedStatusOverride_.clear();
+    activeQueueFinishedStageOverride_.clear();
+    activeQueueFinishedCodeOverride_.clear();
+    activeQueueInitialCorShift_ = 0.0;
+    activeQueueAutoCorShift_ = 0.0;
+    activeQueueHasAutoCorShift_ = false;
     refreshReconQueue();
-    if (ok)
+    if (status == QStringLiteral("done"))
     {
         startNextQueuedReconstruction();
     }
@@ -2270,7 +2964,10 @@ void MainWindow::stopReconstruction()
     controller_.stopReconstruction();
     if (!activeQueueJobPath_.isEmpty())
     {
-        finishQueuedReconstruction(false, QStringLiteral("Queued reconstruction stopped by user."));
+        activeQueueFinishedStatusOverride_ = QStringLiteral("cancelled");
+        activeQueueFinishedStageOverride_ = QStringLiteral("UserStopped");
+        activeQueueFinishedCodeOverride_ = QStringLiteral("UserStopped");
+        appendLog(QStringLiteral("Queued reconstruction stop requested; waiting for worker to exit."));
     }
 }
 
