@@ -66,8 +66,14 @@ cv::Mat CorEstimatorFft::preprocessProjection(
 
 float CorEstimatorFft::estimateShift(const cv::Mat& img0, const cv::Mat& img180, const CorrectionContext& context) const
 {
-    cv::Mat pre0 = preprocessProjection(img0, context, false);
-    cv::Mat pre180 = preprocessProjection(img180, context, true);
+    return estimateShift(img0, context, img180, context);
+}
+
+float CorEstimatorFft::estimateShift(const cv::Mat& img0, const CorrectionContext& context0,
+    const cv::Mat& img180, const CorrectionContext& context180) const
+{
+    cv::Mat pre0 = preprocessProjection(img0, context0, false);
+    cv::Mat pre180 = preprocessProjection(img180, context180, true);
 
     cv::Mat f0;
     cv::Mat f1;

@@ -72,7 +72,7 @@ void PreviewRenderWorker::drainPendingRequest()
     const cv::Mat slice = volume_->downloadSlice(sliceIndex);
     if (!slice.empty())
     {
-        emit previewSliceReady(slice, updateHistogram);
+        emit previewSliceReady(slice.clone(), updateHistogram);
     }
 
     if (pendingSliceIndex_ >= 0)

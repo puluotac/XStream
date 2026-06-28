@@ -1,6 +1,7 @@
 #include "core/config/AppConfig.h"
 
 #include <QFile>
+#include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonParseError>
 
@@ -66,12 +67,31 @@ AppConfig AppConfig::fromJsonObject(const QJsonObject& object)
     cfg.phase.alphaRatio = readValue(phaseObj, "ALPHA_RATIO", cfg.phase.alphaRatio);
 
     const auto preprocessObj = object.value("PREPROCESS").toObject();
-    cfg.preprocess.method = preprocessMethodFromString(
-        readValue(preprocessObj, "METHOD", toString(cfg.preprocess.method)));
-    cfg.preprocess.airValue = readValue(preprocessObj, "AVE", cfg.preprocess.airValue);
+    cfg.preprocess.method = PreprocessMethod::Log;
+    cfg.preprocess.airValue = 1.0f;
     cfg.preprocess.taperWidth = readValue(preprocessObj, "TAPER_WIDTH", cfg.preprocess.taperWidth);
     cfg.preprocess.filterType = filterTypeFromString(
         readValue(preprocessObj, "FILTER_TYPE", toString(cfg.preprocess.filterType)));
+    cfg.preprocess.flatGap = std::max(0, readValue(preprocessObj, "FLAT_GAP", cfg.preprocess.flatGap));
+    cfg.preprocess.flatNum = std::max(1, readValue(preprocessObj, "FLAT_NUM", cfg.preprocess.flatNum));
+    const QJsonArray flatGroups = preprocessObj.value("FLAT_GROUPS").toArray();
+    for (const QJsonValue& value : flatGroups)
+    {
+        const QJsonObject obj = value.toObject();
+        if (obj.isEmpty())
+        {
+            continue;
+        }
+        FlatGroupConfig group;
+        group.label = obj.value("LABEL").toString();
+        group.afterProjectionCount = obj.value("AFTER_PROJECTION_COUNT").toInt(group.afterProjectionCount);
+        group.firstFlatIndex = obj.value("FIRST_FLAT_INDEX").toInt(group.firstFlatIndex);
+        group.flatCount = obj.value("FLAT_COUNT").toInt(group.flatCount);
+        if (group.flatCount > 0)
+        {
+            cfg.preprocess.flatGroups.append(group);
+        }
+    }
 
     const auto computeObj = object.value("COMPUTE").toObject();
     cfg.compute.batchSize = readValue(computeObj, "BATCH_SIZE", cfg.compute.batchSize);
@@ -206,10 +226,24 @@ QJsonObject AppConfig::toJsonObject() const
     root["PHASE"] = phaseObj;
 
     QJsonObject preprocessObj;
-    preprocessObj["METHOD"] = toString(preprocess.method);
-    preprocessObj["AVE"] = preprocess.airValue;
     preprocessObj["TAPER_WIDTH"] = preprocess.taperWidth;
     preprocessObj["FILTER_TYPE"] = toString(preprocess.filterType);
+    preprocessObj["FLAT_GAP"] = preprocess.flatGap;
+    preprocessObj["FLAT_NUM"] = preprocess.flatNum;
+    if (!preprocess.flatGroups.isEmpty())
+    {
+        QJsonArray flatGroups;
+        for (const FlatGroupConfig& group : preprocess.flatGroups)
+        {
+            QJsonObject obj;
+            obj["LABEL"] = group.label;
+            obj["AFTER_PROJECTION_COUNT"] = group.afterProjectionCount;
+            obj["FIRST_FLAT_INDEX"] = group.firstFlatIndex;
+            obj["FLAT_COUNT"] = group.flatCount;
+            flatGroups.append(obj);
+        }
+        preprocessObj["FLAT_GROUPS"] = flatGroups;
+    }
     root["PREPROCESS"] = preprocessObj;
 
     QJsonObject computeObj;
@@ -286,7 +320,7 @@ QString toString(PreprocessMethod method)
     case PreprocessMethod::Linear: return "linear";
     case PreprocessMethod::Log: return "log";
     }
-    return "linear";
+    return "log";
 }
 
 QString toString(FilterType type)
@@ -339,11 +373,8 @@ CorrectionMode correctionModeFromString(const QString& value)
 
 PreprocessMethod preprocessMethodFromString(const QString& value)
 {
-    if (value.compare("log", Qt::CaseInsensitive) == 0)
-    {
-        return PreprocessMethod::Log;
-    }
-    return PreprocessMethod::Linear;
+    (void)value;
+    return PreprocessMethod::Log;
 }
 
 FilterType filterTypeFromString(const QString& value)

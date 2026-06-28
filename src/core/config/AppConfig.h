@@ -3,6 +3,7 @@
 #include <QJsonObject>
 #include <QMap>
 #include <QString>
+#include <QVector>
 
 namespace ct
 {
@@ -62,12 +63,23 @@ struct PhaseConfig
     float alphaRatio = 0.0f;
 };
 
+struct FlatGroupConfig
+{
+    QString label;
+    int afterProjectionCount = 0;
+    int firstFlatIndex = 0;
+    int flatCount = 0;
+};
+
 struct PreprocessConfig
 {
-    PreprocessMethod method = PreprocessMethod::Linear;
+    PreprocessMethod method = PreprocessMethod::Log;
     float airValue = 1.0f;
     int taperWidth = 0;
     FilterType filterType = FilterType::SheppLogan;
+    int flatGap = 0;
+    int flatNum = 1;
+    QVector<FlatGroupConfig> flatGroups;
 };
 
 struct ComputeConfig

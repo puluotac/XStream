@@ -11,6 +11,7 @@
 #include <QCoreApplication>
 #include <QDoubleSpinBox>
 #include <QDir>
+#include <QEvent>
 #include <QFileDialog>
 #include <QFileInfo>
 #include <QFile>
@@ -31,6 +32,7 @@
 #include <QPixmap>
 #include <QProgressBar>
 #include <QPushButton>
+#include <QRegularExpression>
 #include <QScrollArea>
 #include <QSignalBlocker>
 #include <QSizePolicy>
@@ -61,13 +63,41 @@ namespace ct
 namespace
 {
 
+class IgnoreWheelFilter : public QObject
+{
+public:
+    explicit IgnoreWheelFilter(QObject* parent)
+        : QObject(parent)
+    {
+    }
+
+protected:
+    bool eventFilter(QObject* watched, QEvent* event) override
+    {
+        if (event->type() == QEvent::Wheel)
+        {
+            event->ignore();
+            return true;
+        }
+        return QObject::eventFilter(watched, event);
+    }
+};
+
 template <typename T>
 T* makeSpin(QWidget* parent, double min, double max, double step)
 {
     auto* spin = new T(parent);
     spin->setRange(min, max);
     spin->setSingleStep(step);
+    spin->installEventFilter(new IgnoreWheelFilter(spin));
     return spin;
+}
+
+QComboBox* makeCombo(QWidget* parent)
+{
+    auto* combo = new QComboBox(parent);
+    combo->installEventFilter(new IgnoreWheelFilter(combo));
+    return combo;
 }
 
 struct MotorAxisDefinition
@@ -325,11 +355,33 @@ QJsonObject appConfigToJobObject(const AppConfig& cfg)
     geometry["COR_AUTO"] = cfg.geometry.corAuto;
     job["GEOMETRY"] = geometry;
 
+    QJsonObject phase;
+    phase["ENABLE"] = cfg.phase.enable;
+    phase["ENERGY_KEV"] = cfg.phase.energyKev;
+    phase["DISTANCE_M"] = cfg.phase.distanceM;
+    phase["PIXEL_SIZE_UM"] = cfg.phase.pixelSizeUm;
+    phase["ALPHA_RATIO"] = cfg.phase.alphaRatio;
+    job["PHASE"] = phase;
+
     QJsonObject preprocess;
-    preprocess["METHOD"] = toString(cfg.preprocess.method);
-    preprocess["AVE"] = cfg.preprocess.airValue;
     preprocess["TAPER_WIDTH"] = cfg.preprocess.taperWidth;
     preprocess["FILTER_TYPE"] = toString(cfg.preprocess.filterType);
+    preprocess["FLAT_GAP"] = cfg.preprocess.flatGap;
+    preprocess["FLAT_NUM"] = cfg.preprocess.flatNum;
+    if (!cfg.preprocess.flatGroups.isEmpty())
+    {
+        QJsonArray flatGroups;
+        for (const FlatGroupConfig& group : cfg.preprocess.flatGroups)
+        {
+            QJsonObject obj;
+            obj["LABEL"] = group.label;
+            obj["AFTER_PROJECTION_COUNT"] = group.afterProjectionCount;
+            obj["FIRST_FLAT_INDEX"] = group.firstFlatIndex;
+            obj["FLAT_COUNT"] = group.flatCount;
+            flatGroups.append(obj);
+        }
+        preprocess["FLAT_GROUPS"] = flatGroups;
+    }
     job["PREPROCESS"] = preprocess;
 
     QJsonObject compute;
@@ -351,6 +403,21 @@ QJsonObject appConfigToJobObject(const AppConfig& cfg)
     return job;
 }
 
+QJsonArray flatGroupConfigsToJson(const QVector<FlatGroupConfig>& groups)
+{
+    QJsonArray array;
+    for (const FlatGroupConfig& group : groups)
+    {
+        QJsonObject obj;
+        obj["LABEL"] = group.label;
+        obj["AFTER_PROJECTION_COUNT"] = group.afterProjectionCount;
+        obj["FIRST_FLAT_INDEX"] = group.firstFlatIndex;
+        obj["FLAT_COUNT"] = group.flatCount;
+        array.append(obj);
+    }
+    return array;
+}
+
 void applyJobObjectToConfig(const QJsonObject& job, AppConfig& cfg)
 {
     const QJsonObject legacyRecon = job.value(QStringLiteral("RECON_CONFIG")).toObject();
@@ -369,13 +436,42 @@ void applyJobObjectToConfig(const QJsonObject& job, AppConfig& cfg)
         cfg.geometry.corShift = static_cast<float>(geometry.value(QStringLiteral("COR_SHIFT")).toDouble(cfg.geometry.corShift));
         cfg.geometry.corAuto = geometry.value(QStringLiteral("COR_AUTO")).toBool(cfg.geometry.corAuto);
     }
+    const QJsonObject phase = job.value(QStringLiteral("PHASE")).toObject();
+    if (!phase.isEmpty())
+    {
+        cfg.phase.enable = phase.value(QStringLiteral("ENABLE")).toBool(cfg.phase.enable);
+        cfg.phase.energyKev = static_cast<float>(phase.value(QStringLiteral("ENERGY_KEV")).toDouble(cfg.phase.energyKev));
+        cfg.phase.distanceM = static_cast<float>(phase.value(QStringLiteral("DISTANCE_M")).toDouble(cfg.phase.distanceM));
+        cfg.phase.pixelSizeUm = static_cast<float>(phase.value(QStringLiteral("PIXEL_SIZE_UM")).toDouble(cfg.phase.pixelSizeUm));
+        cfg.phase.alphaRatio = static_cast<float>(phase.value(QStringLiteral("ALPHA_RATIO")).toDouble(cfg.phase.alphaRatio));
+    }
     const QJsonObject preprocess = job.value(QStringLiteral("PREPROCESS")).toObject();
     if (!preprocess.isEmpty())
     {
-        cfg.preprocess.method = preprocessMethodFromString(preprocess.value(QStringLiteral("METHOD")).toString(toString(cfg.preprocess.method)));
-        cfg.preprocess.airValue = static_cast<float>(preprocess.value(QStringLiteral("AVE")).toDouble(cfg.preprocess.airValue));
+        cfg.preprocess.method = PreprocessMethod::Log;
+        cfg.preprocess.airValue = 1.0f;
         cfg.preprocess.taperWidth = preprocess.value(QStringLiteral("TAPER_WIDTH")).toInt(cfg.preprocess.taperWidth);
         cfg.preprocess.filterType = filterTypeFromString(preprocess.value(QStringLiteral("FILTER_TYPE")).toString(toString(cfg.preprocess.filterType)));
+        cfg.preprocess.flatGap = std::max(0, preprocess.value(QStringLiteral("FLAT_GAP")).toInt(cfg.preprocess.flatGap));
+        cfg.preprocess.flatNum = std::max(1, preprocess.value(QStringLiteral("FLAT_NUM")).toInt(cfg.preprocess.flatNum));
+        const QJsonArray flatGroups = preprocess.value(QStringLiteral("FLAT_GROUPS")).toArray();
+        if (!flatGroups.isEmpty())
+        {
+            cfg.preprocess.flatGroups.clear();
+            for (const QJsonValue& value : flatGroups)
+            {
+                const QJsonObject obj = value.toObject();
+                FlatGroupConfig group;
+                group.label = obj.value(QStringLiteral("LABEL")).toString();
+                group.afterProjectionCount = obj.value(QStringLiteral("AFTER_PROJECTION_COUNT")).toInt();
+                group.firstFlatIndex = obj.value(QStringLiteral("FIRST_FLAT_INDEX")).toInt();
+                group.flatCount = obj.value(QStringLiteral("FLAT_COUNT")).toInt();
+                if (group.flatCount > 0)
+                {
+                    cfg.preprocess.flatGroups.append(group);
+                }
+            }
+        }
     }
     const QJsonObject compute = job.value(QStringLiteral("COMPUTE")).toObject();
     if (!compute.isEmpty())
@@ -408,6 +504,102 @@ QString numberedFileName(const QString& prefix, int padding, int index, const QS
         .arg(prefix)
         .arg(std::max(0, index), std::clamp(padding, 1, 12), 10, QLatin1Char('0'))
         .arg(ext);
+}
+
+int extractStartIndexFromPattern(const QString& pattern)
+{
+    const QRegularExpression numberRegex(QStringLiteral(R"((\d+))"));
+    QRegularExpressionMatchIterator it = numberRegex.globalMatch(pattern);
+    int value = 0;
+    while (it.hasNext())
+    {
+        value = it.next().captured(1).toInt();
+    }
+    return value;
+}
+
+QVector<FlatGroupConfig> inferQueueFlatGroups(const AppConfig& cfg, int firstFlatIndex)
+{
+    QVector<FlatGroupConfig> groups;
+    const int flatNum = std::max(1, cfg.preprocess.flatNum);
+
+    auto appendGroup = [&](const QString& label, int afterProjectionCount) {
+        FlatGroupConfig group;
+        group.label = label;
+        group.afterProjectionCount = std::clamp(afterProjectionCount, 0, cfg.geometry.totalAngles);
+        group.firstFlatIndex = firstFlatIndex + groups.size() * flatNum;
+        group.flatCount = flatNum;
+        groups.append(group);
+    };
+
+    appendGroup(QStringLiteral("start"), 0);
+    if (cfg.preprocess.flatGap > 0)
+    {
+        for (int after = cfg.preprocess.flatGap; after < cfg.geometry.totalAngles; after += cfg.preprocess.flatGap)
+        {
+            appendGroup(QStringLiteral("interval"), after);
+        }
+        appendGroup(QStringLiteral("end"), cfg.geometry.totalAngles);
+    }
+    return groups;
+}
+
+int findFirstFlatIndexForConfig(const AppConfig& cfg)
+{
+    const QDir projectionDir(cfg.io.watchDir);
+    for (int index = 0; index < 100000; ++index)
+    {
+        const QString flatPath = projectionDir.filePath(numberedFileName(cfg.io.flatPrefix,
+            cfg.io.inputPadding, index, cfg.io.inputExt));
+        if (QFileInfo::exists(flatPath))
+        {
+            return index;
+        }
+    }
+    return -1;
+}
+
+int findFirstTomoIndexForConfig(const AppConfig& cfg)
+{
+    const QDir projectionDir(cfg.io.watchDir);
+    for (int index = 0; index < 100000; ++index)
+    {
+        const QString tomoPath = projectionDir.filePath(numberedFileName(cfg.io.tomoPrefix,
+            cfg.io.inputPadding, index, cfg.io.inputExt));
+        if (QFileInfo::exists(tomoPath))
+        {
+            return index;
+        }
+    }
+    return -1;
+}
+
+int resolveTomoStartIndexForConfig(AppConfig& cfg)
+{
+    const QDir projectionDir(cfg.io.watchDir);
+    const auto hasCompleteTomoRange = [&](int startIndex) {
+        const QString firstTomo = projectionDir.filePath(numberedFileName(cfg.io.tomoPrefix,
+            cfg.io.inputPadding, startIndex, cfg.io.inputExt));
+        const QString lastTomo = projectionDir.filePath(numberedFileName(cfg.io.tomoPrefix,
+            cfg.io.inputPadding, startIndex + cfg.geometry.totalAngles - 1, cfg.io.inputExt));
+        return QFileInfo::exists(firstTomo) && QFileInfo::exists(lastTomo);
+    };
+
+    const int configuredStartIndex = extractStartIndexFromPattern(cfg.io.filePattern0);
+    if (hasCompleteTomoRange(configuredStartIndex))
+    {
+        return configuredStartIndex;
+    }
+
+    const int detectedStartIndex = findFirstTomoIndexForConfig(cfg);
+    if (detectedStartIndex >= 0 && hasCompleteTomoRange(detectedStartIndex))
+    {
+        cfg.io.filePattern0 = numberedFileName(cfg.io.tomoPrefix,
+            cfg.io.inputPadding, detectedStartIndex, cfg.io.inputExt);
+        return detectedStartIndex;
+    }
+
+    return configuredStartIndex;
 }
 
 void moveJobToFailed(const QString& jobPath, QJsonObject job, const QString& resultPath,
@@ -501,7 +693,7 @@ MainWindow::MainWindow(QWidget* parent)
     cameraExposureSpin_ = makeSpin<QDoubleSpinBox>(cameraGroup, 0.001, 600000.0, 1.0);
     cameraExposureSpin_->setValue(10.0);
     cameraExposureSpin_->setDecimals(3);
-    cameraExposureUnitCombo_ = new QComboBox(cameraGroup);
+    cameraExposureUnitCombo_ = makeCombo(cameraGroup);
     cameraExposureUnitCombo_->addItems({ "us", "ms", "s" });
     cameraExposureUnitCombo_->setCurrentText(QStringLiteral("ms"));
     auto* cameraExposureLayout = new QHBoxLayout();
@@ -796,10 +988,14 @@ MainWindow::MainWindow(QWidget* parent)
     reconQueueUpButton_ = new QPushButton(QStringLiteral("Up"), reconQueueGroup);
     reconQueueDownButton_ = new QPushButton(QStringLiteral("Down"), reconQueueGroup);
     reconQueueRemoveButton_ = new QPushButton(QStringLiteral("Remove"), reconQueueGroup);
+    reconQueueCurrentButton_ = new QPushButton(QStringLiteral("Queue Current Recon"), reconQueueGroup);
+    reconQueueImportButton_ = new QPushButton(QStringLiteral("Import Job"), reconQueueGroup);
     reconQueueButtonLayout->addWidget(reconQueueUpButton_);
     reconQueueButtonLayout->addWidget(reconQueueDownButton_);
     reconQueueButtonLayout->addWidget(reconQueueRemoveButton_);
     reconQueueLayout->addLayout(reconQueueButtonLayout);
+    reconQueueLayout->addWidget(reconQueueImportButton_);
+    reconQueueLayout->addWidget(reconQueueCurrentButton_);
     settingsLayout->addWidget(reconQueueGroup);
 
     auto* ioGroup = new QGroupBox(QStringLiteral("IO"), settingsHost);
@@ -822,10 +1018,10 @@ MainWindow::MainWindow(QWidget* parent)
     auto* saveWidget = new QWidget(ioGroup);
     saveWidget->setLayout(saveLayout);
     ioForm->addRow(QStringLiteral("Save Dir"), saveWidget);
-    correctionModeCombo_ = new QComboBox(ioGroup);
+    correctionModeCombo_ = makeCombo(ioGroup);
     correctionModeCombo_->addItems({ "None", "Flat", "Flat-Dark" });
     ioForm->addRow(QStringLiteral("Correction"), correctionModeCombo_);
-    reconMethodCombo_ = new QComboBox(ioGroup);
+    reconMethodCombo_ = makeCombo(ioGroup);
     reconMethodCombo_->addItems({ "RealTimeFBP", "OfflineFBP", "OfflineGridrec" });
     ioForm->addRow(QStringLiteral("Recon Method"), reconMethodCombo_);
     connect(reconMethodCombo_, &QComboBox::currentTextChanged,
@@ -837,7 +1033,7 @@ MainWindow::MainWindow(QWidget* parent)
     ioForm->addRow(QStringLiteral("Flat Prefix"), flatPrefixEdit_);
     ioForm->addRow(QStringLiteral("Dark Prefix"), darkPrefixEdit_);
     paddingSpin_ = makeSpin<QSpinBox>(ioGroup, 1, 10, 1);
-    extCombo_ = new QComboBox(ioGroup);
+    extCombo_ = makeCombo(ioGroup);
     extCombo_->addItems({ "tif", "tiff" });
     ioForm->addRow(QStringLiteral("Padding"), paddingSpin_);
     ioForm->addRow(QStringLiteral("Ext"), extCombo_);
@@ -846,9 +1042,9 @@ MainWindow::MainWindow(QWidget* parent)
     ioForm->addRow(QStringLiteral("0 Deg"), file0Edit_);
     ioForm->addRow(QStringLiteral("180 Deg"), file180Edit_);
     savePrefixEdit_ = new QLineEdit(ioGroup);
-    saveDepthCombo_ = new QComboBox(ioGroup);
+    saveDepthCombo_ = makeCombo(ioGroup);
     saveDepthCombo_->addItems({ "8bit", "16bit", "32bit" });
-    saveFormatCombo_ = new QComboBox(ioGroup);
+    saveFormatCombo_ = makeCombo(ioGroup);
     saveFormatCombo_->addItems({ "tif", "tiff" });
     tiffThreadsSpin_ = makeSpin<QSpinBox>(ioGroup, 1, 64, 1);
     ioForm->addRow(QStringLiteral("Save Prefix"), savePrefixEdit_);
@@ -889,15 +1085,14 @@ MainWindow::MainWindow(QWidget* parent)
 
     auto* preprocessGroup = new QGroupBox(QStringLiteral("Preprocess"), settingsHost);
     auto* preprocessForm = new QFormLayout(preprocessGroup);
-    preprocessMethodCombo_ = new QComboBox(preprocessGroup);
-    preprocessMethodCombo_->addItems({ "linear", "log" });
-    airValueSpin_ = makeSpin<QDoubleSpinBox>(preprocessGroup, 0.0, 65535.0, 0.1);
     taperSpin_ = makeSpin<QSpinBox>(preprocessGroup, 0, 200, 1);
-    filterCombo_ = new QComboBox(preprocessGroup);
+    flatGapSpin_ = makeSpin<QSpinBox>(preprocessGroup, 0, 20000, 1);
+    flatNumSpin_ = makeSpin<QSpinBox>(preprocessGroup, 1, 10000, 1);
+    filterCombo_ = makeCombo(preprocessGroup);
     filterCombo_->addItems({ "shepp-logan", "ram-lak", "cosine", "hamming", "hann" });
-    preprocessForm->addRow(QStringLiteral("Method"), preprocessMethodCombo_);
-    preprocessForm->addRow(QStringLiteral("Air Value"), airValueSpin_);
     preprocessForm->addRow(QStringLiteral("Taper"), taperSpin_);
+    preprocessForm->addRow(QStringLiteral("Flat Gap"), flatGapSpin_);
+    preprocessForm->addRow(QStringLiteral("Flat Num"), flatNumSpin_);
     preprocessForm->addRow(QStringLiteral("Filter"), filterCombo_);
     settingsLayout->addWidget(preprocessGroup);
 
@@ -1025,6 +1220,8 @@ MainWindow::MainWindow(QWidget* parent)
     connect(reconQueueUpButton_, &QPushButton::clicked, this, [this]() { moveSelectedReconQueueJob(-1); });
     connect(reconQueueDownButton_, &QPushButton::clicked, this, [this]() { moveSelectedReconQueueJob(1); });
     connect(reconQueueRemoveButton_, &QPushButton::clicked, this, &MainWindow::removeSelectedReconQueueJob);
+    connect(reconQueueImportButton_, &QPushButton::clicked, this, &MainWindow::importReconJobs);
+    connect(reconQueueCurrentButton_, &QPushButton::clicked, this, &MainWindow::enqueueCurrentReconJob);
     connect(startButton_, &QPushButton::clicked, this, &MainWindow::startReconstruction);
     connect(stopButton_, &QPushButton::clicked, this, &MainWindow::stopReconstruction);
     connect(saveButton_, &QPushButton::clicked, this, &MainWindow::saveSlices);
@@ -1174,9 +1371,9 @@ void MainWindow::applyConfig(const AppConfig& config)
     distanceSpin_->setValue(config.phase.distanceM);
     pixelSpin_->setValue(config.phase.pixelSizeUm);
     alphaSpin_->setValue(config.phase.alphaRatio);
-    preprocessMethodCombo_->setCurrentText(toString(config.preprocess.method));
-    airValueSpin_->setValue(config.preprocess.airValue);
     taperSpin_->setValue(config.preprocess.taperWidth);
+    flatGapSpin_->setValue(config.preprocess.flatGap);
+    flatNumSpin_->setValue(config.preprocess.flatNum);
     filterCombo_->setCurrentText(toString(config.preprocess.filterType));
     batchSpin_->setValue(config.compute.batchSize);
     zChunkSpin_->setValue(config.compute.zChunkSize);
@@ -1229,18 +1426,15 @@ AppConfig MainWindow::configFromUi() const
     cfg.geometry.corShift = static_cast<float>(corShiftSpin_->value());
     cfg.geometry.angleOffsetDeg = static_cast<float>(angleOffsetSpin_->value());
     cfg.phase.enable = phaseEnableCheck_->isChecked();
-    if (cfg.io.reconMethod == ReconMethod::OfflineFBP
-        || cfg.io.reconMethod == ReconMethod::OfflineGridrec)
-    {
-        cfg.phase.enable = false;
-    }
     cfg.phase.energyKev = static_cast<float>(energySpin_->value());
     cfg.phase.distanceM = static_cast<float>(distanceSpin_->value());
     cfg.phase.pixelSizeUm = static_cast<float>(pixelSpin_->value());
     cfg.phase.alphaRatio = static_cast<float>(alphaSpin_->value());
-    cfg.preprocess.method = preprocessMethodFromString(preprocessMethodCombo_->currentText());
-    cfg.preprocess.airValue = static_cast<float>(airValueSpin_->value());
+    cfg.preprocess.method = PreprocessMethod::Log;
+    cfg.preprocess.airValue = 1.0f;
     cfg.preprocess.taperWidth = taperSpin_->value();
+    cfg.preprocess.flatGap = flatGapSpin_->value();
+    cfg.preprocess.flatNum = flatNumSpin_->value();
     cfg.preprocess.filterType = filterTypeFromString(filterCombo_->currentText());
     cfg.compute.batchSize = batchSpin_->value();
     cfg.compute.zChunkSize = zChunkSpin_->value();
@@ -1812,7 +2006,6 @@ void MainWindow::startCtAcquisition()
     {
         ctSettings_.reconConfig.io.reconMethod = ReconMethod::OfflineFBP;
     }
-    ctSettings_.reconConfig.phase.enable = false;
     ctSettings_.reconConfig.geometry.corAuto = ctSettings_.autoCor;
     ctSettings_.reconConfig.io.watchDir = savePath;
     ctSettings_.reconConfig.io.saveDir = QDir(savePath).filePath(QStringLiteral("recon"));
@@ -2331,6 +2524,199 @@ void MainWindow::enqueueCtReconJob()
     }
 }
 
+void MainWindow::enqueueCurrentReconJob()
+{
+    AppConfig cfg = configFromUi();
+    if (cfg.io.reconMethod == ReconMethod::RealTimeFBP)
+    {
+        cfg.io.reconMethod = ReconMethod::OfflineFBP;
+    }
+
+    const QString projectionDir = QDir::fromNativeSeparators(cfg.io.watchDir.trimmed());
+    if (projectionDir.isEmpty())
+    {
+        appendLog(QStringLiteral("Queue Current Recon failed: Watch Dir is empty."));
+        return;
+    }
+    if (!QDir(projectionDir).exists())
+    {
+        appendLog(QStringLiteral("Queue Current Recon failed: Watch Dir does not exist: %1").arg(projectionDir));
+        return;
+    }
+
+    if (cfg.io.saveDir.trimmed().isEmpty())
+    {
+        cfg.io.saveDir = QDir(projectionDir).filePath(QStringLiteral("recon"));
+    }
+    cfg.io.watchDir = projectionDir;
+    cfg.io.saveDir = QDir::fromNativeSeparators(cfg.io.saveDir);
+    if (!QDir().mkpath(cfg.io.saveDir))
+    {
+        appendLog(QStringLiteral("Queue Current Recon failed: cannot create Save Dir: %1").arg(cfg.io.saveDir));
+        return;
+    }
+
+    if (cfg.geometry.totalAngles <= 0 || cfg.geometry.volW <= 0 || cfg.geometry.volH <= 0)
+    {
+        appendLog(QStringLiteral("Queue Current Recon failed: invalid geometry or total angle count."));
+        return;
+    }
+
+    const QString originalFilePattern0 = cfg.io.filePattern0;
+    const int tomoStartIndex = resolveTomoStartIndexForConfig(cfg);
+    if (cfg.io.filePattern0 != originalFilePattern0)
+    {
+        appendLog(QStringLiteral("Queue Current Recon adjusted FILE_PATTERN_0 to existing first Tomo: %1")
+            .arg(cfg.io.filePattern0));
+    }
+    const QString firstTomo = QDir(projectionDir).filePath(numberedFileName(cfg.io.tomoPrefix,
+        cfg.io.inputPadding, tomoStartIndex, cfg.io.inputExt));
+    const QString lastTomo = QDir(projectionDir).filePath(numberedFileName(cfg.io.tomoPrefix,
+        cfg.io.inputPadding, tomoStartIndex + cfg.geometry.totalAngles - 1, cfg.io.inputExt));
+    if (!QFileInfo::exists(firstTomo))
+    {
+        appendLog(QStringLiteral("Queue Current Recon failed: missing first Tomo file: %1").arg(firstTomo));
+        return;
+    }
+    if (!QFileInfo::exists(lastTomo))
+    {
+        appendLog(QStringLiteral("Queue Current Recon failed: missing last Tomo file: %1").arg(lastTomo));
+        return;
+    }
+
+    QVector<FlatGroupConfig> flatGroups;
+    if (cfg.io.correctionMode == CorrectionMode::Flat || cfg.io.correctionMode == CorrectionMode::FlatDark)
+    {
+        const int firstFlatIndex = findFirstFlatIndexForConfig(cfg);
+        if (firstFlatIndex < 0)
+        {
+            appendLog(QStringLiteral("Queue Current Recon failed: no flat file matching prefix %1 in %2.")
+                .arg(cfg.io.flatPrefix, projectionDir));
+            return;
+        }
+        flatGroups = inferQueueFlatGroups(cfg, firstFlatIndex);
+        for (const FlatGroupConfig& group : flatGroups)
+        {
+            const QString firstFlat = QDir(projectionDir).filePath(numberedFileName(cfg.io.flatPrefix,
+                cfg.io.inputPadding, group.firstFlatIndex, cfg.io.inputExt));
+            const QString lastFlat = QDir(projectionDir).filePath(numberedFileName(cfg.io.flatPrefix,
+                cfg.io.inputPadding, group.firstFlatIndex + group.flatCount - 1, cfg.io.inputExt));
+            if (!QFileInfo::exists(firstFlat))
+            {
+                appendLog(QStringLiteral("Queue Current Recon failed: missing flat file: %1").arg(firstFlat));
+                return;
+            }
+            if (!QFileInfo::exists(lastFlat))
+            {
+                appendLog(QStringLiteral("Queue Current Recon failed: missing flat file: %1").arg(lastFlat));
+                return;
+            }
+        }
+    }
+    cfg.preprocess.flatGroups = flatGroups;
+
+    if (cfg.geometry.corAuto)
+    {
+        const QString ref0 = QDir(projectionDir).filePath(cfg.io.filePattern0);
+        const QString ref180 = QDir(projectionDir).filePath(cfg.io.filePattern180);
+        if (!QFileInfo::exists(ref0))
+        {
+            appendLog(QStringLiteral("Queue Current Recon failed: missing Auto COR 0 deg reference: %1").arg(ref0));
+            return;
+        }
+        if (!QFileInfo::exists(ref180))
+        {
+            appendLog(QStringLiteral("Queue Current Recon failed: missing Auto COR 180 deg reference: %1").arg(ref180));
+            return;
+        }
+    }
+
+    QJsonObject manifest;
+    manifest["TYPE"] = "CT_STREAM_SCAN_MANIFEST";
+    manifest["VERSION"] = 2;
+    manifest["COMPLETED"] = true;
+    manifest["ERROR"] = QString();
+    manifest["CREATED_AT"] = QDateTime::currentDateTime().toString(Qt::ISODate);
+
+    QJsonObject acq;
+    acq["BEGINNING_ANGLE_DEG"] = cfg.geometry.angleOffsetDeg;
+    acq["END_ANGLE_DEG"] = static_cast<double>(cfg.geometry.angleOffsetDeg) + 180.0;
+    acq["ANGLE_STEP_DEG"] = 180.0 / static_cast<double>(std::max(1, cfg.geometry.totalAngles));
+    acq["PROJECTION_COUNT"] = cfg.geometry.totalAngles;
+    acq["FLAT_GAP"] = cfg.preprocess.flatGap;
+    acq["FLAT_MOVE_DISTANCE_UM"] = 0.0;
+    acq["FLAT_NUM"] = cfg.preprocess.flatNum;
+    acq["IMAGE_WIDTH"] = cfg.geometry.volW;
+    acq["IMAGE_HEIGHT"] = cfg.geometry.volH;
+    acq["AUTO_COR"] = cfg.geometry.corAuto;
+    acq["COR_REFERENCE_CAPTURED"] = cfg.geometry.corAuto;
+    acq["COR_SHIFT"] = cfg.geometry.corShift;
+    manifest["ACQUISITION"] = acq;
+
+    QJsonObject io;
+    io["TOMO_PREFIX"] = cfg.io.tomoPrefix;
+    io["FLAT_PREFIX"] = cfg.io.flatPrefix;
+    io["DARK_PREFIX"] = cfg.io.darkPrefix;
+    io["INPUT_PADDING"] = cfg.io.inputPadding;
+    io["INPUT_EXT"] = cfg.io.inputExt;
+    io["FILE_PATTERN_0"] = cfg.io.filePattern0;
+    io["FILE_PATTERN_180"] = cfg.io.filePattern180;
+    manifest["IO"] = io;
+    manifest["FLAT_GROUPS"] = flatGroupConfigsToJson(flatGroups);
+
+    QJsonObject camera;
+    camera["ROI_X"] = 0;
+    camera["ROI_Y"] = 0;
+    camera["ROI_WIDTH"] = cfg.geometry.volW;
+    camera["ROI_HEIGHT"] = cfg.geometry.volH;
+    manifest["CAMERA"] = camera;
+
+    const QString manifestPath = manifestPathForProjectionDir(projectionDir);
+    if (!writeJsonFileAtomic(manifestPath, manifest))
+    {
+        appendLog(QStringLiteral("Queue Current Recon failed: cannot write manifest: %1").arg(manifestPath));
+        return;
+    }
+
+    const QString pendingDir = QDir(reconQueueRoot()).filePath(QStringLiteral("pending"));
+    QDir().mkpath(pendingDir);
+    const QStringList existing = QDir(pendingDir).entryList({ QStringLiteral("*.json") }, QDir::Files, QDir::Name);
+    int maxIndex = 0;
+    for (const QString& fileName : existing)
+    {
+        maxIndex = std::max(maxIndex, queueIndexFromFileName(fileName));
+    }
+    if (maxIndex == std::numeric_limits<int>::max())
+    {
+        maxIndex = existing.size() * 10;
+    }
+    const int queueIndex = maxIndex + 10;
+    QString base = sanitizeQueueName(QFileInfo(projectionDir).fileName());
+    if (base.isEmpty())
+    {
+        base = QStringLiteral("manual_recon");
+    }
+    const QString jobPath = QDir(pendingDir).filePath(queueFileName(queueIndex, base));
+    QJsonObject job = appConfigToJobObject(cfg);
+    job["TYPE"] = "CT_STREAM_RECON_JOB";
+    job["VERSION"] = 2;
+    job["STATUS"] = "pending";
+    job["QUEUE_INDEX"] = queueIndex;
+    job["CREATED_AT"] = QDateTime::currentDateTime().toString(Qt::ISODate);
+    job["PROJECTION_DIR"] = projectionDir;
+    job["OUTPUT_DIR"] = cfg.io.saveDir;
+
+    if (!writeJsonFileAtomic(jobPath, job))
+    {
+        appendLog(QStringLiteral("Queue Current Recon failed: cannot write job: %1").arg(jobPath));
+        return;
+    }
+
+    appendLog(QStringLiteral("Current reconstruction queued: manifest=%1, job=%2").arg(manifestPath, jobPath));
+    refreshReconQueue();
+    startNextQueuedReconstruction();
+}
+
 QString MainWindow::reconQueueRoot() const
 {
     return QDir(QCoreApplication::applicationDirPath()).filePath(QStringLiteral("recon_queue"));
@@ -2473,6 +2859,120 @@ void MainWindow::normalizePendingReconQueue(bool scheduleRefresh)
     {
         scheduleReconQueueRefresh();
     }
+}
+
+void MainWindow::importReconJobs()
+{
+    const QStringList sourcePaths = QFileDialog::getOpenFileNames(this,
+        QStringLiteral("Import Recon Job JSON"),
+        QDir::homePath(),
+        QStringLiteral("JSON Files (*.json);;All Files (*)"));
+    if (sourcePaths.isEmpty())
+    {
+        return;
+    }
+
+    const QString pendingDirPath = QDir(reconQueueRoot()).filePath(QStringLiteral("pending"));
+    QDir().mkpath(pendingDirPath);
+    QDir pendingDir(pendingDirPath);
+    normalizePendingReconQueue(false);
+
+    const QStringList existing = pendingDir.entryList({ QStringLiteral("*.json") }, QDir::Files, QDir::Name);
+    int maxIndex = 0;
+    for (const QString& fileName : existing)
+    {
+        const int index = queueIndexFromFileName(fileName);
+        if (index != std::numeric_limits<int>::max())
+        {
+            maxIndex = std::max(maxIndex, index);
+        }
+    }
+
+    int imported = 0;
+    int skipped = 0;
+    for (const QString& sourcePath : sourcePaths)
+    {
+        QJsonObject job;
+        QString error;
+        if (!readJsonFile(sourcePath, &job, &error))
+        {
+            appendLog(QStringLiteral("Import Job skipped: %1").arg(error));
+            ++skipped;
+            continue;
+        }
+
+        QString projectionDir = QDir::fromNativeSeparators(projectionDirFromJob(job).trimmed());
+        if (projectionDir.isEmpty())
+        {
+            appendLog(QStringLiteral("Import Job skipped: missing PROJECTION_DIR in %1").arg(sourcePath));
+            ++skipped;
+            continue;
+        }
+        if (!QDir(projectionDir).exists())
+        {
+            appendLog(QStringLiteral("Import Job skipped: PROJECTION_DIR does not exist: %1").arg(projectionDir));
+            ++skipped;
+            continue;
+        }
+
+        const QString manifestPath = manifestPathForProjectionDir(projectionDir);
+        QJsonObject manifest;
+        if (!readJsonFile(manifestPath, &manifest, &error))
+        {
+            appendLog(QStringLiteral("Import Job skipped: missing or invalid scan_manifest.json for %1: %2")
+                .arg(projectionDir, error));
+            ++skipped;
+            continue;
+        }
+        if (!manifest.value(QStringLiteral("COMPLETED")).toBool(false))
+        {
+            appendLog(QStringLiteral("Import Job skipped: scan_manifest.json COMPLETED=false for %1").arg(projectionDir));
+            ++skipped;
+            continue;
+        }
+
+        QString outputDir = QDir::fromNativeSeparators(job.value(QStringLiteral("OUTPUT_DIR")).toString().trimmed());
+        if (outputDir.isEmpty())
+        {
+            outputDir = QDir(projectionDir).filePath(QStringLiteral("recon"));
+        }
+
+        maxIndex += 10;
+        job["TYPE"] = "CT_STREAM_RECON_JOB";
+        job["VERSION"] = std::max(2, job.value(QStringLiteral("VERSION")).toInt(2));
+        job["STATUS"] = "pending";
+        job["QUEUE_INDEX"] = maxIndex;
+        job["IMPORTED_AT"] = QDateTime::currentDateTime().toString(Qt::ISODate);
+        job["SOURCE_JOB_PATH"] = QDir::fromNativeSeparators(sourcePath);
+        job["PROJECTION_DIR"] = projectionDir;
+        job["OUTPUT_DIR"] = outputDir;
+
+        QString base = queueBaseNameFromPath(sourcePath);
+        if (base.isEmpty())
+        {
+            base = sanitizeQueueName(QFileInfo(projectionDir).fileName());
+        }
+        QString targetPath = pendingDir.filePath(queueFileName(maxIndex, base));
+        int duplicate = 1;
+        while (QFileInfo::exists(targetPath))
+        {
+            targetPath = pendingDir.filePath(queueFileName(maxIndex, QStringLiteral("%1_%2").arg(base).arg(duplicate++)));
+        }
+
+        if (!writeJsonFileAtomic(targetPath, job))
+        {
+            appendLog(QStringLiteral("Import Job failed: cannot write %1").arg(targetPath));
+            ++skipped;
+            continue;
+        }
+        appendLog(QStringLiteral("Imported recon job: %1").arg(targetPath));
+        ++imported;
+    }
+
+    normalizePendingReconQueue(false);
+    refreshReconQueue();
+    startNextQueuedReconstruction();
+    appendLog(QStringLiteral("Import Job finished: imported=%1, skipped=%2.").arg(imported).arg(skipped));
 }
 
 void MainWindow::moveSelectedReconQueueJob(int direction)
@@ -2686,11 +3186,30 @@ bool MainWindow::startQueuedReconstruction(const QString& jobPath)
     cfg.geometry.volW = acq.value(QStringLiteral("IMAGE_WIDTH")).toInt(cfg.geometry.volW);
     cfg.geometry.volH = acq.value(QStringLiteral("IMAGE_HEIGHT")).toInt(cfg.geometry.volH);
     cfg.geometry.angleOffsetDeg = static_cast<float>(acq.value(QStringLiteral("BEGINNING_ANGLE_DEG")).toDouble(cfg.geometry.angleOffsetDeg));
+    cfg.preprocess.flatGap = std::max(0, acq.value(QStringLiteral("FLAT_GAP")).toInt(cfg.preprocess.flatGap));
+    cfg.preprocess.flatNum = std::max(1, acq.value(QStringLiteral("FLAT_NUM")).toInt(cfg.preprocess.flatNum));
+    const QJsonArray manifestFlatGroups = manifest.value(QStringLiteral("FLAT_GROUPS")).toArray();
+    if (!manifestFlatGroups.isEmpty())
+    {
+        cfg.preprocess.flatGroups.clear();
+        for (const QJsonValue& value : manifestFlatGroups)
+        {
+            const QJsonObject obj = value.toObject();
+            FlatGroupConfig group;
+            group.label = obj.value(QStringLiteral("LABEL")).toString();
+            group.afterProjectionCount = obj.value(QStringLiteral("AFTER_PROJECTION_COUNT")).toInt();
+            group.firstFlatIndex = obj.value(QStringLiteral("FIRST_FLAT_INDEX")).toInt();
+            group.flatCount = obj.value(QStringLiteral("FLAT_COUNT")).toInt();
+            if (group.flatCount > 0)
+            {
+                cfg.preprocess.flatGroups.append(group);
+            }
+        }
+    }
     if (!job.value(QStringLiteral("GEOMETRY")).toObject().contains(QStringLiteral("COR_SHIFT")))
     {
         cfg.geometry.corShift = static_cast<float>(acq.value(QStringLiteral("COR_SHIFT")).toDouble(cfg.geometry.corShift));
     }
-    cfg.phase.enable = false;
     if (cfg.io.reconMethod == ReconMethod::RealTimeFBP)
     {
         cfg.io.reconMethod = ReconMethod::OfflineFBP;
@@ -2706,10 +3225,11 @@ bool MainWindow::startQueuedReconstruction(const QString& jobPath)
             QStringLiteral("InvalidGeometry"), message, reconQueueRoot());
         return false;
     }
+    const int tomoStartIndex = resolveTomoStartIndexForConfig(cfg);
     const QString firstTomo = QDir(projectionDir).filePath(numberedFileName(cfg.io.tomoPrefix,
-        cfg.io.inputPadding, 0, cfg.io.inputExt));
+        cfg.io.inputPadding, tomoStartIndex, cfg.io.inputExt));
     const QString lastTomo = QDir(projectionDir).filePath(numberedFileName(cfg.io.tomoPrefix,
-        cfg.io.inputPadding, cfg.geometry.totalAngles - 1, cfg.io.inputExt));
+        cfg.io.inputPadding, tomoStartIndex + cfg.geometry.totalAngles - 1, cfg.io.inputExt));
     if (!QFileInfo::exists(firstTomo) || !QFileInfo::exists(lastTomo))
     {
         const QString message = QStringLiteral("Projection files are incomplete. Missing first or last Tomo file.");
@@ -2723,11 +3243,69 @@ bool MainWindow::startQueuedReconstruction(const QString& jobPath)
     }
     if (cfg.io.correctionMode == CorrectionMode::Flat || cfg.io.correctionMode == CorrectionMode::FlatDark)
     {
-        const QString firstFlat = QDir(projectionDir).filePath(numberedFileName(cfg.io.flatPrefix,
-            cfg.io.inputPadding, 0, cfg.io.inputExt));
-        if (!QFileInfo::exists(firstFlat))
+        QString missingFlat;
+        if (!cfg.preprocess.flatGroups.isEmpty())
         {
-            const QString message = QStringLiteral("Flat correction requested but no first Flat file was found.");
+            for (const FlatGroupConfig& group : cfg.preprocess.flatGroups)
+            {
+                const QString firstFlat = QDir(projectionDir).filePath(numberedFileName(cfg.io.flatPrefix,
+                    cfg.io.inputPadding, group.firstFlatIndex, cfg.io.inputExt));
+                const QString lastFlat = QDir(projectionDir).filePath(numberedFileName(cfg.io.flatPrefix,
+                    cfg.io.inputPadding, group.firstFlatIndex + group.flatCount - 1, cfg.io.inputExt));
+                if (!QFileInfo::exists(firstFlat))
+                {
+                    missingFlat = firstFlat;
+                    break;
+                }
+                if (!QFileInfo::exists(lastFlat))
+                {
+                    missingFlat = lastFlat;
+                    break;
+                }
+            }
+        }
+        else
+        {
+            int firstFlatIndex = 0;
+            bool foundFlat = false;
+            for (int index = 0; index < 100000; ++index)
+            {
+                const QString flatPath = QDir(projectionDir).filePath(numberedFileName(cfg.io.flatPrefix,
+                    cfg.io.inputPadding, index, cfg.io.inputExt));
+                if (QFileInfo::exists(flatPath))
+                {
+                    firstFlatIndex = index;
+                    foundFlat = true;
+                    break;
+                }
+            }
+            const QVector<FlatGroupConfig> inferredGroups = foundFlat ? inferQueueFlatGroups(cfg, firstFlatIndex) : QVector<FlatGroupConfig>();
+            if (!foundFlat)
+            {
+                missingFlat = QDir(projectionDir).filePath(numberedFileName(cfg.io.flatPrefix,
+                    cfg.io.inputPadding, 0, cfg.io.inputExt));
+            }
+            for (const FlatGroupConfig& group : inferredGroups)
+            {
+                const QString firstFlat = QDir(projectionDir).filePath(numberedFileName(cfg.io.flatPrefix,
+                    cfg.io.inputPadding, group.firstFlatIndex, cfg.io.inputExt));
+                const QString lastFlat = QDir(projectionDir).filePath(numberedFileName(cfg.io.flatPrefix,
+                    cfg.io.inputPadding, group.firstFlatIndex + group.flatCount - 1, cfg.io.inputExt));
+                if (!QFileInfo::exists(firstFlat))
+                {
+                    missingFlat = firstFlat;
+                    break;
+                }
+                if (!QFileInfo::exists(lastFlat))
+                {
+                    missingFlat = lastFlat;
+                    break;
+                }
+            }
+        }
+        if (!missingFlat.isEmpty())
+        {
+            const QString message = QStringLiteral("Flat correction requested but flat file is missing: %1").arg(missingFlat);
             const QString resultPath = writeReconResultJson(jobPath, job, QStringLiteral("failed"), QStringLiteral("ReferenceLoad"),
                 QStringLiteral("FlatMissing"), message, projectionDir, cfg.io.saveDir, {},
                 QDateTime::currentDateTime().toString(Qt::ISODate),
@@ -3078,9 +3656,9 @@ void MainWindow::updateReconMethodUiState()
 
     if (batchSpin_ != nullptr)
     {
-        batchSpin_->setEnabled(!offline);
+        batchSpin_->setEnabled(true);
         batchSpin_->setToolTip(offline
-            ? QStringLiteral("Offline FBP/Gridrec reconstruct by full-angle sinogram z chunks. Batch is not a reconstruction parameter.")
+            ? QStringLiteral("Projection batch size for offline TIFF read/decode and GPU preprocessing before full-angle z-chunk reconstruction.")
             : QStringLiteral("Projection batch size for real-time FBP incremental reconstruction."));
     }
     if (zChunkSpin_ != nullptr)
@@ -3098,22 +3676,14 @@ void MainWindow::updateReconMethodUiState()
 
     if (phaseEnableCheck_ != nullptr)
     {
-        if (offline && phaseEnableCheck_->isChecked())
-        {
-            const QSignalBlocker blocker(phaseEnableCheck_);
-            phaseEnableCheck_->setChecked(false);
-        }
-        phaseEnableCheck_->setEnabled(!offline);
-        phaseEnableCheck_->setToolTip(offline
-            ? QStringLiteral("Paganin phase retrieval is disabled for offline FBP/Gridrec. Use camera-side preprocessing and point Watch Dir to the processed projection folder.")
-            : QStringLiteral("Apply Paganin phase retrieval to each projection before real-time FBP."));
+        phaseEnableCheck_->setEnabled(true);
+        phaseEnableCheck_->setToolTip(QStringLiteral("Apply Paganin phase retrieval on the GPU projection batch after flat/dark correction and before log/taper."));
     }
 
-    const bool phaseParameterEnabled = !offline;
-    if (energySpin_ != nullptr) { energySpin_->setEnabled(phaseParameterEnabled); }
-    if (distanceSpin_ != nullptr) { distanceSpin_->setEnabled(phaseParameterEnabled); }
-    if (pixelSpin_ != nullptr) { pixelSpin_->setEnabled(phaseParameterEnabled); }
-    if (alphaSpin_ != nullptr) { alphaSpin_->setEnabled(phaseParameterEnabled); }
+    if (energySpin_ != nullptr) { energySpin_->setEnabled(true); }
+    if (distanceSpin_ != nullptr) { distanceSpin_->setEnabled(true); }
+    if (pixelSpin_ != nullptr) { pixelSpin_->setEnabled(true); }
+    if (alphaSpin_ != nullptr) { alphaSpin_->setEnabled(true); }
 
     if (previewSliceSlider_ != nullptr)
     {

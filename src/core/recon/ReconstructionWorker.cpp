@@ -300,6 +300,7 @@ void ReconstructionWorker::process()
 
         stopRequested_.store(false);
         emit logMessage(QStringLiteral("=== Starting C++ Custom Recon ==="));
+        emit logMessage(QStringLiteral("Recon method dispatch: %1.").arg(toString(config_.io.reconMethod)));
 
         if (config_.io.reconMethod == ReconMethod::OfflineFBP
             || config_.io.reconMethod == ReconMethod::OfflineGridrec)
@@ -311,7 +312,7 @@ void ReconstructionWorker::process()
                 [this](int volW, int volH) { emit volumeGeometryResolved(volW, volH); },
                 [this](bool updateHistogram) { emit previewRefreshSuggested(updateHistogram); },
                 [this](const cv::Mat& slice, bool updateHistogram) {
-                    emit directPreviewSliceReady(slice, updateHistogram);
+                    emit directPreviewSliceReady(slice.clone(), updateHistogram);
                 });
             volumeBuffer_ = result.volume;
             config_ = result.config;

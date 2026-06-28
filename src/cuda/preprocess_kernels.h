@@ -11,6 +11,9 @@ namespace ct
 bool launchApplyCorrection(float* rawAngleMajor, int angleCount, int height, int width,
     const float* flat, const float* dark, int correctionMode, cudaStream_t stream);
 
+bool launchApplyCorrectionRange(float* rawAngleMajor, int angleOffset, int angleCount, int height, int width,
+    const float* flat, const float* dark, int correctionMode, cudaStream_t stream);
+
 bool launchTransposeAngleMajorToRecon(const float* rawAngleMajor, float* reconLayout,
     int angleCount, int height, int width, cudaStream_t stream);
 

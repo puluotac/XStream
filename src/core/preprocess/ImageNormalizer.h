@@ -12,6 +12,13 @@ namespace ct
 
 struct DeviceCorrectionImages
 {
+    DeviceCorrectionImages() = default;
+    ~DeviceCorrectionImages();
+    DeviceCorrectionImages(const DeviceCorrectionImages&) = delete;
+    DeviceCorrectionImages& operator=(const DeviceCorrectionImages&) = delete;
+    DeviceCorrectionImages(DeviceCorrectionImages&& other) noexcept;
+    DeviceCorrectionImages& operator=(DeviceCorrectionImages&& other) noexcept;
+
     float* flat = nullptr;
     float* dark = nullptr;
     int height = 0;
@@ -27,6 +34,8 @@ public:
         int height, int width, DeviceCorrectionImages& outImages);
     static bool applyCorrection(GpuProjectionBatch& batch, const DeviceCorrectionImages& correctionImages,
         CorrectionMode mode, cudaStream_t stream);
+    static bool applyCorrectionRange(GpuProjectionBatch& batch, int angleOffset, int angleCount,
+        const DeviceCorrectionImages& correctionImages, CorrectionMode mode, cudaStream_t stream);
     static bool transposeRawToRecon(GpuProjectionBatch& batch, cudaStream_t stream);
     static bool applyMethodAndTaper(GpuProjectionBatch& batch, const PreprocessConfig& config, cudaStream_t stream);
 };

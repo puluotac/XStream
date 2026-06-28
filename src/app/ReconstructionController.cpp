@@ -10,6 +10,16 @@
 namespace ct
 {
 
+namespace
+{
+
+bool isOfflineMethod(ReconMethod method)
+{
+    return method == ReconMethod::OfflineFBP || method == ReconMethod::OfflineGridrec;
+}
+
+} // namespace
+
 ReconstructionController::ReconstructionController(QObject* parent)
     : QObject(parent)
 {
@@ -56,7 +66,8 @@ void ReconstructionController::startReconstruction(const AppConfig& config)
     }
 
     reconstructionThread_ = new QThread(this);
-    reconstructionWorker_ = new ReconstructionWorker(config, runtimeCache_);
+    reconstructionWorker_ = new ReconstructionWorker(config,
+        isOfflineMethod(config.io.reconMethod) ? nullptr : runtimeCache_);
     reconstructionWorker_->moveToThread(reconstructionThread_);
 
     connect(reconstructionThread_, &QThread::started, reconstructionWorker_, &ReconstructionWorker::process);
@@ -78,26 +89,30 @@ void ReconstructionController::startReconstruction(const AppConfig& config)
         requestPreviewRender(updateHistogram);
     });
     connect(reconstructionWorker_, &ReconstructionWorker::directPreviewSliceReady,
-        this, &ReconstructionController::previewSliceReady);
+        this, [this](cv::Mat slice, bool updateHistogram) {
+            emit previewSliceReady(std::move(slice), updateHistogram);
+        });
 
     connect(reconstructionWorker_, &ReconstructionWorker::reconstructionFinished, this, [this]() {
-        latestVolume_ = reconstructionWorker_->volumeBuffer();
-        latestConfig_ = reconstructionWorker_->config();
+        const bool hasActiveWorker = reconstructionWorker_ != nullptr;
+        latestVolume_ = hasActiveWorker ? reconstructionWorker_->volumeBuffer() : nullptr;
+        latestConfig_ = hasActiveWorker ? reconstructionWorker_->config() : latestConfig_;
         busy_ = false;
         emit busyChanged(false);
         if (latestVolume_)
         {
             requestPreviewRender(true);
         }
-        emit reconstructionCompleted(static_cast<bool>(latestVolume_));
+        const bool hasVolume = static_cast<bool>(latestVolume_);
         cleanupReconstructionThread();
+        emit reconstructionCompleted(hasVolume);
     });
 
     connect(reconstructionWorker_, &ReconstructionWorker::reconstructionFailed, this, [this](const QString& error) {
         busy_ = false;
         emit busyChanged(false);
-        emit reconstructionFailed(error);
         cleanupReconstructionThread();
+        emit reconstructionFailed(error);
     });
 
     reconstructionThread_->start();

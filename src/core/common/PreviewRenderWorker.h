@@ -23,7 +23,7 @@ public:
     void enqueueRender(int sliceIndex, bool updateHistogram);
 
 signals:
-    void previewSliceReady(const cv::Mat& slice, bool updateHistogram);
+    void previewSliceReady(cv::Mat slice, bool updateHistogram);
 
 private:
     void scheduleDrain();

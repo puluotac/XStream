@@ -40,7 +40,7 @@ public:
 signals:
     void logMessage(const QString& text);
     void progressUpdated(int current, int total);
-    void previewSliceReady(const cv::Mat& slice, bool updateHistogram);
+    void previewSliceReady(cv::Mat slice, bool updateHistogram);
     void corComputed(double shift);
     void volumeGeometryResolved(int volW, int volH);
     void busyChanged(bool busy);

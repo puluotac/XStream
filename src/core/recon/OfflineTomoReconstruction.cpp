@@ -12,6 +12,9 @@
 #include <QElapsedTimer>
 #include <QFile>
 #include <QFileInfo>
+#include <QJsonArray>
+#include <QJsonDocument>
+#include <QJsonObject>
 #include <QThread>
 
 #include <cuda_runtime.h>
@@ -502,14 +505,25 @@ struct OfflineSaveWindow
     }
 };
 
-constexpr double kAutoSaveWindowLowPercentile = 1.0;
-constexpr double kAutoSaveWindowHighPercentile = 99.9;
+constexpr double kAutoSaveWindowLowPercentile = 0.10;
+constexpr double kAutoSaveWindowHighPercentile = 99.95;
+constexpr double kAutoSaveWindowHighMarginFraction = 0.05;
 
 struct OfflineInputBatch
 {
     int batchIndex = 0;
     int validCount = 0;
     std::vector<int> logicalIndices;
+};
+
+struct ResolvedFlatGroup
+{
+    QString label;
+    int afterProjectionCount = 0;
+    int firstFlatIndex = 0;
+    int flatCount = 0;
+    cv::Mat flatAverage;
+    DeviceCorrectionImages correctionImages;
 };
 
 bool saveImageWithQtPath(const QString& filePath, const cv::Mat& image)
@@ -801,6 +815,252 @@ OfflineInputBatch loadOfflineInputBatch(FileProjectionSource& source, const AppC
     return batch;
 }
 
+int findFirstExistingFlatIndex(FileProjectionSource& source, const AppConfig& config, std::atomic_bool& stopRequested)
+{
+    QDir inputDir(config.io.watchDir);
+    for (int index = 0; index < 100000 && !stopRequested.load(); ++index)
+    {
+        const QString filePath = inputDir.filePath(source.makeNumberedFileName(config.io.flatPrefix, index));
+        if (QFileInfo::exists(filePath))
+        {
+            return index;
+        }
+    }
+    return -1;
+}
+
+std::vector<FlatGroupConfig> inferFlatGroupsFromConfig(FileProjectionSource& source, const AppConfig& config,
+    std::atomic_bool& stopRequested)
+{
+    std::vector<FlatGroupConfig> groups;
+    if (config.io.correctionMode == CorrectionMode::None)
+    {
+        return groups;
+    }
+    const int flatNum = std::max(1, config.preprocess.flatNum);
+    const int firstFlatIndex = findFirstExistingFlatIndex(source, config, stopRequested);
+    if (firstFlatIndex < 0)
+    {
+        throw std::runtime_error("Flat correction requested but no flat file matching FLAT_PREFIX was found.");
+    }
+
+    auto appendGroup = [&](const QString& label, int afterProjectionCount) {
+        FlatGroupConfig group;
+        group.label = label;
+        group.afterProjectionCount = std::clamp(afterProjectionCount, 0, config.geometry.totalAngles);
+        group.firstFlatIndex = firstFlatIndex + static_cast<int>(groups.size()) * flatNum;
+        group.flatCount = flatNum;
+        groups.push_back(group);
+    };
+
+    appendGroup(QStringLiteral("start"), 0);
+    if (config.preprocess.flatGap > 0)
+    {
+        for (int after = config.preprocess.flatGap; after < config.geometry.totalAngles; after += config.preprocess.flatGap)
+        {
+            appendGroup(QStringLiteral("interval"), after);
+        }
+        appendGroup(QStringLiteral("end"), config.geometry.totalAngles);
+    }
+    return groups;
+}
+
+std::vector<FlatGroupConfig> flatGroupConfigsFromManifest(const AppConfig& config,
+    const OfflineTomoReconstruction::LogCallback& log)
+{
+    std::vector<FlatGroupConfig> groups;
+    if (config.io.watchDir.isEmpty())
+    {
+        return groups;
+    }
+
+    const QString manifestPath = QDir(config.io.watchDir).filePath(QStringLiteral("scan_manifest.json"));
+    QFile file(manifestPath);
+    if (!file.exists())
+    {
+        return groups;
+    }
+    if (!file.open(QIODevice::ReadOnly))
+    {
+        log(QStringLiteral("Offline flat groups: ignoring unreadable scan_manifest.json: %1.").arg(manifestPath));
+        return groups;
+    }
+
+    QJsonParseError parseError;
+    const QJsonDocument doc = QJsonDocument::fromJson(file.readAll(), &parseError);
+    if (parseError.error != QJsonParseError::NoError || !doc.isObject())
+    {
+        log(QStringLiteral("Offline flat groups: ignoring invalid scan_manifest.json: %1.").arg(parseError.errorString()));
+        return groups;
+    }
+
+    const QJsonObject root = doc.object();
+    if (!root.value(QStringLiteral("COMPLETED")).toBool(false))
+    {
+        log(QStringLiteral("Offline flat groups: scan_manifest.json exists but COMPLETED=false; falling back to UI/job flat settings."));
+        return groups;
+    }
+
+    const QJsonArray flatGroups = root.value(QStringLiteral("FLAT_GROUPS")).toArray();
+    groups.reserve(static_cast<size_t>(flatGroups.size()));
+    for (const QJsonValue& value : flatGroups)
+    {
+        const QJsonObject obj = value.toObject();
+        FlatGroupConfig group;
+        group.label = obj.value(QStringLiteral("LABEL")).toString();
+        group.afterProjectionCount = obj.value(QStringLiteral("AFTER_PROJECTION_COUNT")).toInt();
+        group.firstFlatIndex = obj.value(QStringLiteral("FIRST_FLAT_INDEX")).toInt();
+        group.flatCount = obj.value(QStringLiteral("FLAT_COUNT")).toInt();
+        if (group.flatCount > 0)
+        {
+            groups.push_back(group);
+        }
+    }
+    if (!groups.empty())
+    {
+        log(QStringLiteral("Offline flat groups: using %1 groups from scan_manifest.json.").arg(groups.size()));
+    }
+    return groups;
+}
+
+std::vector<FlatGroupConfig> flatGroupConfigsForRun(FileProjectionSource& source, const AppConfig& config,
+    std::atomic_bool& stopRequested, const OfflineTomoReconstruction::LogCallback& log)
+{
+    if (config.io.correctionMode == CorrectionMode::None)
+    {
+        return {};
+    }
+    std::vector<FlatGroupConfig> groups;
+    groups = flatGroupConfigsFromManifest(config, log);
+    if (groups.empty())
+    {
+        if (!config.preprocess.flatGroups.isEmpty())
+        {
+            groups.reserve(static_cast<size_t>(config.preprocess.flatGroups.size()));
+            for (const FlatGroupConfig& group : config.preprocess.flatGroups)
+            {
+                if (group.flatCount > 0)
+                {
+                    groups.push_back(group);
+                }
+            }
+            log(QStringLiteral("Offline flat groups: using %1 groups from recon job.").arg(groups.size()));
+        }
+        else
+        {
+            groups = inferFlatGroupsFromConfig(source, config, stopRequested);
+            log(QStringLiteral("Offline flat groups: inferred %1 groups from Flat Gap=%2, Flat Num=%3.")
+                    .arg(groups.size())
+                    .arg(config.preprocess.flatGap)
+                    .arg(config.preprocess.flatNum));
+        }
+    }
+    std::sort(groups.begin(), groups.end(), [](const FlatGroupConfig& a, const FlatGroupConfig& b) {
+        if (a.afterProjectionCount != b.afterProjectionCount)
+        {
+            return a.afterProjectionCount < b.afterProjectionCount;
+        }
+        return a.firstFlatIndex < b.firstFlatIndex;
+    });
+    return groups;
+}
+
+cv::Mat averageFlatGroup(FileProjectionSource& source, const AppConfig& config, const FlatGroupConfig& group,
+    std::atomic_bool& stopRequested)
+{
+    const int height = config.geometry.volH;
+    const int width = config.geometry.volW;
+    cv::Mat sum(height, width, CV_32F, cv::Scalar(0.0f));
+    QDir inputDir(config.io.watchDir);
+    int loaded = 0;
+    for (int i = 0; i < group.flatCount && !stopRequested.load(); ++i)
+    {
+        const int fileIndex = group.firstFlatIndex + i;
+        const QString filePath = inputDir.filePath(source.makeNumberedFileName(config.io.flatPrefix, fileIndex));
+        cv::Mat image = source.readImageRobust(filePath);
+        if (image.empty())
+        {
+            throw std::runtime_error(QStringLiteral("Flat group '%1' is missing flat file: %2")
+                    .arg(group.label.isEmpty() ? QString::number(group.afterProjectionCount) : group.label)
+                    .arg(filePath)
+                    .toStdString());
+        }
+        if (image.rows != height || image.cols != width || image.channels() != 1)
+        {
+            throw std::runtime_error(QStringLiteral("Flat group image size mismatch: %1")
+                    .arg(filePath)
+                    .toStdString());
+        }
+        cv::Mat floatImage;
+        image.convertTo(floatImage, CV_32F);
+        sum += floatImage;
+        ++loaded;
+    }
+    if (loaded <= 0)
+    {
+        throw std::runtime_error("Flat group has no readable flat images.");
+    }
+    sum *= (1.0f / static_cast<float>(loaded));
+    return sum;
+}
+
+std::vector<ResolvedFlatGroup> loadResolvedFlatGroups(FileProjectionSource& source, AppConfig& config,
+    const cv::Mat& dark, std::atomic_bool& stopRequested, const OfflineTomoReconstruction::LogCallback& log)
+{
+    std::vector<ResolvedFlatGroup> resolved;
+    const std::vector<FlatGroupConfig> groupConfigs = flatGroupConfigsForRun(source, config, stopRequested, log);
+    resolved.reserve(groupConfigs.size());
+    for (const FlatGroupConfig& groupConfig : groupConfigs)
+    {
+        resolved.emplace_back();
+        ResolvedFlatGroup& group = resolved.back();
+        group.label = groupConfig.label;
+        group.afterProjectionCount = groupConfig.afterProjectionCount;
+        group.firstFlatIndex = groupConfig.firstFlatIndex;
+        group.flatCount = groupConfig.flatCount;
+        group.flatAverage = averageFlatGroup(source, config, groupConfig, stopRequested);
+        if (!ImageNormalizer::uploadCorrectionImages(group.flatAverage, dark,
+                config.geometry.volH, config.geometry.volW, group.correctionImages))
+        {
+            throw std::runtime_error("Failed to upload averaged flat group to GPU.");
+        }
+        log(QStringLiteral("Offline flat group %1: after=%2, firstFlat=%3, count=%4.")
+                .arg(resolved.size())
+                .arg(group.afterProjectionCount)
+                .arg(group.firstFlatIndex)
+                .arg(group.flatCount));
+    }
+    return resolved;
+}
+
+void releaseResolvedFlatGroups(std::vector<ResolvedFlatGroup>& groups)
+{
+    for (ResolvedFlatGroup& group : groups)
+    {
+        group.correctionImages.release();
+    }
+}
+
+int nearestFlatGroupIndex(const std::vector<ResolvedFlatGroup>& groups, int projectionOrdinal)
+{
+    if (groups.empty())
+    {
+        return -1;
+    }
+    int best = 0;
+    int bestDistance = std::abs(projectionOrdinal - groups.front().afterProjectionCount);
+    for (int i = 1; i < static_cast<int>(groups.size()); ++i)
+    {
+        const int distance = std::abs(projectionOrdinal - groups[static_cast<size_t>(i)].afterProjectionCount);
+        if (distance <= bestDistance)
+        {
+            best = i;
+            bestDistance = distance;
+        }
+    }
+    return best;
+}
+
 void preprocessAllProjections(AppConfig& config, FileProjectionSource& source, const cv::Mat& flat, const cv::Mat& dark,
     std::vector<float>& projectionStack, std::atomic_bool& stopRequested,
     const OfflineTomoReconstruction::LogCallback& log,
@@ -809,12 +1069,12 @@ void preprocessAllProjections(AppConfig& config, FileProjectionSource& source, c
     const int angleCount = config.geometry.totalAngles;
     const int height = config.geometry.volH;
     const int width = config.geometry.volW;
+    (void)flat;
     const size_t projectionElements = static_cast<size_t>(angleCount) * height * width;
     projectionStack.assign(projectionElements, 0.0f);
 
     HostPinnedProjectionBatch hostBatches[2];
     GpuProjectionBatch gpuBatch;
-    DeviceCorrectionImages correctionImages;
     PaganinProcessor paganin;
     cudaStream_t stream = nullptr;
 
@@ -824,11 +1084,20 @@ void preprocessAllProjections(AppConfig& config, FileProjectionSource& source, c
     {
         throw std::runtime_error("Failed to allocate offline preprocessing batch buffers.");
     }
-    if (!ImageNormalizer::uploadCorrectionImages(flat, dark, height, width, correctionImages))
+    std::vector<ResolvedFlatGroup> flatGroups = loadResolvedFlatGroups(source, config, dark, stopRequested, log);
+    if (flatGroups.empty() && (config.io.correctionMode == CorrectionMode::Flat || config.io.correctionMode == CorrectionMode::FlatDark))
     {
-        throw std::runtime_error("Failed to upload offline correction images.");
+        throw std::runtime_error("Flat correction requested but no flat groups were resolved.");
     }
     paganin.configure(config.phase);
+    if (paganin.isEnabled())
+    {
+        log(QStringLiteral("Offline Paganin phase retrieval enabled: GPU batch after flat/dark correction, before log/taper. Energy=%1 keV, distance=%2 m, pixel=%3 um, alpha=%4.")
+            .arg(config.phase.energyKev, 0, 'g', 6)
+            .arg(config.phase.distanceM, 0, 'g', 6)
+            .arg(config.phase.pixelSizeUm, 0, 'g', 6)
+            .arg(config.phase.alphaRatio, 0, 'g', 6));
+    }
     ensureCuda(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), "create offline preprocess stream");
 
     const int startIndex = source.extractStartIndex(config.io.filePattern0);
@@ -870,9 +1139,32 @@ void preprocessAllProjections(AppConfig& config, FileProjectionSource& source, c
         {
             throw std::runtime_error("Failed to upload offline projection batch.");
         }
-        if (!ImageNormalizer::applyCorrection(gpuBatch, correctionImages, config.io.correctionMode, stream))
+        if (config.io.correctionMode != CorrectionMode::None)
         {
-            throw std::runtime_error("Offline flat/dark correction failed.");
+            int segmentStart = 0;
+            int currentGroupIndex = nearestFlatGroupIndex(flatGroups, inputBatch.logicalIndices.front() + 1);
+            for (int localAngle = 1; localAngle <= validCount; ++localAngle)
+            {
+                const int nextGroupIndex = (localAngle < validCount)
+                    ? nearestFlatGroupIndex(flatGroups, inputBatch.logicalIndices[static_cast<size_t>(localAngle)] + 1)
+                    : -1;
+                if (localAngle == validCount || nextGroupIndex != currentGroupIndex)
+                {
+                    if (currentGroupIndex < 0)
+                    {
+                        throw std::runtime_error("Offline flat/dark correction has no flat group for projection batch.");
+                    }
+                    const int segmentCount = localAngle - segmentStart;
+                    if (!ImageNormalizer::applyCorrectionRange(gpuBatch, segmentStart, segmentCount,
+                            flatGroups[static_cast<size_t>(currentGroupIndex)].correctionImages,
+                            config.io.correctionMode, stream))
+                    {
+                        throw std::runtime_error("Offline flat/dark correction failed.");
+                    }
+                    segmentStart = localAngle;
+                    currentGroupIndex = nextGroupIndex;
+                }
+            }
         }
         if (paganin.isEnabled() && !paganin.apply(gpuBatch, stream))
         {
@@ -907,7 +1199,7 @@ void preprocessAllProjections(AppConfig& config, FileProjectionSource& source, c
     }
 
     cudaStreamDestroy(stream);
-    correctionImages.release();
+    releaseResolvedFlatGroups(flatGroups);
 
     if (stopRequested.load())
     {
@@ -947,6 +1239,24 @@ float percentileFinite(std::vector<float>& values, double percentile)
     const size_t index = static_cast<size_t>(std::floor((clamped / 100.0) * (values.size() - 1)));
     std::nth_element(values.begin(), values.begin() + static_cast<std::ptrdiff_t>(index), values.end());
     return values[index];
+}
+
+OfflineSaveWindow makeOfflineSaveWindowFromCalibration(const std::vector<float>& calibration)
+{
+    std::vector<float> lowCalibration = calibration;
+    std::vector<float> highCalibration = calibration;
+
+    OfflineSaveWindow saveWindow;
+    saveWindow.vmin = percentileFinite(lowCalibration, kAutoSaveWindowLowPercentile);
+    saveWindow.vmax = percentileFinite(highCalibration, kAutoSaveWindowHighPercentile);
+    if (saveWindow.vmax <= saveWindow.vmin)
+    {
+        saveWindow.vmax = saveWindow.vmin + 1.0f;
+    }
+
+    const float margin = saveWindow.range() * static_cast<float>(kAutoSaveWindowHighMarginFraction);
+    saveWindow.vmax += margin;
+    return saveWindow;
 }
 
 std::vector<int> makeCenterFirstChunkStarts(int height, int zChunk)
@@ -1143,17 +1453,12 @@ qint64 runOfflineFbp(const AppConfig& config, const std::vector<float>& projecti
                 "download offline FBP calibration chunk");
             ensureCuda(cudaStreamSynchronize(stream), "offline FBP calibration sync");
 
-            std::vector<float> lowCalibration(hostOut.begin(), hostOut.begin() + static_cast<std::ptrdiff_t>(chunkVoxels));
-            std::vector<float> highCalibration = lowCalibration;
-            saveWindow.vmin = percentileFinite(lowCalibration, kAutoSaveWindowLowPercentile);
-            saveWindow.vmax = percentileFinite(highCalibration, kAutoSaveWindowHighPercentile);
-            if (saveWindow.vmax <= saveWindow.vmin)
-            {
-                saveWindow.vmax = saveWindow.vmin + 1.0f;
-            }
-            log(QStringLiteral("Offline FBP fixed uint16 save window: center chunk p%1-p%2, vmin=%3, vmax=%4.")
+            const std::vector<float> calibration(hostOut.begin(), hostOut.begin() + static_cast<std::ptrdiff_t>(chunkVoxels));
+            saveWindow = makeOfflineSaveWindowFromCalibration(calibration);
+            log(QStringLiteral("Offline FBP fixed uint16 save window: center chunk p%1-p%2 + %3% high margin, vmin=%4, vmax=%5.")
                 .arg(kAutoSaveWindowLowPercentile, 0, 'f', 2)
                 .arg(kAutoSaveWindowHighPercentile, 0, 'f', 2)
+                .arg(kAutoSaveWindowHighMarginFraction * 100.0, 0, 'f', 1)
                 .arg(saveWindow.vmin, 0, 'g', 8)
                 .arg(saveWindow.vmax, 0, 'g', 8));
             writer = makeChunkWriter(config, saveWindow, log);
@@ -1400,17 +1705,12 @@ qint64 runOfflineGridrec(const AppConfig& config, const std::vector<float>& proj
                 "download offline Gridrec calibration chunk");
             ensureCuda(cudaStreamSynchronize(stream), "offline Gridrec calibration sync");
 
-            std::vector<float> lowCalibration(hostOut.begin(), hostOut.begin() + static_cast<std::ptrdiff_t>(chunkVoxels));
-            std::vector<float> highCalibration = lowCalibration;
-            saveWindow.vmin = percentileFinite(lowCalibration, kAutoSaveWindowLowPercentile);
-            saveWindow.vmax = percentileFinite(highCalibration, kAutoSaveWindowHighPercentile);
-            if (saveWindow.vmax <= saveWindow.vmin)
-            {
-                saveWindow.vmax = saveWindow.vmin + 1.0f;
-            }
-            log(QStringLiteral("Offline Gridrec fixed uint16 save window: center chunk p%1-p%2, vmin=%3, vmax=%4.")
+            const std::vector<float> calibration(hostOut.begin(), hostOut.begin() + static_cast<std::ptrdiff_t>(chunkVoxels));
+            saveWindow = makeOfflineSaveWindowFromCalibration(calibration);
+            log(QStringLiteral("Offline Gridrec fixed uint16 save window: center chunk p%1-p%2 + %3% high margin, vmin=%4, vmax=%5.")
                 .arg(kAutoSaveWindowLowPercentile, 0, 'f', 2)
                 .arg(kAutoSaveWindowHighPercentile, 0, 'f', 2)
+                .arg(kAutoSaveWindowHighMarginFraction * 100.0, 0, 'f', 1)
                 .arg(saveWindow.vmin, 0, 'g', 8)
                 .arg(saveWindow.vmax, 0, 'g', 8));
             writer = makeChunkWriter(config, saveWindow, log);
@@ -1518,11 +1818,6 @@ OfflineTomoResult OfflineTomoReconstruction::run(const AppConfig& inputConfig,
     (void)previewSuggested;
     AppConfig config = inputConfig;
     config.io.tiffThreads = std::clamp(config.io.tiffThreads, 1, 64);
-    if (config.phase.enable)
-    {
-        config.phase.enable = false;
-        log(QStringLiteral("Offline FBP/Gridrec ignores PHASE.ENABLE: use camera-side phase retrieval and point WATCH_DIR to processed projections."));
-    }
     if (config.io.watchDir.isEmpty())
     {
         throw std::runtime_error("WATCH_DIR is empty.");
@@ -1537,18 +1832,11 @@ OfflineTomoResult OfflineTomoReconstruction::run(const AppConfig& inputConfig,
     totalTimer.start();
     FileProjectionSource source(config.io);
     cv::Mat flat;
+    cv::Mat corFlat180;
     cv::Mat dark;
 
     log(QStringLiteral("=== Starting %1 ===").arg(toString(config.io.reconMethod)));
     log(QStringLiteral("Offline TIFF writer threads requested: %1.").arg(config.io.tiffThreads));
-    if (config.io.correctionMode == CorrectionMode::Flat || config.io.correctionMode == CorrectionMode::FlatDark)
-    {
-        log(QStringLiteral("Offline waiting for flat reference..."));
-        if (!source.waitForReferenceImage(config.io.flatPrefix, QStringLiteral("Flat"), flat, stopRequested))
-        {
-            throw std::runtime_error("Failed to acquire flat reference.");
-        }
-    }
     if (config.io.correctionMode == CorrectionMode::FlatDark)
     {
         log(QStringLiteral("Offline waiting for dark reference..."));
@@ -1556,6 +1844,18 @@ OfflineTomoResult OfflineTomoReconstruction::run(const AppConfig& inputConfig,
         {
             throw std::runtime_error("Failed to acquire dark reference.");
         }
+    }
+
+    if (config.io.correctionMode == CorrectionMode::Flat || config.io.correctionMode == CorrectionMode::FlatDark)
+    {
+        log(QStringLiteral("Offline loading flat groups for reference geometry/COR..."));
+        const std::vector<FlatGroupConfig> flatGroupConfigs = flatGroupConfigsForRun(source, config, stopRequested, log);
+        if (flatGroupConfigs.empty())
+        {
+            throw std::runtime_error("Flat correction requested but no flat groups were resolved.");
+        }
+        flat = averageFlatGroup(source, config, flatGroupConfigs.front(), stopRequested);
+        corFlat180 = averageFlatGroup(source, config, flatGroupConfigs.back(), stopRequested);
     }
 
     cv::Mat ref0;
@@ -1599,7 +1899,9 @@ OfflineTomoResult OfflineTomoReconstruction::run(const AppConfig& inputConfig,
         context.flat = flat;
         context.dark = dark;
         context.cropMargin = 50;
-        config.geometry.corShift = corEstimator.estimateShift(ref0, ref180, context);
+        CorrectionContext context180 = context;
+        context180.flat = corFlat180.empty() ? flat : corFlat180;
+        config.geometry.corShift = corEstimator.estimateShift(ref0, context, ref180, context180);
         corComputed(config.geometry.corShift);
         log(QStringLiteral("Offline Auto COR Result: %1").arg(config.geometry.corShift, 0, 'f', 4));
     }

@@ -36,7 +36,7 @@ signals:
     void logMessage(const QString& text);
     void progressUpdated(int current, int total);
     void previewRefreshSuggested(bool updateHistogram);
-    void directPreviewSliceReady(const cv::Mat& slice, bool updateHistogram);
+    void directPreviewSliceReady(cv::Mat slice, bool updateHistogram);
     void corComputed(double shift);
     void volumeGeometryResolved(int volW, int volH);
     void reconstructionFinished();

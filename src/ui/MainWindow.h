@@ -85,12 +85,14 @@ private:
     void finishCtAcquisition(bool ok, const QString& message);
     void writeCtManifest(bool completed, const QString& errorMessage);
     void enqueueCtReconJob();
+    void enqueueCurrentReconJob();
     QString reconQueueRoot() const;
     void ensureReconQueueDirs();
     void recoverStaleRunningReconJobs();
     void scheduleReconQueueRefresh();
     void refreshReconQueue();
     void normalizePendingReconQueue(bool scheduleRefresh = true);
+    void importReconJobs();
     void moveSelectedReconQueueJob(int direction);
     void removeSelectedReconQueueJob();
     void startNextQueuedReconstruction();
@@ -200,9 +202,9 @@ private:
     QDoubleSpinBox* distanceSpin_ = nullptr;
     QDoubleSpinBox* pixelSpin_ = nullptr;
     QDoubleSpinBox* alphaSpin_ = nullptr;
-    QComboBox* preprocessMethodCombo_ = nullptr;
-    QDoubleSpinBox* airValueSpin_ = nullptr;
     QSpinBox* taperSpin_ = nullptr;
+    QSpinBox* flatGapSpin_ = nullptr;
+    QSpinBox* flatNumSpin_ = nullptr;
     QComboBox* filterCombo_ = nullptr;
     QSpinBox* batchSpin_ = nullptr;
     QSpinBox* zChunkSpin_ = nullptr;
@@ -219,6 +221,8 @@ private:
     QPushButton* reconQueueUpButton_ = nullptr;
     QPushButton* reconQueueDownButton_ = nullptr;
     QPushButton* reconQueueRemoveButton_ = nullptr;
+    QPushButton* reconQueueCurrentButton_ = nullptr;
+    QPushButton* reconQueueImportButton_ = nullptr;
     QFileSystemWatcher* reconQueueWatcher_ = nullptr;
     QTimer* reconQueueRefreshTimer_ = nullptr;
     QTimer* reconQueuePollTimer_ = nullptr;

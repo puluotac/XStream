@@ -45,6 +45,40 @@ bool uploadImageToDevice(const cv::Mat& input, int height, int width, float*& de
 
 } // namespace
 
+DeviceCorrectionImages::~DeviceCorrectionImages()
+{
+    release();
+}
+
+DeviceCorrectionImages::DeviceCorrectionImages(DeviceCorrectionImages&& other) noexcept
+    : flat(other.flat)
+    , dark(other.dark)
+    , height(other.height)
+    , width(other.width)
+{
+    other.flat = nullptr;
+    other.dark = nullptr;
+    other.height = 0;
+    other.width = 0;
+}
+
+DeviceCorrectionImages& DeviceCorrectionImages::operator=(DeviceCorrectionImages&& other) noexcept
+{
+    if (this != &other)
+    {
+        release();
+        flat = other.flat;
+        dark = other.dark;
+        height = other.height;
+        width = other.width;
+        other.flat = nullptr;
+        other.dark = nullptr;
+        other.height = 0;
+        other.width = 0;
+    }
+    return *this;
+}
+
 void DeviceCorrectionImages::release()
 {
     if (flat != nullptr)
@@ -92,6 +126,20 @@ bool ImageNormalizer::applyCorrection(GpuProjectionBatch& batch, const DeviceCor
     }
 
     return launchApplyCorrection(batch.rawAngleMajor(), batch.currentAngleCount(),
+        batch.height(), batch.width(), correctionImages.flat, correctionImages.dark,
+        static_cast<int>(mode), stream);
+}
+
+bool ImageNormalizer::applyCorrectionRange(GpuProjectionBatch& batch, int angleOffset, int angleCount,
+    const DeviceCorrectionImages& correctionImages, CorrectionMode mode, cudaStream_t stream)
+{
+    if (batch.rawAngleMajor() == nullptr || batch.currentAngleCount() <= 0
+        || angleOffset < 0 || angleCount <= 0 || angleOffset + angleCount > batch.currentAngleCount())
+    {
+        return false;
+    }
+
+    return launchApplyCorrectionRange(batch.rawAngleMajor(), angleOffset, angleCount,
         batch.height(), batch.width(), correctionImages.flat, correctionImages.dark,
         static_cast<int>(mode), stream);
 }

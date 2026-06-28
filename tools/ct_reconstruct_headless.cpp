@@ -139,7 +139,12 @@ int main(int argc, char** argv)
 
     config.preview.enableLive = false;
 
-    auto runtimeCache = std::make_shared<ct::ReconstructionRuntimeCache>();
+    std::shared_ptr<ct::ReconstructionRuntimeCache> runtimeCache;
+    if (config.io.reconMethod != ct::ReconMethod::OfflineFBP
+        && config.io.reconMethod != ct::ReconMethod::OfflineGridrec)
+    {
+        runtimeCache = std::make_shared<ct::ReconstructionRuntimeCache>();
+    }
     ct::ReconstructionWorker worker(config, runtimeCache);
     QElapsedTimer timer;
     timer.start();

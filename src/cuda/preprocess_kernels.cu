@@ -257,6 +257,20 @@ bool launchApplyCorrection(float* rawAngleMajor, int angleCount, int height, int
     return true;
 }
 
+bool launchApplyCorrectionRange(float* rawAngleMajor, int angleOffset, int angleCount, int height, int width,
+    const float* flat, const float* dark, int correctionMode, cudaStream_t stream)
+{
+    if (angleOffset < 0 || angleCount <= 0)
+    {
+        return false;
+    }
+    cudaGetLastError();
+    const size_t totalCount = static_cast<size_t>(angleCount) * height * width;
+    applyCorrectionRangeKernel<<<makeGrid(totalCount), kKernelBlockSize, 0, stream>>>(
+        rawAngleMajor, angleOffset, angleCount, height, width, flat, dark, correctionMode);
+    return cudaPeekAtLastError() == cudaSuccess;
+}
+
 bool launchTransposeAngleMajorToRecon(const float* rawAngleMajor, float* reconLayout,
     int angleCount, int height, int width, cudaStream_t stream)
 {
