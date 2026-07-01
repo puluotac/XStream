@@ -107,6 +107,45 @@ struct PreviewConfig
     int liveSliceIndex = 512;
 };
 
+struct CtFlyConfig
+{
+    double allowedBlurPx = 1.0;
+};
+
+struct CameraUiConfig
+{
+    double exposureValue = 10.0;
+    QString exposureUnit = "ms";
+    int roiX = 0;
+    int roiY = 0;
+    int roiWidth = 3200;
+    int roiHeight = 3200;
+    QString snapPrefix = "kinetix_frame_";
+    int snapPadding = 6;
+    int snapIndex = 0;
+    QString saveDir = "E:/2026_Chun/2026_06_09/pvcam_capture_test";
+};
+
+struct CtAcquisitionUiConfig
+{
+    double beginningAngleDeg = 0.0;
+    int modeIndex = 0;
+    QString savePath;
+    int projectionNum = 1080;
+    int flatGap = 0;
+    double flatMoveUm = 0.0;
+    int flatNum = 10;
+    double flyLeadAngleDeg = 2.0;
+    bool autoCorReference = false;
+    int tiffThreads = 24;
+};
+
+struct KohzuUiConfig
+{
+    QString host = "10.30.92.201";
+    int port = 12321;
+};
+
 struct IoConfig
 {
     QString watchDir;
@@ -128,9 +167,14 @@ struct IoConfig
 
 struct MotorAxisConfig
 {
+    bool hasRelativeStep = false;
+    double relativeStep = 0.0;
+    bool hasAbsoluteTarget = false;
+    double absoluteTarget = 0.0;
     bool hasBaseSpeed = false;
     double baseSpeed = 0.0;
     double speed = 0.0;
+    // Seconds. Legacy JSON used ACCEL for the same UI field.
     double accel = 0.0;
 };
 
@@ -142,6 +186,10 @@ struct AppConfig
     PreprocessConfig preprocess;
     ComputeConfig compute;
     PreviewConfig preview;
+    CtFlyConfig ctFly;
+    CameraUiConfig cameraUi;
+    CtAcquisitionUiConfig ctAcquisitionUi;
+    KohzuUiConfig kohzuUi;
     IoConfig io;
     QMap<QString, MotorAxisConfig> motorAxes;
 

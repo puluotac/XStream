@@ -67,9 +67,70 @@ namespace
 {
 
 constexpr int kMotorSpeedColumnsLeftOffset = 70 + 78 + 34 + 8;
-constexpr int kMotorSpeedColumnWidth = 76;
+constexpr int kMotorSpeedColumnWidth = 92;
 constexpr int kMotorSpeedColumnSpacing = 4;
-constexpr int kCtFlySpeedTable = 9;
+constexpr int kMotorManualSpeedTable = 8;
+constexpr int kCtStepSpeedTable = kMotorManualSpeedTable;
+constexpr int kCtFlySpeedTable = kMotorManualSpeedTable;
+constexpr int kKohzuSpeedPattern = 2;
+constexpr qint64 kReconQueueCameraSettleMs = 1000;
+constexpr int kPreviewClipCheckMaxSamples = 4096;
+constexpr double kPreviewClipResetFraction = 0.995;
+constexpr double kCtFlyLeadMarginDeg = 3.0;
+
+bool previewWindowProducesClippedImage(const cv::Mat& image, const PreviewWindow& window)
+{
+    if (image.empty() || !window.isValid())
+    {
+        return false;
+    }
+
+    const int total = image.rows * image.cols;
+    if (total <= 0)
+    {
+        return false;
+    }
+
+    const int stride = std::max(1, total / kPreviewClipCheckMaxSamples);
+    int finiteCount = 0;
+    int lowClipped = 0;
+    int highClipped = 0;
+    int index = 0;
+    for (int y = 0; y < image.rows; ++y)
+    {
+        const float* row = image.ptr<float>(y);
+        for (int x = 0; x < image.cols; ++x, ++index)
+        {
+            if ((index % stride) != 0)
+            {
+                continue;
+            }
+            const float value = row[x];
+            if (!std::isfinite(value))
+            {
+                continue;
+            }
+            ++finiteCount;
+            if (value <= window.lower)
+            {
+                ++lowClipped;
+            }
+            else if (value >= window.upper)
+            {
+                ++highClipped;
+            }
+        }
+    }
+
+    if (finiteCount < 64)
+    {
+        return false;
+    }
+
+    const double lowFraction = static_cast<double>(lowClipped) / static_cast<double>(finiteCount);
+    const double highFraction = static_cast<double>(highClipped) / static_cast<double>(finiteCount);
+    return lowFraction >= kPreviewClipResetFraction || highFraction >= kPreviewClipResetFraction;
+}
 
 void writeStartupTrace(const QString& text)
 {
@@ -166,6 +227,36 @@ QString formatCtSeconds(qint64 ms)
     return QString::number(static_cast<double>(std::max<qint64>(0, ms)) / 1000.0, 'f', 3);
 }
 
+QString formatDurationSeconds(double seconds)
+{
+    const double safeSeconds = std::max(0.0, seconds);
+    if (safeSeconds >= 60.0)
+    {
+        return QStringLiteral("%1 s (%2 min)")
+            .arg(safeSeconds, 0, 'f', 3)
+            .arg(safeSeconds / 60.0, 0, 'f', 2);
+    }
+    return QStringLiteral("%1 s").arg(safeSeconds, 0, 'f', 3);
+}
+
+QString formatClockDuration(double seconds)
+{
+    const qint64 totalSeconds = static_cast<qint64>(std::llround(std::max(0.0, seconds)));
+    const qint64 hours = totalSeconds / 3600;
+    const qint64 minutes = (totalSeconds % 3600) / 60;
+    const qint64 secs = totalSeconds % 60;
+    if (hours > 0)
+    {
+        return QStringLiteral("%1:%2:%3")
+            .arg(hours)
+            .arg(minutes, 2, 10, QLatin1Char('0'))
+            .arg(secs, 2, 10, QLatin1Char('0'));
+    }
+    return QStringLiteral("%1:%2")
+        .arg(minutes)
+        .arg(secs, 2, 10, QLatin1Char('0'));
+}
+
 void addTimingMs(QJsonObject& obj, const QString& key, qint64 ms)
 {
     const qint64 clamped = std::max<qint64>(0, ms);
@@ -178,6 +269,63 @@ QLabel* makeCenteredHeader(const QString& text, QWidget* parent)
     auto* label = new QLabel(text, parent);
     label->setAlignment(Qt::AlignCenter);
     return label;
+}
+
+struct MotorSpeedTableParams
+{
+    int speedTable = 0;
+    int startSpeedPps = 1;
+    int topSpeedPps = 2;
+    int accelTime10ms = 1;
+    int decelTime10ms = 1;
+    int accelPattern = kKohzuSpeedPattern;
+    QString summary;
+};
+
+MotorSpeedTableParams makeMotorSpeedTableParams(const QString& axisName, int speedTable, double pulsePerUnit,
+    const QString& unit, double startSpeedPerSec, double topSpeedPerSec, double accelTimeSec)
+{
+    MotorSpeedTableParams params;
+    params.speedTable = speedTable;
+    const double safePulsePerUnit = std::max(1e-9, pulsePerUnit);
+    const double safeStart = std::max(0.0, startSpeedPerSec);
+    const double safeTop = std::max(0.0, topSpeedPerSec);
+
+    qint64 startPps = std::llround(safeStart * safePulsePerUnit);
+    qint64 topPps = std::llround(safeTop * safePulsePerUnit);
+    startPps = std::clamp<qint64>(startPps, 1, 2500000);
+    topPps = std::clamp<qint64>(topPps, 2, 5000000);
+    if (topPps <= startPps)
+    {
+        if (startPps < 5000000)
+        {
+            topPps = startPps + 1;
+        }
+        else
+        {
+            startPps = topPps - 1;
+        }
+    }
+
+    const double safeAccelTimeSec = std::max(0.01, accelTimeSec);
+    const int accelTicks = static_cast<int>(std::clamp<qint64>(std::llround(safeAccelTimeSec * 100.0), 1, 10000));
+
+    params.startSpeedPps = static_cast<int>(startPps);
+    params.topSpeedPps = static_cast<int>(topPps);
+    params.accelTime10ms = accelTicks;
+    params.decelTime10ms = accelTicks;
+    params.summary = QStringLiteral("%1 speed table %2: start=%3 %4/s (%5 pps), top=%6 %4/s (%7 pps), accel/decel=%8 s (%9 ticks), pattern=%10")
+        .arg(axisName)
+        .arg(speedTable)
+        .arg(safeStart, 0, 'f', 4)
+        .arg(unit)
+        .arg(params.startSpeedPps)
+        .arg(safeTop, 0, 'f', 4)
+        .arg(params.topSpeedPps)
+        .arg(static_cast<double>(params.accelTime10ms) / 100.0, 0, 'f', 2)
+        .arg(params.accelTime10ms)
+        .arg(params.accelPattern);
+    return params;
 }
 
 void configureMotorSpinBox(QDoubleSpinBox* spin, int decimals, int width)
@@ -242,6 +390,16 @@ QString numberedPath(const QString& dirPath, const QString& prefix, int padding,
         .arg(ext));
 }
 
+bool directoryHasAnyEntries(const QString& path)
+{
+    QDir dir(path);
+    if (!dir.exists())
+    {
+        return false;
+    }
+    return !dir.entryList(QDir::AllEntries | QDir::NoDotAndDotDot | QDir::Hidden | QDir::System).isEmpty();
+}
+
 QJsonObject pvcamSettingsToJson(const PvcamCaptureSettings& settings)
 {
     QJsonObject obj;
@@ -257,6 +415,10 @@ QJsonObject pvcamSettingsToJson(const PvcamCaptureSettings& settings)
     obj["ROI_Y"] = settings.roiY;
     obj["ROI_WIDTH"] = settings.roiWidth;
     obj["ROI_HEIGHT"] = settings.roiHeight;
+    obj["RAW_FRAME_LIMIT"] = settings.rawFrameLimit;
+    obj["FRAME_INTERVAL_MS"] = settings.frameIntervalMs;
+    obj["FIRST_KEEP_DELAY_MS"] = settings.firstKeepDelayMs;
+    obj["ALLOW_FRAME_INTERVAL_DECIMATION"] = settings.allowFrameIntervalDecimation;
     return obj;
 }
 
@@ -779,7 +941,7 @@ MainWindow::MainWindow(QWidget* parent)
 
     auto* hardwareScroll = new QScrollArea(central);
     hardwareScroll->setWidgetResizable(true);
-    hardwareScroll->setFixedWidth(470);
+    hardwareScroll->setFixedWidth(540);
     hardwareScroll->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
     auto* hardwareHost = new QWidget(hardwareScroll);
     auto* hardwareLayout = new QVBoxLayout(hardwareHost);
@@ -908,21 +1070,34 @@ MainWindow::MainWindow(QWidget* parent)
     auto* ctFlyPage = new QWidget(ctModeTabs_);
     auto* ctFlyForm = new QFormLayout(ctFlyPage);
     ctFlyForm->setContentsMargins(6, 6, 6, 6);
-    ctFlySpeedSpin_ = makeSpin<QDoubleSpinBox>(ctFlyPage, 0.001, 15.0, 0.1);
-    ctFlySpeedSpin_->setDecimals(4);
-    ctFlySpeedSpin_->setValue(1.0);
-    ctFlyLeadAngleSpin_ = makeSpin<QDoubleSpinBox>(ctFlyPage, 0.0, 90.0, 0.1);
-    ctFlyLeadAngleSpin_->setDecimals(4);
-    ctFlyLeadAngleSpin_->setValue(2.0);
+    ctFlyAllowedBlurSpin_ = makeSpin<QDoubleSpinBox>(ctFlyPage, 0.01, 1000.0, 0.1);
+    ctFlyAllowedBlurSpin_->setDecimals(3);
+    ctFlyAllowedBlurSpin_->setValue(1.0);
     ctFlyTotalAngleSpin_ = makeSpin<QDoubleSpinBox>(ctFlyPage, 180.0, 180.0, 1.0);
     ctFlyTotalAngleSpin_->setDecimals(4);
     ctFlyTotalAngleSpin_->setValue(180.0);
     ctFlyTotalAngleSpin_->setEnabled(false);
+    ctFlyRadiusLabel_ = new QLabel(QStringLiteral("-"), ctFlyPage);
+    ctFlySpeedLabel_ = new QLabel(QStringLiteral("-"), ctFlyPage);
+    ctFlySpeedLabel_->setToolTip(QStringLiteral("Derived from exposure, ROI radius, and allowed edge blur."));
+    ctFlyLeadAngleLabel_ = new QLabel(QStringLiteral("-"), ctFlyPage);
+    ctFlyLeadAngleLabel_->setToolTip(QStringLiteral("Automatically derived from R start speed, fly speed, acceleration time, and a fixed 3 deg safety margin."));
+    ctFlyScanTimeLabel_ = new QLabel(QStringLiteral("-"), ctFlyPage);
+    ctFlyFrameIntervalLabel_ = new QLabel(QStringLiteral("-"), ctFlyPage);
+    ctFlyMaxProjectionLabel_ = new QLabel(QStringLiteral("-"), ctFlyPage);
+    ctFlyValidationLabel_ = new QLabel(QStringLiteral("-"), ctFlyPage);
+    ctFlyValidationLabel_->setWordWrap(true);
     auto* ctFlyNote = new QLabel(QStringLiteral("Fly v1 uses start/end flats only; interval Flat Gap is ignored."), ctFlyPage);
     ctFlyNote->setWordWrap(true);
-    ctFlyForm->addRow(QStringLiteral("Fly Speed deg/s"), ctFlySpeedSpin_);
-    ctFlyForm->addRow(QStringLiteral("Lead Angle deg"), ctFlyLeadAngleSpin_);
+    ctFlyForm->addRow(QStringLiteral("ROI Radius px"), ctFlyRadiusLabel_);
+    ctFlyForm->addRow(QStringLiteral("Edge Blur px"), ctFlyAllowedBlurSpin_);
+    ctFlyForm->addRow(QStringLiteral("Fly Speed deg/s"), ctFlySpeedLabel_);
+    ctFlyForm->addRow(QStringLiteral("Scan Time"), ctFlyScanTimeLabel_);
+    ctFlyForm->addRow(QStringLiteral("Lead Angle deg"), ctFlyLeadAngleLabel_);
     ctFlyForm->addRow(QStringLiteral("Total Angle deg"), ctFlyTotalAngleSpin_);
+    ctFlyForm->addRow(QStringLiteral("Frame Interval"), ctFlyFrameIntervalLabel_);
+    ctFlyForm->addRow(QStringLiteral("Max Projections"), ctFlyMaxProjectionLabel_);
+    ctFlyForm->addRow(QStringLiteral("Fly Check"), ctFlyValidationLabel_);
     ctFlyForm->addRow(ctFlyNote);
     ctModeTabs_->addTab(ctStepPage, QStringLiteral("Step"));
     ctModeTabs_->addTab(ctFlyPage, QStringLiteral("Fly"));
@@ -930,6 +1105,14 @@ MainWindow::MainWindow(QWidget* parent)
     ctTiffThreadsSpin_ = makeSpin<QSpinBox>(ctGroup, 1, 64, 1);
     ctTiffThreadsSpin_->setValue(24);
     ctStatusLabel_ = new QLabel(QStringLiteral("Idle"), ctGroup);
+    ctTimingLabel_ = new QLabel(QStringLiteral("Elapsed 0:00 / remaining --"), ctGroup);
+    ctTimingLabel_->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
+    ctProgressBar_ = new QProgressBar(ctGroup);
+    ctProgressBar_->setRange(0, 1000);
+    ctProgressBar_->setValue(0);
+    ctProgressBar_->setTextVisible(true);
+    ctProgressBar_->setFormat(QStringLiteral("%p%"));
+    ctProgressBar_->setMaximumHeight(18);
     ctWriterLabel_ = new QLabel(QStringLiteral("24 threads, 0.0 MiB/s, saved 0"), ctGroup);
     ctBufferLabel_ = new QLabel(QStringLiteral("0 / 2048 frames, 0.0 / 40.0 GiB"), ctGroup);
     ctStartButton_ = new QPushButton(QStringLiteral("Start CT"), ctGroup);
@@ -942,6 +1125,13 @@ MainWindow::MainWindow(QWidget* parent)
     ctButtonLayout->addWidget(ctStopButton_);
     auto* ctButtonWidget = new QWidget(ctGroup);
     ctButtonWidget->setLayout(ctButtonLayout);
+    auto* ctStatusLayout = new QHBoxLayout();
+    ctStatusLayout->setContentsMargins(0, 0, 0, 0);
+    ctStatusLayout->setSpacing(8);
+    ctStatusLayout->addWidget(ctStatusLabel_, 1);
+    ctStatusLayout->addWidget(ctTimingLabel_, 0);
+    auto* ctStatusWidget = new QWidget(ctGroup);
+    ctStatusWidget->setLayout(ctStatusLayout);
     ctForm->addRow(QStringLiteral("Beginning Angle"), ctBeginningAngleSpin_);
     ctForm->addRow(QStringLiteral("Mode"), ctModeTabs_);
     ctForm->addRow(QStringLiteral("Save Path"), ctSaveWidget);
@@ -951,7 +1141,8 @@ MainWindow::MainWindow(QWidget* parent)
     ctForm->addRow(QStringLiteral("Flat Num"), ctFlatNumSpin_);
     ctForm->addRow(ctAutoCorCheck_);
     ctForm->addRow(QStringLiteral("CT TIFF Threads"), ctTiffThreadsSpin_);
-    ctForm->addRow(QStringLiteral("CT Status"), ctStatusLabel_);
+    ctForm->addRow(QStringLiteral("CT Status"), ctStatusWidget);
+    ctForm->addRow(QStringLiteral("CT Progress"), ctProgressBar_);
     ctForm->addRow(QStringLiteral("Writer"), ctWriterLabel_);
     ctForm->addRow(QStringLiteral("Buffer"), ctBufferLabel_);
     ctForm->addRow(ctButtonWidget);
@@ -993,9 +1184,9 @@ MainWindow::MainWindow(QWidget* parent)
     auto* speedHeaderSpacer = new QWidget(motorSpeedHeader_);
     speedHeaderSpacer->setFixedWidth(kMotorSpeedColumnsLeftOffset);
     speedHeaderLayout->addWidget(speedHeaderSpacer);
-    auto* baseHeader = makeCenteredHeader(QStringLiteral("Base"), motorSpeedHeader_);
-    auto* speedHeader = makeCenteredHeader(QStringLiteral("Speed"), motorSpeedHeader_);
-    auto* accelHeader = makeCenteredHeader(QStringLiteral("Accel"), motorSpeedHeader_);
+    auto* baseHeader = makeCenteredHeader(QStringLiteral("Start Speed/s"), motorSpeedHeader_);
+    auto* speedHeader = makeCenteredHeader(QStringLiteral("Top Speed/s"), motorSpeedHeader_);
+    auto* accelHeader = makeCenteredHeader(QStringLiteral("Accel Time*s"), motorSpeedHeader_);
     baseHeader->setFixedWidth(kMotorSpeedColumnWidth);
     speedHeader->setFixedWidth(kMotorSpeedColumnWidth);
     accelHeader->setFixedWidth(kMotorSpeedColumnWidth);
@@ -1048,15 +1239,18 @@ MainWindow::MainWindow(QWidget* parent)
         axisUi.speedUnitLabel = new QLabel(axisUi.unit, axisGroup);
         axisUi.speedUnitLabel->setAlignment(Qt::AlignCenter);
         axisUi.speedUnitLabel->setFixedWidth(34);
-        axisUi.baseSpeedSpin = makeSpin<QDoubleSpinBox>(axisGroup, 0.0, 1000000.0, def.defaultBaseSpeed);
-        configureMotorSpinBox(axisUi.baseSpeedSpin, 4, 76);
+        axisUi.baseSpeedSpin = makeSpin<QDoubleSpinBox>(axisGroup, 0.0001, 1000000.0, def.defaultBaseSpeed);
+        configureMotorSpinBox(axisUi.baseSpeedSpin, 4, kMotorSpeedColumnWidth);
         axisUi.baseSpeedSpin->setValue(def.defaultBaseSpeed);
-        axisUi.speedSpin = makeSpin<QDoubleSpinBox>(axisGroup, 0.0, 1000000.0, def.defaultSpeed);
-        configureMotorSpinBox(axisUi.speedSpin, 4, 76);
+        axisUi.baseSpeedSpin->setToolTip(QStringLiteral("Kohzu WTB start speed in %1/s.").arg(axisUi.unit));
+        axisUi.speedSpin = makeSpin<QDoubleSpinBox>(axisGroup, 0.0001, 1000000.0, def.defaultSpeed);
+        configureMotorSpinBox(axisUi.speedSpin, 4, kMotorSpeedColumnWidth);
         axisUi.speedSpin->setValue(def.defaultSpeed);
-        axisUi.accelSpin = makeSpin<QDoubleSpinBox>(axisGroup, 0.0, 1000000.0, def.defaultAccel);
-        configureMotorSpinBox(axisUi.accelSpin, 4, 76);
+        axisUi.speedSpin->setToolTip(QStringLiteral("Kohzu WTB top speed in %1/s.").arg(axisUi.unit));
+        axisUi.accelSpin = makeSpin<QDoubleSpinBox>(axisGroup, 0.01, 100.0, 0.01);
+        configureMotorSpinBox(axisUi.accelSpin, 2, kMotorSpeedColumnWidth);
         axisUi.accelSpin->setValue(def.defaultAccel);
+        axisUi.accelSpin->setToolTip(QStringLiteral("Kohzu WTB acceleration/deceleration time in seconds. Sent as 10 ms ticks."));
         axisUi.speedUnitLabel->hide();
         auto* speedLayout = new QHBoxLayout();
         speedLayout->setContentsMargins(0, 0, 0, 0);
@@ -1099,6 +1293,12 @@ MainWindow::MainWindow(QWidget* parent)
         connect(axisUi.goButton, &QPushButton::clicked, this, [this, axisKey]() {
             moveMotorAxis(axisKey);
         });
+        if (axisKey == QStringLiteral("R") && axisUi.speedSpin)
+        {
+            connect(axisUi.speedSpin, qOverload<double>(&QDoubleSpinBox::valueChanged), this, [this](double) {
+                updateCtFlyDerivedParams();
+            });
+        }
 
         motorAxes_.insert(axisKey, axisUi);
         motorAxisNamesByNumber_.insert(axisUi.axis, axisKey);
@@ -1406,6 +1606,22 @@ MainWindow::MainWindow(QWidget* parent)
                 ? QStringLiteral("Step mode interval flat gap.")
                 : QStringLiteral("Fly v1 ignores interval Flat Gap and uses start/end flats only."));
         }
+        updateCtFlyDerivedParams();
+    });
+    connect(cameraExposureSpin_, qOverload<double>(&QDoubleSpinBox::valueChanged), this, [this](double) {
+        updateCtFlyDerivedParams();
+    });
+    connect(cameraExposureUnitCombo_, &QComboBox::currentTextChanged, this, [this](const QString&) {
+        updateCtFlyDerivedParams();
+    });
+    connect(cameraRoiWidthSpin_, qOverload<int>(&QSpinBox::valueChanged), this, [this](int) {
+        updateCtFlyDerivedParams();
+    });
+    connect(ctProjectionNumSpin_, qOverload<int>(&QSpinBox::valueChanged), this, [this](int) {
+        updateCtFlyDerivedParams();
+    });
+    connect(ctFlyAllowedBlurSpin_, qOverload<double>(&QDoubleSpinBox::valueChanged), this, [this](double) {
+        updateCtFlyDerivedParams();
     });
     connect(reconQueueUpButton_, &QPushButton::clicked, this, [this]() { moveSelectedReconQueueJob(-1); });
     connect(reconQueueDownButton_, &QPushButton::clicked, this, [this]() { moveSelectedReconQueueJob(1); });
@@ -1473,6 +1689,11 @@ MainWindow::MainWindow(QWidget* parent)
         appendLog(QStringLiteral("Save error: %1").arg(error));
     });
 
+    ctProgressTimer_ = new QTimer(this);
+    ctProgressTimer_->setInterval(1000);
+    connect(ctProgressTimer_, &QTimer::timeout, this, &MainWindow::updateCtProgressUi);
+    updateCtProgressUi();
+
     const QString sessionConfigFile = sessionConfigPath();
     writeStartupTrace(QStringLiteral("Preparing recon queue"));
     ensureReconQueueDirs();
@@ -1522,6 +1743,20 @@ MainWindow::MainWindow(QWidget* parent)
         .arg(QString::fromLatin1(__DATE__), QString::fromLatin1(__TIME__)));
     writeStartupTrace(QStringLiteral("MainWindow ctor complete"));
     QTimer::singleShot(0, this, &MainWindow::startNextQueuedReconstruction);
+    QTimer::singleShot(5000, this, [this]() {
+        if (cameraWarmOpenComplete_)
+        {
+            return;
+        }
+        cameraWarmOpenComplete_ = true;
+        cameraWarmOpenCompletedMs_ = QDateTime::currentMSecsSinceEpoch();
+        writeStartupTrace(QStringLiteral("camera warm open fallback timeout; allowing recon queue"));
+        if (reconStartDeferredForCameraWarmOpen_)
+        {
+            reconStartDeferredForCameraWarmOpen_ = false;
+            QTimer::singleShot(static_cast<int>(kReconQueueCameraSettleMs), this, &MainWindow::startNextQueuedReconstruction);
+        }
+    });
     QTimer::singleShot(1000, this, &MainWindow::maybeStartCtSmokeAutostart);
     QTimer::singleShot(1000, this, &MainWindow::maybeStartCtReplayAutostart);
 }
@@ -1577,6 +1812,34 @@ void MainWindow::applyConfig(const AppConfig& config)
     gpuSpin_->setValue(config.compute.gpuIndex);
     zBlockSpin_->setValue(config.compute.zBlockSplit);
     livePreviewCheck_->setChecked(config.preview.enableLive);
+    cameraExposureSpin_->setValue(config.cameraUi.exposureValue);
+    cameraExposureUnitCombo_->setCurrentText(config.cameraUi.exposureUnit);
+    cameraRoiXSpin_->setValue(config.cameraUi.roiX);
+    cameraRoiYSpin_->setValue(config.cameraUi.roiY);
+    cameraRoiWidthSpin_->setValue(config.cameraUi.roiWidth);
+    cameraRoiHeightSpin_->setValue(config.cameraUi.roiHeight);
+    cameraSnapPrefixEdit_->setText(config.cameraUi.snapPrefix);
+    cameraSnapPaddingSpin_->setValue(config.cameraUi.snapPadding);
+    cameraSnapIndexSpin_->setValue(config.cameraUi.snapIndex);
+    cameraSaveDirEdit_->setText(config.cameraUi.saveDir);
+    motorHostEdit_->setText(config.kohzuUi.host);
+    motorPortSpin_->setValue(config.kohzuUi.port);
+    ctBeginningAngleSpin_->setValue(config.ctAcquisitionUi.beginningAngleDeg);
+    if (ctModeTabs_)
+    {
+        ctModeTabs_->setCurrentIndex(config.ctAcquisitionUi.modeIndex);
+    }
+    ctSavePathEdit_->setText(config.ctAcquisitionUi.savePath);
+    ctProjectionNumSpin_->setValue(config.ctAcquisitionUi.projectionNum);
+    ctFlatGapSpin_->setValue(config.ctAcquisitionUi.flatGap);
+    ctFlatMoveSpin_->setValue(config.ctAcquisitionUi.flatMoveUm);
+    ctFlatNumSpin_->setValue(config.ctAcquisitionUi.flatNum);
+    ctAutoCorCheck_->setChecked(config.ctAcquisitionUi.autoCorReference);
+    ctTiffThreadsSpin_->setValue(config.ctAcquisitionUi.tiffThreads);
+    if (ctFlyAllowedBlurSpin_)
+    {
+        ctFlyAllowedBlurSpin_->setValue(config.ctFly.allowedBlurPx);
+    }
     setPreviewSliceRange(config.geometry.volH);
     syncPreviewSliceControls(config.preview.liveSliceIndex);
     for (auto it = motorAxes_.begin(); it != motorAxes_.end(); ++it)
@@ -1585,6 +1848,14 @@ void MainWindow::applyConfig(const AppConfig& config)
         if (motorIt == config.motorAxes.constEnd())
         {
             continue;
+        }
+        if (it->relativeSpin && motorIt.value().hasRelativeStep)
+        {
+            it->relativeSpin->setValue(std::abs(motorIt.value().relativeStep));
+        }
+        if (it->absoluteSpin && motorIt.value().hasAbsoluteTarget)
+        {
+            it->absoluteSpin->setValue(motorIt.value().absoluteTarget);
         }
         if (it->baseSpeedSpin && motorIt.value().hasBaseSpeed)
         {
@@ -1600,6 +1871,7 @@ void MainWindow::applyConfig(const AppConfig& config)
         }
     }
     updateReconMethodUiState();
+    updateCtFlyDerivedParams();
 }
 
 AppConfig MainWindow::configFromUi() const
@@ -1650,10 +1922,37 @@ AppConfig MainWindow::configFromUi() const
     cfg.compute.zBlockSplit = zBlockSpin_->value();
     cfg.preview.enableLive = livePreviewCheck_->isChecked();
     cfg.preview.liveSliceIndex = liveSliceSpin_->value();
+    cfg.cameraUi.exposureValue = cameraExposureSpin_->value();
+    cfg.cameraUi.exposureUnit = cameraExposureUnitCombo_->currentText();
+    cfg.cameraUi.roiX = cameraRoiXSpin_->value();
+    cfg.cameraUi.roiY = cameraRoiYSpin_->value();
+    cfg.cameraUi.roiWidth = cameraRoiWidthSpin_->value();
+    cfg.cameraUi.roiHeight = cameraRoiHeightSpin_->value();
+    cfg.cameraUi.snapPrefix = cameraSnapPrefixEdit_->text();
+    cfg.cameraUi.snapPadding = cameraSnapPaddingSpin_->value();
+    cfg.cameraUi.snapIndex = cameraSnapIndexSpin_->value();
+    cfg.cameraUi.saveDir = cameraSaveDirEdit_->text();
+    cfg.ctAcquisitionUi.beginningAngleDeg = ctBeginningAngleSpin_->value();
+    cfg.ctAcquisitionUi.modeIndex = ctModeTabs_ ? ctModeTabs_->currentIndex() : 0;
+    cfg.ctAcquisitionUi.savePath = ctSavePathEdit_->text();
+    cfg.ctAcquisitionUi.projectionNum = ctProjectionNumSpin_->value();
+    cfg.ctAcquisitionUi.flatGap = ctFlatGapSpin_->value();
+    cfg.ctAcquisitionUi.flatMoveUm = ctFlatMoveSpin_->value();
+    cfg.ctAcquisitionUi.flatNum = ctFlatNumSpin_->value();
+    cfg.ctAcquisitionUi.flyLeadAngleDeg = ctFlyDerivedLeadAngleDeg_;
+    cfg.ctAcquisitionUi.autoCorReference = ctAutoCorCheck_->isChecked();
+    cfg.ctAcquisitionUi.tiffThreads = ctTiffThreadsSpin_->value();
+    cfg.kohzuUi.host = motorHostEdit_->text().trimmed();
+    cfg.kohzuUi.port = motorPortSpin_->value();
+    cfg.ctFly.allowedBlurPx = ctFlyAllowedBlurSpin_ ? ctFlyAllowedBlurSpin_->value() : cfg.ctFly.allowedBlurPx;
     cfg.motorAxes.clear();
     for (auto it = motorAxes_.cbegin(); it != motorAxes_.cend(); ++it)
     {
         MotorAxisConfig motorCfg;
+        motorCfg.hasRelativeStep = true;
+        motorCfg.relativeStep = it->relativeSpin ? it->relativeSpin->value() : 0.0;
+        motorCfg.hasAbsoluteTarget = true;
+        motorCfg.absoluteTarget = it->absoluteSpin ? it->absoluteSpin->value() : 0.0;
         motorCfg.hasBaseSpeed = true;
         motorCfg.baseSpeed = it->baseSpeedSpin ? it->baseSpeedSpin->value() : 0.0;
         motorCfg.speed = it->speedSpin ? it->speedSpin->value() : 0.0;
@@ -1681,10 +1980,319 @@ QString MainWindow::sessionConfigPath() const
 
 void MainWindow::setBusy(bool busy)
 {
-    startButton_->setEnabled(!busy);
-    stopButton_->setEnabled(busy);
-    stopButton_->setText(QStringLiteral("Stop"));
-    saveButton_->setEnabled(!busy && controller_.hasVolume());
+    writeStartupTrace(QStringLiteral("setBusy enter: %1").arg(busy));
+    if (startButton_)
+    {
+        startButton_->setEnabled(!busy);
+    }
+    if (stopButton_)
+    {
+        stopButton_->setEnabled(busy);
+        stopButton_->setText(QStringLiteral("Stop"));
+    }
+    if (saveButton_)
+    {
+        saveButton_->setEnabled(!busy && controller_.hasVolume());
+    }
+    writeStartupTrace(QStringLiteral("setBusy exit: %1").arg(busy));
+}
+
+void MainWindow::updateCtFlyDerivedParams()
+{
+    if (!ctFlySpeedLabel_)
+    {
+        return;
+    }
+
+    PvcamCaptureSettings cameraSettings;
+    cameraSettings.exposureValue = cameraExposureSpin_ ? cameraExposureSpin_->value() : 1.0;
+    cameraSettings.exposureUnit = cameraExposureUnitCombo_
+        ? cameraExposureUnitFromText(cameraExposureUnitCombo_->currentText())
+        : PvcamExposureUnit::Milliseconds;
+
+    const double exposureMs = exposureMsFromSettings(cameraSettings);
+    const double exposureS = exposureMs / 1000.0;
+    const double roiWidthPx = static_cast<double>(cameraRoiWidthSpin_ ? cameraRoiWidthSpin_->value() : 0);
+    const double radiusPx = roiWidthPx * 0.5;
+    const double allowedBlurPx = ctFlyAllowedBlurSpin_ ? ctFlyAllowedBlurSpin_->value() : 1.0;
+    const double totalAngleDeg = ctFlyTotalAngleSpin_ ? ctFlyTotalAngleSpin_->value() : 180.0;
+    const int projectionCount = ctProjectionNumSpin_ ? ctProjectionNumSpin_->value() : 1;
+
+    QStringList problems;
+    double flySpeedDegPerSec = 0.0;
+    double blurAngleDeg = 0.0;
+    double scanTimeS = 0.0;
+    double frameIntervalS = 0.0;
+    double leadAngleDeg = kCtFlyLeadMarginDeg;
+    double firstKeepDelayS = 0.0;
+    int maxProjectionCount = 0;
+    double estimatedBlurPx = 0.0;
+
+    if (radiusPx <= 0.0)
+    {
+        problems.append(QStringLiteral("ROI width is invalid."));
+    }
+    if (exposureS <= 0.0)
+    {
+        problems.append(QStringLiteral("Exposure is invalid."));
+    }
+    if (allowedBlurPx <= 0.0)
+    {
+        problems.append(QStringLiteral("Edge blur must be positive."));
+    }
+    if (projectionCount <= 0)
+    {
+        problems.append(QStringLiteral("Projection Num is invalid."));
+    }
+
+    if (problems.isEmpty())
+    {
+        const double radToDeg = 180.0 / std::acos(-1.0);
+        blurAngleDeg = std::atan(allowedBlurPx / radiusPx) * radToDeg;
+        flySpeedDegPerSec = blurAngleDeg / exposureS;
+        if (flySpeedDegPerSec > 0.0)
+        {
+            scanTimeS = totalAngleDeg / flySpeedDegPerSec;
+            frameIntervalS = scanTimeS / static_cast<double>(projectionCount);
+            const double minFrameIntervalS = exposureS * 1.05;
+            maxProjectionCount = static_cast<int>(std::floor(scanTimeS / std::max(1e-9, minFrameIntervalS)));
+            estimatedBlurPx = std::tan((flySpeedDegPerSec * exposureS) / radToDeg) * radiusPx;
+
+            const auto rIt = motorAxes_.constFind(QStringLiteral("R"));
+            double rStartSpeed = std::min(1.0, flySpeedDegPerSec);
+            double rAccelTimeS = 1.5;
+            if (rIt != motorAxes_.constEnd())
+            {
+                if (rIt->baseSpeedSpin)
+                {
+                    rStartSpeed = std::min(rIt->baseSpeedSpin->value(), flySpeedDegPerSec);
+                }
+                if (rIt->accelSpin)
+                {
+                    rAccelTimeS = std::max(0.01, rIt->accelSpin->value());
+                }
+            }
+            const double accelDistanceDeg = 0.5 * (std::max(0.0, rStartSpeed) + flySpeedDegPerSec) * rAccelTimeS;
+            leadAngleDeg = std::min(90.0, std::max(kCtFlyLeadMarginDeg, accelDistanceDeg + kCtFlyLeadMarginDeg));
+            firstKeepDelayS = rAccelTimeS
+                + std::max(0.0, leadAngleDeg - accelDistanceDeg) / std::max(1e-9, flySpeedDegPerSec);
+
+            if (frameIntervalS < minFrameIntervalS)
+            {
+                problems.append(QStringLiteral("Projection Num is too high for exposure plus 5% guard; max is about %1.")
+                    .arg(std::max(0, maxProjectionCount)));
+            }
+            if (rIt != motorAxes_.constEnd() && rIt->speedSpin && flySpeedDegPerSec > rIt->speedSpin->value())
+            {
+                problems.append(QStringLiteral("Derived speed exceeds current R Top Speed/s (%1 deg/s).")
+                    .arg(rIt->speedSpin->value(), 0, 'f', 4));
+            }
+            if (leadAngleDeg >= 90.0)
+            {
+                problems.append(QStringLiteral("Derived lead reached 90 deg clamp; reduce fly speed or R acceleration time."));
+            }
+        }
+        else
+        {
+            problems.append(QStringLiteral("Derived fly speed is invalid."));
+        }
+    }
+
+    ctFlyDerivedSpeedDegPerSec_ = flySpeedDegPerSec > 0.0 ? flySpeedDegPerSec : 1.0;
+    ctFlyDerivedLeadAngleDeg_ = leadAngleDeg;
+    ctFlyDerivedScanTimeS_ = scanTimeS;
+    ctFlyDerivedFrameIntervalMs_ = frameIntervalS > 0.0 ? frameIntervalS * 1000.0 : 0.0;
+    ctFlyFirstKeepDelayMs_ = firstKeepDelayS > 0.0 ? firstKeepDelayS * 1000.0 : 0.0;
+    ctFlySpeedLabel_->setText(flySpeedDegPerSec > 0.0
+        ? QStringLiteral("%1").arg(flySpeedDegPerSec, 0, 'f', 6)
+        : QStringLiteral("-"));
+    if (ctFlyLeadAngleLabel_)
+    {
+        ctFlyLeadAngleLabel_->setText(leadAngleDeg > 0.0
+            ? QStringLiteral("%1 (margin %2)").arg(leadAngleDeg, 0, 'f', 4).arg(kCtFlyLeadMarginDeg, 0, 'f', 1)
+            : QStringLiteral("-"));
+    }
+
+    if (ctFlyRadiusLabel_)
+    {
+        ctFlyRadiusLabel_->setText(radiusPx > 0.0
+            ? QStringLiteral("%1 px").arg(radiusPx, 0, 'f', 1)
+            : QStringLiteral("-"));
+    }
+    if (ctFlyScanTimeLabel_)
+    {
+        ctFlyScanTimeLabel_->setText(scanTimeS > 0.0 ? formatDurationSeconds(scanTimeS) : QStringLiteral("-"));
+    }
+    if (ctFlyFrameIntervalLabel_)
+    {
+        ctFlyFrameIntervalLabel_->setText(frameIntervalS > 0.0
+            ? QStringLiteral("%1 s (%2 ms)")
+                .arg(frameIntervalS, 0, 'f', 6)
+                .arg(frameIntervalS * 1000.0, 0, 'f', 3)
+            : QStringLiteral("-"));
+    }
+    if (ctFlyMaxProjectionLabel_)
+    {
+        ctFlyMaxProjectionLabel_->setText(maxProjectionCount > 0
+            ? QStringLiteral("%1 at exposure x 1.05 guard").arg(maxProjectionCount)
+            : QStringLiteral("-"));
+    }
+    if (ctFlyValidationLabel_)
+    {
+        if (problems.isEmpty())
+        {
+            ctFlyValidationLabel_->setText(QStringLiteral("OK: blur=%1 px, angle during exposure=%2 deg, first keep delay=%3 s.")
+                .arg(estimatedBlurPx, 0, 'f', 3)
+                .arg(blurAngleDeg, 0, 'f', 6)
+                .arg(firstKeepDelayS, 0, 'f', 3));
+            ctFlyValidationLabel_->setStyleSheet(QStringLiteral("color:#1b7f3a;"));
+        }
+        else
+        {
+            ctFlyValidationLabel_->setText(problems.join(QStringLiteral(" ")));
+            ctFlyValidationLabel_->setStyleSheet(QStringLiteral("color:#b00020;"));
+        }
+    }
+}
+
+int MainWindow::estimateCtTotalFrames() const
+{
+    const int projections = std::max(0, ctSettings_.projectionCount);
+    int frames = projections;
+    if (ctSettings_.autoCor)
+    {
+        frames += 1;
+    }
+    if (ctSettings_.flatCount > 0)
+    {
+        int flatGroups = 2;
+        if (ctSettings_.mode == CtAcquisitionMode::StepAndShoot
+            && ctSettings_.flatGap > 0
+            && projections > 1)
+        {
+            flatGroups += (projections - 1) / ctSettings_.flatGap;
+        }
+        frames += flatGroups * ctSettings_.flatCount;
+    }
+    return std::max(0, frames);
+}
+
+double MainWindow::estimateAxisMoveSeconds(const QString& axisName, double distanceUnits) const
+{
+    const auto it = motorAxes_.find(axisName);
+    if (it == motorAxes_.end())
+    {
+        return 0.0;
+    }
+    const double distance = std::abs(distanceUnits);
+    const double topSpeed = it->speedSpin ? std::max(1e-9, it->speedSpin->value()) : 1.0;
+    const double accelTime = it->accelSpin ? std::max(0.0, it->accelSpin->value()) : 0.0;
+    constexpr double kCommandSettleSeconds = 0.08;
+    return distance / topSpeed + accelTime + kCommandSettleSeconds;
+}
+
+double MainWindow::estimateCtAcquisitionSeconds(int totalFrames) const
+{
+    if (totalFrames <= 0)
+    {
+        return 0.0;
+    }
+    const int projections = std::max(0, ctSettings_.projectionCount);
+    const double exposureS = std::max(0.001, exposureMsFromSettings(ctSettings_.camera)) / 1000.0;
+    constexpr double kPreparedFrameOverheadS = 0.04;
+    const int corFrames = ctSettings_.autoCor ? 1 : 0;
+    const int flatFrames = std::max(0, totalFrames - projections - corFrames);
+
+    if (ctSettings_.mode == CtAcquisitionMode::FlyScan)
+    {
+        const double scanS = ctSettings_.flyScanTimeS > 0.0
+            ? ctSettings_.flyScanTimeS
+            : (std::max(0.0, ctSettings_.flyFrameIntervalMs) * static_cast<double>(projections) / 1000.0);
+        const double referenceFrameS = static_cast<double>(flatFrames + corFrames) * (exposureS + kPreparedFrameOverheadS);
+        const int flatGroups = ctSettings_.flatCount > 0 ? 2 : 0;
+        const double yMoveS = static_cast<double>(flatGroups) * 2.0
+            * estimateAxisMoveSeconds(QStringLiteral("Y"), ctSettings_.flatMoveDistanceUm);
+        const double flySweepS = ctSettings_.flySpeedDegPerSec > 0.0
+            ? ((180.0 + 2.0 * std::max(0.0, ctSettings_.flyLeadAngleDeg)) / ctSettings_.flySpeedDegPerSec
+                + estimateAxisMoveSeconds(QStringLiteral("R"), 0.0))
+            : scanS;
+        return std::max(scanS, flySweepS) + referenceFrameS + yMoveS;
+    }
+
+    int flatGroups = 0;
+    if (ctSettings_.flatCount > 0)
+    {
+        flatGroups = 2;
+        if (ctSettings_.flatGap > 0 && projections > 1)
+        {
+            flatGroups += (projections - 1) / ctSettings_.flatGap;
+        }
+    }
+    const double angleStep = projections > 0 ? 180.0 / static_cast<double>(projections) : 0.0;
+    const int smallRMoveCount = std::max(0, projections - 1);
+    const double rSmallMoveS = static_cast<double>(smallRMoveCount)
+        * estimateAxisMoveSeconds(QStringLiteral("R"), angleStep);
+    const double rInitialMoveS = estimateAxisMoveSeconds(QStringLiteral("R"), ctSettings_.autoCor ? 180.0 : 0.0)
+        + (ctSettings_.autoCor ? estimateAxisMoveSeconds(QStringLiteral("R"), 180.0) : 0.0);
+    const double yMoveS = static_cast<double>(flatGroups) * 2.0
+        * estimateAxisMoveSeconds(QStringLiteral("Y"), ctSettings_.flatMoveDistanceUm);
+    const double cameraS = static_cast<double>(totalFrames) * (exposureS + kPreparedFrameOverheadS);
+    return cameraS + rInitialMoveS + rSmallMoveS + yMoveS;
+}
+
+void MainWindow::updateCtProgressUi()
+{
+    if (!ctProgressBar_ || !ctTimingLabel_)
+    {
+        return;
+    }
+
+    const qint64 nowMs = QDateTime::currentMSecsSinceEpoch();
+    const double elapsedS = ctAcquisitionStartedMs_ > 0
+        ? static_cast<double>(std::max<qint64>(0, (ctCompletedMs_ > 0 && !ctRunning_) ? (ctCompletedMs_ - ctAcquisitionStartedMs_) : (nowMs - ctAcquisitionStartedMs_))) / 1000.0
+        : 0.0;
+    const int totalFrames = std::max(0, ctEstimatedTotalFrames_);
+    const int savedFrames = std::max(0, ctFrameSavedCount_);
+    const double frameRatio = totalFrames > 0
+        ? std::clamp(static_cast<double>(savedFrames) / static_cast<double>(totalFrames), 0.0, 1.0)
+        : 0.0;
+    const double timeRatio = ctEstimatedTotalSeconds_ > 0.0
+        ? std::clamp(elapsedS / ctEstimatedTotalSeconds_, 0.0, 1.0)
+        : 0.0;
+    double progressRatio = std::max(frameRatio, timeRatio);
+    if (ctRunning_)
+    {
+        progressRatio = std::min(progressRatio, 0.99);
+    }
+
+    ctProgressBar_->setValue(static_cast<int>(std::llround(progressRatio * static_cast<double>(ctProgressBar_->maximum()))));
+
+    double remainingS = 0.0;
+    const QString frameText = totalFrames > 0
+        ? QStringLiteral("Frames %1/%2").arg(savedFrames).arg(totalFrames)
+        : QStringLiteral("Frames %1").arg(savedFrames);
+    if (ctRunning_)
+    {
+        if (savedFrames >= 3 && totalFrames > savedFrames)
+        {
+            remainingS = (elapsedS / static_cast<double>(savedFrames)) * static_cast<double>(totalFrames - savedFrames);
+        }
+        else if (ctEstimatedTotalSeconds_ > 0.0)
+        {
+            remainingS = std::max(0.0, ctEstimatedTotalSeconds_ - elapsedS);
+        }
+        ctTimingLabel_->setText(QStringLiteral("%1 | Elapsed %2 / remaining %3")
+            .arg(frameText, formatClockDuration(elapsedS), formatClockDuration(remainingS)));
+    }
+    else if (ctCompletedMs_ > 0)
+    {
+        ctTimingLabel_->setText(QStringLiteral("%1 | Elapsed %2 / remaining 0:00")
+            .arg(frameText, formatClockDuration(elapsedS)));
+    }
+    else
+    {
+        ctTimingLabel_->setText(QStringLiteral("Elapsed 0:00 / remaining --"));
+    }
 }
 
 void MainWindow::appendLog(const QString& text)
@@ -1747,6 +2355,20 @@ void MainWindow::startCameraWorker()
     connect(cameraWorker_, &PvcamCameraWorker::cameraStateChanged, this, [this](const QString& state) {
         if (shuttingDown_) { return; }
         cameraStateLabel_->setText(state);
+        if (!cameraWarmOpenComplete_
+            && (state.contains(QStringLiteral("Ready"), Qt::CaseInsensitive)
+                || state.contains(QStringLiteral("Error"), Qt::CaseInsensitive)
+                || state.contains(QStringLiteral("unavailable"), Qt::CaseInsensitive)))
+        {
+            cameraWarmOpenComplete_ = true;
+            cameraWarmOpenCompletedMs_ = QDateTime::currentMSecsSinceEpoch();
+            writeStartupTrace(QStringLiteral("camera warm open complete: %1").arg(state));
+            if (reconStartDeferredForCameraWarmOpen_)
+            {
+                reconStartDeferredForCameraWarmOpen_ = false;
+                QTimer::singleShot(static_cast<int>(kReconQueueCameraSettleMs), this, &MainWindow::startNextQueuedReconstruction);
+            }
+        }
     });
     connect(cameraWorker_, &PvcamCameraWorker::frameReady, this, [this](const CameraFrame& frame) {
         if (ctRunning_ && ctWaitingForFrame_)
@@ -2212,9 +2834,21 @@ void MainWindow::updateCameraFrameForCtPreview(const CameraFrame& frame)
         ? static_cast<double>(lastRawCameraFrame_.rows) / static_cast<double>(frame.image.rows)
         : 1.0;
 
-    if (!currentCameraPreviewWindow_.isValid() || cameraPreviewFrameCount_ == 1)
+    const PreviewWindow estimatedWindow = PreviewSliceRenderer::estimateRobustWindow(lastRawCameraFrame_);
+    const bool windowOutsideData = estimatedWindow.isValid()
+        && currentCameraPreviewWindow_.isValid()
+        && (currentCameraPreviewWindow_.upper <= estimatedWindow.lower
+            || currentCameraPreviewWindow_.lower >= estimatedWindow.upper);
+    if (!currentCameraPreviewWindow_.isValid() || cameraPreviewFrameCount_ == 1 || windowOutsideData)
     {
-        currentCameraPreviewWindow_ = PreviewSliceRenderer::estimateRobustWindow(lastRawCameraFrame_);
+        currentCameraPreviewWindow_ = estimatedWindow;
+    }
+    if (cameraHistogramWidget_)
+    {
+        const QSignalBlocker blocker(cameraHistogramWidget_);
+        cameraHistogramWidget_->updateData(lastRawCameraFrame_);
+        cameraHistogramWidget_->setWindow(currentCameraPreviewWindow_, false);
+        currentCameraPreviewWindow_ = cameraHistogramWidget_->window();
     }
 
     if (cameraPreviewFrameCount_ == 1)
@@ -2240,6 +2874,21 @@ void MainWindow::renderCameraPreviewWithCurrentWindow()
     if (!currentCameraPreviewWindow_.isValid())
     {
         currentCameraPreviewWindow_ = PreviewSliceRenderer::estimateRobustWindow(lastRawCameraFrame_);
+    }
+    if (previewWindowProducesClippedImage(lastRawCameraFrame_, currentCameraPreviewWindow_))
+    {
+        const PreviewWindow recoveredWindow = PreviewSliceRenderer::estimateRobustWindow(lastRawCameraFrame_);
+        if (recoveredWindow.isValid())
+        {
+            currentCameraPreviewWindow_ = recoveredWindow;
+            if (cameraHistogramWidget_)
+            {
+                const QSignalBlocker blocker(cameraHistogramWidget_);
+                cameraHistogramWidget_->updateData(lastRawCameraFrame_);
+                cameraHistogramWidget_->setWindow(currentCameraPreviewWindow_, false);
+                currentCameraPreviewWindow_ = cameraHistogramWidget_->window();
+            }
+        }
     }
     if (!currentCameraPreviewWindow_.isValid())
     {
@@ -2343,16 +2992,16 @@ void MainWindow::startCtAcquisition()
         appendLog(QStringLiteral("CT acquisition failed: Kohzu is not connected."));
         return;
     }
-    ctRestoreLiveAfterFinish_ = cameraLiveRunning_;
-    if (cameraLiveRunning_)
-    {
-        appendLog(QStringLiteral("Kinetix Live is running; closing it before CT acquisition and will restore it afterwards."));
-        stopCameraLivePreview(false);
-    }
     const QString savePath = ctSavePathEdit_->text().trimmed();
     if (savePath.isEmpty())
     {
         appendLog(QStringLiteral("CT acquisition failed: Save Path is empty."));
+        return;
+    }
+    const bool requestedFlyMode = ctModeTabs_ && ctModeTabs_->currentIndex() == 1;
+    if (requestedFlyMode && directoryHasAnyEntries(savePath))
+    {
+        appendLog(QStringLiteral("CT acquisition failed: FlyScan Save Path must be empty or absent before the production test: %1").arg(savePath));
         return;
     }
     QDir().mkpath(savePath);
@@ -2367,11 +3016,12 @@ void MainWindow::startCtAcquisition()
         appendLog(QStringLiteral("CT acquisition failed: R/Y axes are unavailable."));
         return;
     }
+    updateCtFlyDerivedParams();
 
     const MotorAxisUi& rAxis = motorAxes_[QStringLiteral("R")];
     const MotorAxisUi& yAxis = motorAxes_[QStringLiteral("Y")];
     ctSettings_ = {};
-    ctSettings_.mode = (ctModeTabs_ && ctModeTabs_->currentIndex() == 1)
+    ctSettings_.mode = requestedFlyMode
         ? CtAcquisitionMode::FlyScan
         : CtAcquisitionMode::StepAndShoot;
     ctSettings_.savePath = savePath;
@@ -2380,8 +3030,10 @@ void MainWindow::startCtAcquisition()
     ctSettings_.flatGap = ctFlatGapSpin_->value();
     ctSettings_.flatMoveDistanceUm = ctFlatMoveSpin_->value();
     ctSettings_.flatCount = ctFlatNumSpin_->value();
-    ctSettings_.flySpeedDegPerSec = ctFlySpeedSpin_ ? ctFlySpeedSpin_->value() : 1.0;
-    ctSettings_.flyLeadAngleDeg = ctFlyLeadAngleSpin_ ? ctFlyLeadAngleSpin_->value() : 2.0;
+    ctSettings_.flySpeedDegPerSec = std::max(1e-6, ctFlyDerivedSpeedDegPerSec_);
+    ctSettings_.flyLeadAngleDeg = std::max(0.0, ctFlyDerivedLeadAngleDeg_);
+    ctSettings_.flyFrameIntervalMs = ctFlyDerivedFrameIntervalMs_;
+    ctSettings_.flyScanTimeS = ctFlyDerivedScanTimeS_;
     ctSettings_.autoCor = ctAutoCorCheck_->isChecked();
     if (ctSettings_.mode == CtAcquisitionMode::FlyScan)
     {
@@ -2405,6 +3057,35 @@ void MainWindow::startCtAcquisition()
     ctSettings_.camera.enqueueFrames = false;
     ctSettings_.camera.outputDir = savePath;
     ctSettings_.camera.previewIntervalMs = 0;
+    ctSettings_.camera.frameIntervalMs = ctSettings_.mode == CtAcquisitionMode::FlyScan
+        ? ctSettings_.flyFrameIntervalMs
+        : 0.0;
+    ctSettings_.camera.firstKeepDelayMs = ctSettings_.mode == CtAcquisitionMode::FlyScan
+        ? ctFlyFirstKeepDelayMs_
+        : 0.0;
+    ctSettings_.camera.allowFrameIntervalDecimation = ctSettings_.mode == CtAcquisitionMode::FlyScan;
+    if (ctSettings_.mode == CtAcquisitionMode::FlyScan)
+    {
+        const double exposureMs = std::max(0.001, exposureMsFromSettings(ctSettings_.camera));
+        const double minFrameIntervalMs = exposureMs * 1.05;
+        const int maxProjectionCount = ctSettings_.flyScanTimeS > 0.0
+            ? static_cast<int>(std::floor((ctSettings_.flyScanTimeS * 1000.0) / minFrameIntervalMs))
+            : 0;
+        if (ctSettings_.flySpeedDegPerSec <= 0.0 || ctSettings_.flyScanTimeS <= 0.0 || ctSettings_.flyFrameIntervalMs <= 0.0)
+        {
+            appendLog(QStringLiteral("CT acquisition failed: FlyScan derived parameters are invalid. Check ROI, exposure, edge blur, and Projection Num."));
+            return;
+        }
+        if (ctSettings_.flyFrameIntervalMs < minFrameIntervalMs)
+        {
+            appendLog(QStringLiteral("CT acquisition failed: FlyScan frame interval %1 ms is shorter than exposure guard %2 ms (exposure %3 ms). Reduce Projection Num to <= %4, reduce exposure, or increase Edge Blur.")
+                .arg(ctSettings_.flyFrameIntervalMs, 0, 'f', 4)
+                .arg(minFrameIntervalMs, 0, 'f', 4)
+                .arg(exposureMs, 0, 'f', 4)
+                .arg(std::max(0, maxProjectionCount)));
+            return;
+        }
+    }
     ctSettings_.reconConfig = configFromUi();
     if (ctSettings_.reconConfig.io.reconMethod == ReconMethod::RealTimeFBP)
     {
@@ -2457,6 +3138,13 @@ void MainWindow::startCtAcquisition()
         return;
     }
 
+    ctRestoreLiveAfterFinish_ = cameraLiveRunning_;
+    if (cameraLiveRunning_)
+    {
+        appendLog(QStringLiteral("Kinetix Live is running; closing it before CT acquisition and will restore it afterwards."));
+        stopCameraLivePreview(false);
+    }
+
     ctManifestPath_ = QDir(savePath).filePath(QStringLiteral("scan_manifest.json"));
     ctFlatGroups_.clear();
     ctFlyFrames_.clear();
@@ -2485,6 +3173,8 @@ void MainWindow::startCtAcquisition()
     ctFlyFlatStage_ = 0;
     ctFlyContinuousFramesReceived_ = 0;
     ctFlyRawFramePlan_ = 0;
+    ctFlyDerivedScanTimeS_ = ctSettings_.flyScanTimeS;
+    ctFlyDerivedFrameIntervalMs_ = ctSettings_.flyFrameIntervalMs;
     ctFlyScanStartedMs_ = 0;
     ctFlyScanFinishedMs_ = 0;
     ctPendingMotorAction_.clear();
@@ -2509,11 +3199,21 @@ void MainWindow::startCtAcquisition()
     ctYMoveCount_ = 0;
     ctFrameBatchCount_ = 0;
     ctFrameSavedCount_ = 0;
+    ctMotorSpeedTablesReady_ = false;
+    ctMotorSpeedSetupStage_ = 0;
+    ctIdlePollingPausedForCt_ = false;
+    ctEstimatedTotalFrames_ = estimateCtTotalFrames();
+    ctEstimatedTotalSeconds_ = estimateCtAcquisitionSeconds(ctEstimatedTotalFrames_);
     ctRunning_ = true;
 
     ctStartButton_->setEnabled(false);
     ctStopButton_->setEnabled(true);
     ctStatusLabel_->setText(QStringLiteral("Running"));
+    if (ctProgressTimer_)
+    {
+        ctProgressTimer_->start();
+    }
+    updateCtProgressUi();
     cameraSnapButton_->setEnabled(false);
     cameraLiveButton_->setEnabled(false);
     cameraApplyRoiButton_->setEnabled(false);
@@ -2533,8 +3233,7 @@ void MainWindow::startCtAcquisition()
     ctFlatNumSpin_->setEnabled(false);
     ctAutoCorCheck_->setEnabled(false);
     ctTiffThreadsSpin_->setEnabled(false);
-    if (ctFlySpeedSpin_) { ctFlySpeedSpin_->setEnabled(false); }
-    if (ctFlyLeadAngleSpin_) { ctFlyLeadAngleSpin_->setEnabled(false); }
+    if (ctFlyAllowedBlurSpin_) { ctFlyAllowedBlurSpin_->setEnabled(false); }
     currentCameraPreviewWindow_ = {};
     cameraPreviewFrameCount_ = 0;
     lastCameraPreviewRenderMs_ = 0;
@@ -2575,10 +3274,11 @@ void MainWindow::startCtAcquisition()
         .arg(ctWriterQueueCapacity_)
         .arg(static_cast<double>(ctWriterFrameBytes_) / (1024.0 * 1024.0), 0, 'f', 2)
         .arg(capacityGiB, 0, 'f', 1));
+    appendLog(QStringLiteral("CT estimate: frames=%1, total=%2.")
+        .arg(ctEstimatedTotalFrames_)
+        .arg(formatDurationSeconds(ctEstimatedTotalSeconds_)));
     writeCtManifest(false, QStringLiteral("CT acquisition running."));
-    ctPreparedStartedMs_ = QDateTime::currentMSecsSinceEpoch();
-    QMetaObject::invokeMethod(cameraWorker_, "beginPreparedCapture", Qt::QueuedConnection,
-        Q_ARG(ct::PvcamCaptureSettings, ctSettings_.camera));
+    startCtMotorSpeedTableSetup();
 }
 
 void MainWindow::stopCtAcquisition()
@@ -2663,8 +3363,10 @@ void MainWindow::maybeStartCtSmokeAutostart()
     }
 
     const QString savePath = qEnvironmentVariable("CT_SMOKE_SAVE_PATH",
-        QDir(QStringLiteral("E:/2026_Chun/2026_06_09")).filePath(
-            QStringLiteral("ct_acq_smoke_%1").arg(QDateTime::currentDateTime().toString(QStringLiteral("yyyyMMdd_HHmmss")))));
+        qEnvironmentVariable("CT_SMOKE_MODE").compare(QStringLiteral("fly"), Qt::CaseInsensitive) == 0
+            ? QStringLiteral("F:/ShiZhan_Stack1")
+            : QDir(QStringLiteral("E:/2026_Chun/2026_06_09")).filePath(
+                QStringLiteral("ct_acq_smoke_%1").arg(QDateTime::currentDateTime().toString(QStringLiteral("yyyyMMdd_HHmmss")))));
     writeStartupTrace(QStringLiteral("CT smoke save path len=%1 native=%2")
         .arg(savePath.size())
         .arg(QDir::fromNativeSeparators(savePath)));
@@ -2697,27 +3399,20 @@ void MainWindow::maybeStartCtSmokeAutostart()
             ? qEnvironmentVariableIntValue("CT_SMOKE_FLAT_GAP")
             : 2);
     ctFlatMoveSpin_->setValue(qEnvironmentVariable("CT_SMOKE_FLAT_MOVE_UM").isEmpty()
-            ? 10.0
+            ? (qEnvironmentVariable("CT_SMOKE_MODE").compare(QStringLiteral("fly"), Qt::CaseInsensitive) == 0 ? 10000.0 : 10.0)
             : qEnvironmentVariable("CT_SMOKE_FLAT_MOVE_UM").toDouble());
     ctFlatNumSpin_->setValue(qEnvironmentVariableIntValue("CT_SMOKE_FLAT_NUM") > 0
             ? qEnvironmentVariableIntValue("CT_SMOKE_FLAT_NUM")
-            : 1);
+            : (qEnvironmentVariable("CT_SMOKE_MODE").compare(QStringLiteral("fly"), Qt::CaseInsensitive) == 0 ? 2 : 1));
     ctAutoCorCheck_->setChecked(true);
     ctTiffThreadsSpin_->setValue(qEnvironmentVariableIntValue("CT_SMOKE_TIFF_THREADS") > 0
             ? qEnvironmentVariableIntValue("CT_SMOKE_TIFF_THREADS")
             : 4);
-    if (ctFlySpeedSpin_)
+    if (ctFlyAllowedBlurSpin_ && !qEnvironmentVariable("CT_SMOKE_FLY_BLUR_PX").isEmpty())
     {
-        ctFlySpeedSpin_->setValue(qEnvironmentVariable("CT_SMOKE_FLY_SPEED").isEmpty()
-                ? 1.0
-                : qEnvironmentVariable("CT_SMOKE_FLY_SPEED").toDouble());
+        ctFlyAllowedBlurSpin_->setValue(qEnvironmentVariable("CT_SMOKE_FLY_BLUR_PX").toDouble());
     }
-    if (ctFlyLeadAngleSpin_)
-    {
-        ctFlyLeadAngleSpin_->setValue(qEnvironmentVariable("CT_SMOKE_FLY_LEAD").isEmpty()
-                ? 2.0
-                : qEnvironmentVariable("CT_SMOKE_FLY_LEAD").toDouble());
-    }
+    updateCtFlyDerivedParams();
 
     correctionModeCombo_->setCurrentText(toString(CorrectionMode::Flat));
     reconMethodCombo_->setCurrentText(toString(ReconMethod::OfflineFBP));
@@ -2970,12 +3665,19 @@ void MainWindow::startInternalCtReplay()
     ctYMoveCount_ = 0;
     ctFrameBatchCount_ = 0;
     ctFrameSavedCount_ = 0;
+    ctEstimatedTotalFrames_ = estimateCtTotalFrames();
+    ctEstimatedTotalSeconds_ = estimateCtAcquisitionSeconds(ctEstimatedTotalFrames_);
 
     QDir().mkpath(targetProjectionDir);
     QDir().mkpath(targetOutputDir);
     ctStartButton_->setEnabled(false);
     ctStopButton_->setEnabled(true);
     ctStatusLabel_->setText(QStringLiteral("Replay"));
+    if (ctProgressTimer_)
+    {
+        ctProgressTimer_->start();
+    }
+    updateCtProgressUi();
     cameraSnapButton_->setEnabled(false);
     cameraLiveButton_->setEnabled(false);
     cameraApplyRoiButton_->setEnabled(false);
@@ -3058,6 +3760,7 @@ void MainWindow::handleReplayCtFrame(const CameraFrame& frame, const QString& fi
     ctFrameEnqueueMs_ += std::max<qint64>(0, QDateTime::currentMSecsSinceEpoch() - enqueueStartedMs);
     ctLastFrameEnqueuedMs_ = QDateTime::currentMSecsSinceEpoch();
     ++ctFrameSavedCount_;
+    updateCtProgressUi();
     if (isCor180)
     {
         ctStatusLabel_->setText(QStringLiteral("Replay COR 180"));
@@ -3111,14 +3814,12 @@ void MainWindow::startCtInitialMotorMove()
     const double firstTargetAngle = ctSettings_.autoCor
         ? ctSettings_.beginningAngleDeg + 180.0
         : ctSettings_.beginningAngleDeg;
-    startCtMotorTiming(ctPendingMotorAction_);
-    QMetaObject::invokeMethod(kohzuController_, "moveAbsolutePulse", Qt::QueuedConnection,
-        Q_ARG(int, ctSettings_.rAxis),
-        Q_ARG(qint64, static_cast<qint64>(std::llround(firstTargetAngle * ctSettings_.rPulsePerDeg))),
-        Q_ARG(int, 0),
-        Q_ARG(QString, ctSettings_.autoCor
+    moveCtAxisAbsolute(QStringLiteral("R"),
+        firstTargetAngle,
+        ctPendingMotorAction_,
+        ctSettings_.autoCor
             ? QStringLiteral("CT R COR 180 %1 deg").arg(firstTargetAngle, 0, 'f', 4)
-            : QStringLiteral("CT R start %1 deg").arg(firstTargetAngle, 0, 'f', 4)));
+            : QStringLiteral("CT R start %1 deg").arg(firstTargetAngle, 0, 'f', 4));
 }
 
 void MainWindow::startCtFlyInitialMove()
@@ -3133,14 +3834,12 @@ void MainWindow::startCtFlyInitialMove()
     const double firstTargetAngle = ctSettings_.autoCor
         ? ctSettings_.beginningAngleDeg + 180.0
         : ctSettings_.beginningAngleDeg;
-    startCtMotorTiming(ctPendingMotorAction_);
-    QMetaObject::invokeMethod(kohzuController_, "moveAbsolutePulse", Qt::QueuedConnection,
-        Q_ARG(int, ctSettings_.rAxis),
-        Q_ARG(qint64, static_cast<qint64>(std::llround(firstTargetAngle * ctSettings_.rPulsePerDeg))),
-        Q_ARG(int, 0),
-        Q_ARG(QString, ctSettings_.autoCor
+    moveCtAxisAbsolute(QStringLiteral("R"),
+        firstTargetAngle,
+        ctPendingMotorAction_,
+        ctSettings_.autoCor
             ? QStringLiteral("CT Fly R COR 180 %1 deg").arg(firstTargetAngle, 0, 'f', 4)
-            : QStringLiteral("CT Fly R start %1 deg").arg(firstTargetAngle, 0, 'f', 4)));
+            : QStringLiteral("CT Fly R start %1 deg").arg(firstTargetAngle, 0, 'f', 4));
 }
 
 void MainWindow::advanceCtFlyAcquisition()
@@ -3167,14 +3866,11 @@ void MainWindow::advanceCtFlyAcquisition()
     }
     if (ctYIsOutForFlat_)
     {
-        const qint64 pulse = static_cast<qint64>(std::llround(-ctSettings_.flatMoveDistanceUm * ctSettings_.yPulsePerUm));
-        if (pulse != 0)
+        if (moveCtAxisRelative(QStringLiteral("Y"),
+            -ctSettings_.flatMoveDistanceUm,
+            QStringLiteral("flat_return"),
+            QStringLiteral("CT Fly Y return")))
         {
-            ctWaitingForMotor_ = true;
-            ctPendingMotorAction_ = QStringLiteral("flat_return");
-            startCtMotorTiming(ctPendingMotorAction_);
-            QMetaObject::invokeMethod(kohzuController_, "jogRelativePulse", Qt::QueuedConnection,
-                Q_ARG(int, ctSettings_.yAxis), Q_ARG(qint64, pulse), Q_ARG(int, 0), Q_ARG(QString, QStringLiteral("CT Fly Y return")));
             return;
         }
         ctYIsOutForFlat_ = false;
@@ -3204,14 +3900,11 @@ void MainWindow::advanceCtFlyAcquisition()
         group.flatCount = ctSettings_.flatCount;
         group.yMoveUm = ctSettings_.flatMoveDistanceUm;
         ctFlatGroups_.append(group);
-        const qint64 pulse = static_cast<qint64>(std::llround(ctSettings_.flatMoveDistanceUm * ctSettings_.yPulsePerUm));
-        if (pulse != 0)
+        if (moveCtAxisRelative(QStringLiteral("Y"),
+            ctSettings_.flatMoveDistanceUm,
+            QStringLiteral("flat_out"),
+            QStringLiteral("CT Fly Y flat out")))
         {
-            ctWaitingForMotor_ = true;
-            ctPendingMotorAction_ = QStringLiteral("flat_out");
-            startCtMotorTiming(ctPendingMotorAction_);
-            QMetaObject::invokeMethod(kohzuController_, "jogRelativePulse", Qt::QueuedConnection,
-                Q_ARG(int, ctSettings_.yAxis), Q_ARG(qint64, pulse), Q_ARG(int, 0), Q_ARG(QString, QStringLiteral("CT Fly Y flat out")));
             return;
         }
         ctYIsOutForFlat_ = true;
@@ -3221,15 +3914,14 @@ void MainWindow::advanceCtFlyAcquisition()
 
     if (!ctFlyScanRequested_)
     {
-        ctWaitingForMotor_ = true;
-        ctPendingMotorAction_ = QStringLiteral("r_fly_start");
         const double leadStart = ctSettings_.beginningAngleDeg - ctSettings_.flyLeadAngleDeg;
-        startCtMotorTiming(ctPendingMotorAction_);
-        QMetaObject::invokeMethod(kohzuController_, "moveAbsolutePulse", Qt::QueuedConnection,
-            Q_ARG(int, ctSettings_.rAxis),
-            Q_ARG(qint64, static_cast<qint64>(std::llround(leadStart * ctSettings_.rPulsePerDeg))),
-            Q_ARG(int, 0),
-            Q_ARG(QString, QStringLiteral("CT Fly R lead start %1 deg").arg(leadStart, 0, 'f', 4)));
+        if (!moveCtAxisAbsolute(QStringLiteral("R"),
+            leadStart,
+            QStringLiteral("r_fly_start"),
+            QStringLiteral("CT Fly R lead start %1 deg").arg(leadStart, 0, 'f', 4)))
+        {
+            return;
+        }
         ctFlyScanRequested_ = true;
         return;
     }
@@ -3261,44 +3953,46 @@ void MainWindow::startCtFlyScanMove()
     ctFlyScanStartedMs_ = QDateTime::currentMSecsSinceEpoch();
     ctStatusLabel_->setText(QStringLiteral("Fly Tomo 0/%1").arg(ctSettings_.projectionCount));
 
-    const double exposureIntervalMs = std::max(0.001, exposureMsFromSettings(ctSettings_.camera));
-    const double scanRangeDeg = 180.0 + 2.0 * std::max(0.0, ctSettings_.flyLeadAngleDeg);
-    const double speedDegPerMs = std::max(1e-9, ctSettings_.flySpeedDegPerSec) / 1000.0;
-    const int rawFrameCount = std::max(ctSettings_.projectionCount,
-        static_cast<int>(std::ceil((scanRangeDeg / speedDegPerMs) / exposureIntervalMs)) + 8);
-    ctFlyRawFramePlan_ = rawFrameCount;
-    QVector<int> selectedFrames;
-    selectedFrames.reserve(ctSettings_.projectionCount);
-    int lastSelected = -1;
-    const double angleStep = 180.0 / static_cast<double>(std::max(1, ctSettings_.projectionCount));
-    for (int i = 0; i < ctSettings_.projectionCount; ++i)
+    const double exposureMs = std::max(0.001, exposureMsFromSettings(ctSettings_.camera));
+    const double minFrameIntervalMs = exposureMs * 1.05;
+    if (ctSettings_.flyFrameIntervalMs < minFrameIntervalMs)
     {
-        const double relativeAngle = ctSettings_.flyLeadAngleDeg + static_cast<double>(i) * angleStep;
-        const int rawIndex = static_cast<int>(std::llround((relativeAngle / speedDegPerMs) / exposureIntervalMs));
-        if (rawIndex <= lastSelected)
-        {
-            finishCtAcquisition(false, QStringLiteral("CT fly settings are too fast for exposure interval; duplicate selected raw frame at projection %1. Reduce Fly Speed or exposure.").arg(i));
-            return;
-        }
-        selectedFrames.append(std::clamp(rawIndex, 0, rawFrameCount - 1));
-        lastSelected = rawIndex;
+        finishCtAcquisition(false, QStringLiteral("CT fly frame interval %1 ms must be at least exposure guard %2 ms (exposure %3 ms).")
+            .arg(ctSettings_.flyFrameIntervalMs, 0, 'f', 4)
+            .arg(minFrameIntervalMs, 0, 'f', 4)
+            .arg(exposureMs, 0, 'f', 4));
+        return;
     }
 
     PvcamCaptureSettings flySettings = ctSettings_.camera;
-    flySettings.frameCount = rawFrameCount;
+    flySettings.frameCount = ctSettings_.projectionCount;
     flySettings.queueCapacity = std::clamp(ctSettings_.projectionCount, 4, 256);
     flySettings.previewIntervalMs = 0;
-    flySettings.selectedFrameIndices = selectedFrames;
+    flySettings.selectedFrameIndices.clear();
+    flySettings.frameIntervalMs = ctSettings_.flyFrameIntervalMs;
+    flySettings.firstKeepDelayMs = ctFlyFirstKeepDelayMs_;
+    flySettings.allowFrameIntervalDecimation = true;
+    flySettings.rawFrameLimit = 0;
+    ctFlyRawFramePlan_ = ctSettings_.flyFrameIntervalMs > 0.0
+        ? std::max(0, static_cast<int>(std::ceil(
+            (ctFlyFirstKeepDelayMs_
+                + ctSettings_.flyFrameIntervalMs * static_cast<double>(ctSettings_.projectionCount))
+            / ctSettings_.flyFrameIntervalMs)))
+        : 0;
     ctCurrentFrameBatchStartedMs_ = QDateTime::currentMSecsSinceEpoch();
     QMetaObject::invokeMethod(cameraWorker_, "endPreparedCapture", Qt::QueuedConnection);
     QMetaObject::invokeMethod(cameraWorker_, "startContinuousCapture", Qt::QueuedConnection,
         Q_ARG(ct::PvcamCaptureSettings, flySettings));
 
-    appendLog(QStringLiteral("CT fly scan camera arming: speed=%1 deg/s, raw frames=%2, kept projections=%3, exposure interval=%4 ms.")
+    appendLog(QStringLiteral("CT fly scan camera arming: speed=%1 deg/s, projections=%2, exposure=%3 ms, frame interval=%4 ms, scan time=%5 s, lead=%6 deg, first keep delay=%7 ms, time-gated raw estimate=%8.")
         .arg(ctSettings_.flySpeedDegPerSec, 0, 'f', 4)
-        .arg(rawFrameCount)
         .arg(ctSettings_.projectionCount)
-        .arg(exposureIntervalMs, 0, 'f', 4));
+        .arg(exposureMs, 0, 'f', 4)
+        .arg(ctSettings_.flyFrameIntervalMs, 0, 'f', 4)
+        .arg(ctSettings_.flyScanTimeS, 0, 'f', 3)
+        .arg(ctSettings_.flyLeadAngleDeg, 0, 'f', 4)
+        .arg(ctFlyFirstKeepDelayMs_, 0, 'f', 3)
+        .arg(ctFlyRawFramePlan_));
 }
 
 void MainWindow::startCtFlyScanMotorSweep()
@@ -3316,47 +4010,127 @@ void MainWindow::startCtFlyScanMotorSweep()
         rAxisUi = &(*rIt);
     }
     const double rBaseSpeed = rAxisUi && rAxisUi->baseSpeedSpin
-        ? std::min(rAxisUi->baseSpeedSpin->value(), ctSettings_.flySpeedDegPerSec)
-        : std::min(2.0, ctSettings_.flySpeedDegPerSec);
-    const double rAccel = rAxisUi && rAxisUi->accelSpin
+        ? std::min(rAxisUi->baseSpeedSpin->value(), ctSettings_.flySpeedDegPerSec * 0.5)
+        : std::min(1.0, ctSettings_.flySpeedDegPerSec * 0.5);
+    const double rAccelTimeSec = rAxisUi && rAxisUi->accelSpin
         ? rAxisUi->accelSpin->value()
         : 1.5;
-    const int startSpeedPps = static_cast<int>(std::clamp(
-        std::llround(std::max(1e-6, rBaseSpeed) * ctSettings_.rPulsePerDeg),
-        1LL,
-        2500000LL));
-    const int topSpeedPps = static_cast<int>(std::clamp(
-        std::llround(std::max(1e-6, ctSettings_.flySpeedDegPerSec) * ctSettings_.rPulsePerDeg),
-        2LL,
-        5000000LL));
-    const double accelTimeSec = std::max(0.01, (ctSettings_.flySpeedDegPerSec - rBaseSpeed) / std::max(1e-6, rAccel));
-    const int accelTime10ms = static_cast<int>(std::clamp(std::llround(accelTimeSec * 100.0), 1LL, 10000LL));
-    const int decelTime10ms = accelTime10ms;
-    const int accelPattern = 2;
+    const MotorSpeedTableParams speedParams = makeMotorSpeedTableParams(
+        QStringLiteral("CT Fly R"),
+        speedTable,
+        ctSettings_.rPulsePerDeg,
+        QStringLiteral("deg"),
+        rBaseSpeed,
+        ctSettings_.flySpeedDegPerSec,
+        rAccelTimeSec);
     ctWaitingForMotor_ = true;
     ctPendingMotorAction_ = QStringLiteral("r_fly_scan");
     startCtMotorTiming(ctPendingMotorAction_);
-    appendLog(QStringLiteral("CT fly scan motor sweep started: R %1 -> %2 deg, speed table=%3, speed=%4 deg/s (%5 pps), base=%6 deg/s (%7 pps), accel=%8 deg/s^2, accel time=%9 ms.")
+    appendLog(QStringLiteral("CT fly scan motor sweep started: R %1 -> %2 deg; %3.")
         .arg(ctSettings_.beginningAngleDeg - ctSettings_.flyLeadAngleDeg, 0, 'f', 4)
         .arg(flyEnd, 0, 'f', 4)
-        .arg(speedTable)
-        .arg(ctSettings_.flySpeedDegPerSec, 0, 'f', 4)
-        .arg(topSpeedPps)
-        .arg(rBaseSpeed, 0, 'f', 4)
-        .arg(startSpeedPps)
-        .arg(rAccel, 0, 'f', 4)
-        .arg(accelTime10ms * 10));
+        .arg(speedParams.summary));
     QMetaObject::invokeMethod(kohzuController_, "configureSpeedTableAndMoveAbsolute", Qt::QueuedConnection,
         Q_ARG(int, ctSettings_.rAxis),
         Q_ARG(qint64, static_cast<qint64>(std::llround(flyEnd * ctSettings_.rPulsePerDeg))),
-        Q_ARG(int, speedTable),
-        Q_ARG(int, startSpeedPps),
-        Q_ARG(int, topSpeedPps),
-        Q_ARG(int, accelTime10ms),
-        Q_ARG(int, decelTime10ms),
-        Q_ARG(int, accelPattern),
-        Q_ARG(QString, QStringLiteral("CT Fly R speed table %1").arg(speedTable)),
+        Q_ARG(int, speedParams.speedTable),
+        Q_ARG(int, speedParams.startSpeedPps),
+        Q_ARG(int, speedParams.topSpeedPps),
+        Q_ARG(int, speedParams.accelTime10ms),
+        Q_ARG(int, speedParams.decelTime10ms),
+        Q_ARG(int, speedParams.accelPattern),
+        Q_ARG(QString, speedParams.summary),
         Q_ARG(QString, QStringLiteral("CT Fly R scan to %1 deg").arg(flyEnd, 0, 'f', 4)));
+}
+
+void MainWindow::startCtMotorSpeedTableSetup()
+{
+    if (!ctRunning_ || ctReplayRunning_)
+    {
+        return;
+    }
+    if (!kohzuController_ || !motorConnected_)
+    {
+        finishCtAcquisition(false, QStringLiteral("CT motor speed table setup failed: Kohzu is not connected."));
+        return;
+    }
+    ctMotorSpeedTablesReady_ = false;
+    ctMotorSpeedSetupStage_ = 0;
+    if (!ctIdlePollingPausedForCt_)
+    {
+        ctIdlePollingPausedForCt_ = true;
+        QMetaObject::invokeMethod(kohzuController_, "setIdlePollingEnabled", Qt::QueuedConnection,
+            Q_ARG(bool, false));
+    }
+    appendLog(QStringLiteral("CT motor setup: preloading R/Y speed table %1 once for this acquisition.").arg(kCtStepSpeedTable));
+    sendNextCtMotorSpeedTableSetup();
+}
+
+void MainWindow::sendNextCtMotorSpeedTableSetup()
+{
+    if (!ctRunning_ || ctReplayRunning_)
+    {
+        return;
+    }
+    if (!kohzuController_ || !motorConnected_)
+    {
+        finishCtAcquisition(false, QStringLiteral("CT motor speed table setup failed: Kohzu is not connected."));
+        return;
+    }
+
+    QString axisName;
+    if (ctMotorSpeedSetupStage_ == 0)
+    {
+        axisName = QStringLiteral("R");
+    }
+    else if (ctMotorSpeedSetupStage_ == 1)
+    {
+        axisName = QStringLiteral("Y");
+    }
+    else
+    {
+        finishCtMotorSpeedTableSetup();
+        return;
+    }
+
+    auto it = motorAxes_.find(axisName);
+    if (it == motorAxes_.end())
+    {
+        finishCtAcquisition(false, QStringLiteral("CT motor speed table setup failed: axis %1 is not configured.").arg(axisName));
+        return;
+    }
+
+    const MotorSpeedTableParams speedParams = makeMotorSpeedTableParams(
+        QStringLiteral("CT %1").arg(axisName),
+        kCtStepSpeedTable,
+        it->pulsePerUnit,
+        it->unit,
+        it->baseSpeedSpin ? it->baseSpeedSpin->value() : 1.0,
+        it->speedSpin ? it->speedSpin->value() : 2.0,
+        it->accelSpin ? it->accelSpin->value() : 0.5);
+    ++ctMotorSpeedSetupStage_;
+    QMetaObject::invokeMethod(kohzuController_, "configureSpeedTable", Qt::QueuedConnection,
+        Q_ARG(int, it->axis),
+        Q_ARG(int, speedParams.speedTable),
+        Q_ARG(int, speedParams.startSpeedPps),
+        Q_ARG(int, speedParams.topSpeedPps),
+        Q_ARG(int, speedParams.accelTime10ms),
+        Q_ARG(int, speedParams.decelTime10ms),
+        Q_ARG(int, speedParams.accelPattern),
+        Q_ARG(QString, QStringLiteral("CT speed table %1").arg(axisName)));
+}
+
+void MainWindow::finishCtMotorSpeedTableSetup()
+{
+    if (!ctRunning_ || ctReplayRunning_)
+    {
+        return;
+    }
+    ctMotorSpeedTablesReady_ = true;
+    appendLog(QStringLiteral("CT motor setup: R/Y speed tables ready; starting Kinetix prepared capture."));
+    ctPreparedStartedMs_ = QDateTime::currentMSecsSinceEpoch();
+    QMetaObject::invokeMethod(cameraWorker_, "beginPreparedCapture", Qt::QueuedConnection,
+        Q_ARG(ct::PvcamCaptureSettings, ctSettings_.camera));
 }
 
 void MainWindow::startCtMotorTiming(const QString& action)
@@ -3387,6 +4161,76 @@ void MainWindow::finishCtMotorTiming(const QString& action)
     }
 }
 
+bool MainWindow::moveCtAxisAbsolute(const QString& axisName, double targetValue, const QString& action, const QString& label)
+{
+    auto it = motorAxes_.find(axisName);
+    if (it == motorAxes_.end())
+    {
+        finishCtAcquisition(false, QStringLiteral("CT motor move failed: axis %1 is not configured.").arg(axisName));
+        return false;
+    }
+    if (!motorConnected_ || !kohzuController_)
+    {
+        finishCtAcquisition(false, QStringLiteral("CT motor move failed: Kohzu is not connected."));
+        return false;
+    }
+    if (!ctMotorSpeedTablesReady_)
+    {
+        finishCtAcquisition(false, QStringLiteral("CT motor move failed: R/Y speed tables are not ready."));
+        return false;
+    }
+
+    const qint64 pulse = static_cast<qint64>(std::llround(targetValue * it->pulsePerUnit));
+
+    ctWaitingForMotor_ = true;
+    ctPendingMotorAction_ = action;
+    startCtMotorTiming(action);
+    appendLog(label);
+    QMetaObject::invokeMethod(kohzuController_, "moveAbsolutePulse", Qt::QueuedConnection,
+        Q_ARG(int, it->axis),
+        Q_ARG(qint64, pulse),
+        Q_ARG(int, kCtStepSpeedTable),
+        Q_ARG(QString, label));
+    return true;
+}
+
+bool MainWindow::moveCtAxisRelative(const QString& axisName, double deltaValue, const QString& action, const QString& label)
+{
+    auto it = motorAxes_.find(axisName);
+    if (it == motorAxes_.end())
+    {
+        finishCtAcquisition(false, QStringLiteral("CT motor move failed: axis %1 is not configured.").arg(axisName));
+        return false;
+    }
+    if (!motorConnected_ || !kohzuController_)
+    {
+        finishCtAcquisition(false, QStringLiteral("CT motor move failed: Kohzu is not connected."));
+        return false;
+    }
+    if (!ctMotorSpeedTablesReady_)
+    {
+        finishCtAcquisition(false, QStringLiteral("CT motor move failed: R/Y speed tables are not ready."));
+        return false;
+    }
+
+    const qint64 pulse = static_cast<qint64>(std::llround(deltaValue * it->pulsePerUnit));
+    if (pulse == 0)
+    {
+        return false;
+    }
+
+    ctWaitingForMotor_ = true;
+    ctPendingMotorAction_ = action;
+    startCtMotorTiming(action);
+    appendLog(label);
+    QMetaObject::invokeMethod(kohzuController_, "jogRelativePulse", Qt::QueuedConnection,
+        Q_ARG(int, it->axis),
+        Q_ARG(qint64, pulse),
+        Q_ARG(int, kCtStepSpeedTable),
+        Q_ARG(QString, label));
+    return true;
+}
+
 void MainWindow::advanceCtAcquisition()
 {
     if (!ctRunning_ || ctWaitingForFrame_ || ctWaitingForCaptureFinish_ || ctWaitingForMotor_)
@@ -3403,14 +4247,11 @@ void MainWindow::advanceCtAcquisition()
         ctProjectionNeedsMove_ = false;
         const double nextAngle = ctSettings_.beginningAngleDeg
             + (static_cast<double>(ctProjectionIndex_) * 180.0 / static_cast<double>(std::max(1, ctSettings_.projectionCount)));
-        const qint64 pulse = static_cast<qint64>(std::llround(nextAngle * ctSettings_.rPulsePerDeg));
         ctCurrentAngleDeg_ = nextAngle;
-        ctWaitingForMotor_ = true;
-        ctPendingMotorAction_ = QStringLiteral("r_move");
-        startCtMotorTiming(ctPendingMotorAction_);
-        QMetaObject::invokeMethod(kohzuController_, "moveAbsolutePulse", Qt::QueuedConnection,
-            Q_ARG(int, ctSettings_.rAxis), Q_ARG(qint64, pulse), Q_ARG(int, 0),
-            Q_ARG(QString, QStringLiteral("CT R to %1 deg").arg(nextAngle, 0, 'f', 4)));
+        moveCtAxisAbsolute(QStringLiteral("R"),
+            nextAngle,
+            QStringLiteral("r_move"),
+            QStringLiteral("CT R to %1 deg").arg(nextAngle, 0, 'f', 4));
         return;
     }
     if (ctStopRequested_)
@@ -3425,14 +4266,11 @@ void MainWindow::advanceCtAcquisition()
     }
     if (ctYIsOutForFlat_)
     {
-        const qint64 pulse = static_cast<qint64>(std::llround(-ctSettings_.flatMoveDistanceUm * ctSettings_.yPulsePerUm));
-        if (pulse != 0)
+        if (moveCtAxisRelative(QStringLiteral("Y"),
+            -ctSettings_.flatMoveDistanceUm,
+            QStringLiteral("flat_return"),
+            QStringLiteral("CT Y return")))
         {
-            ctWaitingForMotor_ = true;
-            ctPendingMotorAction_ = QStringLiteral("flat_return");
-            startCtMotorTiming(ctPendingMotorAction_);
-            QMetaObject::invokeMethod(kohzuController_, "jogRelativePulse", Qt::QueuedConnection,
-                Q_ARG(int, ctSettings_.yAxis), Q_ARG(qint64, pulse), Q_ARG(int, 0), Q_ARG(QString, QStringLiteral("CT Y return")));
             return;
         }
         ctYIsOutForFlat_ = false;
@@ -3461,14 +4299,11 @@ void MainWindow::advanceCtAcquisition()
         group.flatCount = ctSettings_.flatCount;
         group.yMoveUm = ctSettings_.flatMoveDistanceUm;
         ctFlatGroups_.append(group);
-        const qint64 pulse = static_cast<qint64>(std::llround(ctSettings_.flatMoveDistanceUm * ctSettings_.yPulsePerUm));
-        if (pulse != 0)
+        if (moveCtAxisRelative(QStringLiteral("Y"),
+            ctSettings_.flatMoveDistanceUm,
+            QStringLiteral("flat_out"),
+            QStringLiteral("CT Y flat out")))
         {
-            ctWaitingForMotor_ = true;
-            ctPendingMotorAction_ = QStringLiteral("flat_out");
-            startCtMotorTiming(ctPendingMotorAction_);
-            QMetaObject::invokeMethod(kohzuController_, "jogRelativePulse", Qt::QueuedConnection,
-                Q_ARG(int, ctSettings_.yAxis), Q_ARG(qint64, pulse), Q_ARG(int, 0), Q_ARG(QString, QStringLiteral("CT Y flat out")));
             return;
         }
         ctYIsOutForFlat_ = true;
@@ -3536,20 +4371,17 @@ void MainWindow::enqueueCtFrame(const CameraFrame& frame)
     ctFrameEnqueueMs_ += std::max<qint64>(0, QDateTime::currentMSecsSinceEpoch() - enqueueStartedMs);
     ctLastFrameEnqueuedMs_ = QDateTime::currentMSecsSinceEpoch();
     ++ctFrameSavedCount_;
+    updateCtProgressUi();
 
     if (kind == CtFrameKind::Cor180)
     {
         ctWaitingForFrame_ = false;
         ctCorReferencePending_ = false;
         ctCorReferenceCaptured_ = true;
-        ctWaitingForMotor_ = true;
-        ctPendingMotorAction_ = QStringLiteral("r_start");
-        startCtMotorTiming(ctPendingMotorAction_);
-        QMetaObject::invokeMethod(kohzuController_, "moveAbsolutePulse", Qt::QueuedConnection,
-            Q_ARG(int, ctSettings_.rAxis),
-            Q_ARG(qint64, static_cast<qint64>(std::llround(ctSettings_.beginningAngleDeg * ctSettings_.rPulsePerDeg))),
-            Q_ARG(int, 0),
-            Q_ARG(QString, QStringLiteral("CT R start %1 deg").arg(ctSettings_.beginningAngleDeg, 0, 'f', 4)));
+        moveCtAxisAbsolute(QStringLiteral("R"),
+            ctSettings_.beginningAngleDeg,
+            QStringLiteral("r_start"),
+            QStringLiteral("CT R start %1 deg").arg(ctSettings_.beginningAngleDeg, 0, 'f', 4));
         return;
     }
 
@@ -3569,8 +4401,10 @@ void MainWindow::enqueueCtFrame(const CameraFrame& frame)
         const int logicalIndex = ctProjectionIndex_;
         const double angleStep = 180.0 / static_cast<double>(std::max(1, ctSettings_.projectionCount));
         QJsonObject flyFrame;
-        flyFrame["FRAME_INDEX"] = frame.frameIndex;
+        flyFrame["RAW_FRAME_INDEX"] = static_cast<double>(frame.frameIndex);
+        flyFrame["FRAME_INDEX"] = frame.logicalIndex >= 0 ? static_cast<double>(frame.logicalIndex) : static_cast<double>(logicalIndex);
         flyFrame["LOGICAL_INDEX"] = logicalIndex;
+        flyFrame["ELAPSED_MS"] = frame.elapsedMs;
         flyFrame["TIMESTAMP_MS"] = static_cast<double>(frame.timestampMs);
         flyFrame["ESTIMATED_ANGLE_DEG"] = ctSettings_.beginningAngleDeg + static_cast<double>(logicalIndex) * angleStep;
         flyFrame["FILE_INDEX"] = fileIndex;
@@ -3617,6 +4451,8 @@ void MainWindow::finishCtAcquisition(bool ok, const QString& message)
     const bool wasReplay = ctReplayRunning_;
     ctRunning_ = false;
     ctReplayRunning_ = false;
+    ctMotorSpeedTablesReady_ = false;
+    ctMotorSpeedSetupStage_ = 0;
     ctWaitingForFrame_ = false;
     ctWaitingForCaptureFinish_ = false;
     ctWaitingForMotor_ = false;
@@ -3636,7 +4472,22 @@ void MainWindow::finishCtAcquisition(bool ok, const QString& message)
     {
         QMetaObject::invokeMethod(cameraWorker_, "endPreparedCapture", Qt::QueuedConnection);
     }
+    if (ctIdlePollingPausedForCt_ && kohzuController_)
+    {
+        ctIdlePollingPausedForCt_ = false;
+        QMetaObject::invokeMethod(kohzuController_, "setIdlePollingEnabled", Qt::QueuedConnection,
+            Q_ARG(bool, true));
+    }
     ctStatusLabel_->setText(ok ? QStringLiteral("Completed") : QStringLiteral("Failed"));
+    if (ctProgressTimer_)
+    {
+        ctProgressTimer_->stop();
+    }
+    updateCtProgressUi();
+    if (ok && ctProgressBar_)
+    {
+        ctProgressBar_->setValue(ctProgressBar_->maximum());
+    }
     if (!ok)
     {
         ctWriterStartedMs_ = 0;
@@ -3662,8 +4513,8 @@ void MainWindow::finishCtAcquisition(bool ok, const QString& message)
     ctFlatNumSpin_->setEnabled(true);
     ctAutoCorCheck_->setEnabled(true);
     ctTiffThreadsSpin_->setEnabled(true);
-    if (ctFlySpeedSpin_) { ctFlySpeedSpin_->setEnabled(true); }
-    if (ctFlyLeadAngleSpin_) { ctFlyLeadAngleSpin_->setEnabled(true); }
+    if (ctFlyAllowedBlurSpin_) { ctFlyAllowedBlurSpin_->setEnabled(true); }
+    updateCtFlyDerivedParams();
     writeCtManifest(ok, ok ? QString() : message);
     const qint64 totalMs = ctAcquisitionStartedMs_ > 0
         ? std::max<qint64>(0, ctCompletedMs_ - ctAcquisitionStartedMs_)
@@ -3734,9 +4585,15 @@ void MainWindow::writeCtManifest(bool completed, const QString& errorMessage)
     {
         acq["FLY_SPEED_DEG_PER_S"] = ctSettings_.flySpeedDegPerSec;
         acq["LEAD_ANGLE_DEG"] = ctSettings_.flyLeadAngleDeg;
+        acq["FRAME_INTERVAL_MS"] = ctSettings_.flyFrameIntervalMs;
+        acq["EXPOSURE_MS"] = exposureMsFromSettings(ctSettings_.camera);
+        acq["SCAN_TIME_S"] = ctSettings_.flyScanTimeS;
+        acq["LEAD_MARGIN_DEG"] = kCtFlyLeadMarginDeg;
+        acq["FIRST_KEEP_DELAY_MS"] = ctFlyFirstKeepDelayMs_;
+        acq["RAW_FRAME_PLAN"] = ctFlyRawFramePlan_;
         acq["FLY_START_ANGLE_DEG"] = ctSettings_.beginningAngleDeg - ctSettings_.flyLeadAngleDeg;
         acq["FLY_END_ANGLE_DEG"] = ctSettings_.beginningAngleDeg + 180.0 + ctSettings_.flyLeadAngleDeg;
-        acq["ANGLE_MODEL"] = QStringLiteral("uniform_selected_frames");
+        acq["ANGLE_MODEL"] = QStringLiteral("time_gated_constant_interval_fly_scan");
     }
     acq["FLAT_GAP"] = ctSettings_.flatGap;
     acq["FLAT_MOVE_DISTANCE_UM"] = ctSettings_.flatMoveDistanceUm;
@@ -3817,6 +4674,8 @@ void MainWindow::writeCtManifest(bool completed, const QString& errorMessage)
     {
         timing["FLY_RAW_FRAME_PLAN"] = ctFlyRawFramePlan_;
         timing["FLY_KEPT_TOMO_FRAMES"] = ctFlyFrames_.size();
+        timing["FLY_FRAME_INTERVAL_MS"] = ctSettings_.flyFrameIntervalMs;
+        timing["FLY_SCAN_TIME_S"] = ctSettings_.flyScanTimeS;
         timing["FLY_SCAN_STARTED_AT"] = ctFlyScanStartedMs_ > 0
             ? QDateTime::fromMSecsSinceEpoch(ctFlyScanStartedMs_).toString(Qt::ISODate)
             : QString();
@@ -4476,6 +5335,25 @@ void MainWindow::removeSelectedReconQueueJob()
 
 void MainWindow::startNextQueuedReconstruction()
 {
+    if (!cameraWarmOpenComplete_)
+    {
+        reconStartDeferredForCameraWarmOpen_ = true;
+        writeStartupTrace(QStringLiteral("startNextQueuedReconstruction deferred: camera warm open not complete"));
+        return;
+    }
+    if (cameraWarmOpenCompletedMs_ > 0)
+    {
+        const qint64 elapsedMs = QDateTime::currentMSecsSinceEpoch() - cameraWarmOpenCompletedMs_;
+        if (elapsedMs >= 0 && elapsedMs < kReconQueueCameraSettleMs)
+        {
+            reconStartDeferredForCameraWarmOpen_ = true;
+            const int remainingMs = static_cast<int>(kReconQueueCameraSettleMs - elapsedMs);
+            writeStartupTrace(QStringLiteral("startNextQueuedReconstruction deferred: camera settle %1 ms remaining")
+                .arg(remainingMs));
+            QTimer::singleShot(std::max(1, remainingMs), this, &MainWindow::startNextQueuedReconstruction);
+            return;
+        }
+    }
     if (controller_.isBusy() || !activeQueueJobPath_.isEmpty())
     {
         return;
@@ -4737,10 +5615,16 @@ bool MainWindow::startQueuedReconstruction(const QString& jobPath)
     activeQueueInitialCorShift_ = cfg.geometry.corShift;
     activeQueueAutoCorShift_ = 0.0;
     activeQueueHasAutoCorShift_ = false;
+    writeStartupTrace(QStringLiteral("startQueuedReconstruction applyConfig begin: %1").arg(runningPath));
     applyConfig(cfg);
+    writeStartupTrace(QStringLiteral("startQueuedReconstruction applyConfig end: %1").arg(runningPath));
     appendLog(QStringLiteral("Starting queued reconstruction: %1").arg(runningPath));
+    writeStartupTrace(QStringLiteral("startQueuedReconstruction refreshReconQueue begin: %1").arg(runningPath));
     refreshReconQueue();
+    writeStartupTrace(QStringLiteral("startQueuedReconstruction refreshReconQueue end: %1").arg(runningPath));
+    writeStartupTrace(QStringLiteral("startQueuedReconstruction controller start begin: %1").arg(runningPath));
     controller_.startReconstruction(cfg);
+    writeStartupTrace(QStringLiteral("startQueuedReconstruction controller start end: %1").arg(runningPath));
     return true;
 }
 
@@ -5172,6 +6056,16 @@ void MainWindow::startMotorWorker()
     connect(kohzuController_, &KohzuController::commandFinished, this, [this](const QString& label, bool ok, const QString& response) {
         if (shuttingDown_) { return; }
         appendLog(QStringLiteral("%1 %2: %3").arg(label, ok ? QStringLiteral("ok") : QStringLiteral("failed"), response));
+        if (ctRunning_ && label.startsWith(QStringLiteral("CT speed table ")))
+        {
+            if (!ok)
+            {
+                finishCtAcquisition(false, QStringLiteral("%1 failed: %2").arg(label, response));
+                return;
+            }
+            sendNextCtMotorSpeedTableSetup();
+            return;
+        }
         if (ctRunning_ && !ok && label.startsWith(QStringLiteral("CT ")))
         {
             finishCtAcquisition(false, QStringLiteral("%1 failed: %2").arg(label, response));
@@ -5324,11 +6218,6 @@ void MainWindow::moveMotorAxis(const QString& name)
     }
 
     const qint64 pulse = static_cast<qint64>(std::llround(target * it->pulsePerUnit));
-    if (pulse == 0)
-    {
-        appendLog(QStringLiteral("%1 absolute move is too small for pulse conversion.").arg(name));
-        return;
-    }
 
     const QString label = QStringLiteral("%1 absolute %2 pulse (%3 -> %4 %5)")
         .arg(name)
@@ -5336,15 +6225,29 @@ void MainWindow::moveMotorAxis(const QString& name)
         .arg(it->currentValue, 0, 'f', 4)
         .arg(target, 0, 'f', 4)
         .arg(it->unit);
+    const MotorSpeedTableParams speedParams = makeMotorSpeedTableParams(
+        name,
+        kMotorManualSpeedTable,
+        it->pulsePerUnit,
+        it->unit,
+        it->baseSpeedSpin ? it->baseSpeedSpin->value() : 1.0,
+        it->speedSpin ? it->speedSpin->value() : 2.0,
+        it->accelSpin ? it->accelSpin->value() : 0.5);
     it->active = true;
     it->goButton->setEnabled(false);
     QMetaObject::invokeMethod(
         kohzuController_,
-        "moveAbsolutePulse",
+        "configureSpeedTableAndMoveAbsolute",
         Qt::QueuedConnection,
         Q_ARG(int, it->axis),
         Q_ARG(qint64, pulse),
-        Q_ARG(int, 0),
+        Q_ARG(int, speedParams.speedTable),
+        Q_ARG(int, speedParams.startSpeedPps),
+        Q_ARG(int, speedParams.topSpeedPps),
+        Q_ARG(int, speedParams.accelTime10ms),
+        Q_ARG(int, speedParams.decelTime10ms),
+        Q_ARG(int, speedParams.accelPattern),
+        Q_ARG(QString, speedParams.summary),
         Q_ARG(QString, label));
 }
 
@@ -5404,17 +6307,31 @@ void MainWindow::moveMotorAxisRelative(const QString& name, int direction)
         .arg(it->currentValue, 0, 'f', 4)
         .arg(target, 0, 'f', 4)
         .arg(it->unit);
+    const MotorSpeedTableParams speedParams = makeMotorSpeedTableParams(
+        name,
+        kMotorManualSpeedTable,
+        it->pulsePerUnit,
+        it->unit,
+        it->baseSpeedSpin ? it->baseSpeedSpin->value() : 1.0,
+        it->speedSpin ? it->speedSpin->value() : 2.0,
+        it->accelSpin ? it->accelSpin->value() : 0.5);
     it->active = true;
     it->relativeMinusButton->setEnabled(false);
     it->relativePlusButton->setEnabled(false);
     it->goButton->setEnabled(false);
     QMetaObject::invokeMethod(
         kohzuController_,
-        "jogRelativePulse",
+        "configureSpeedTableAndMoveRelative",
         Qt::QueuedConnection,
         Q_ARG(int, it->axis),
         Q_ARG(qint64, pulse),
-        Q_ARG(int, 0),
+        Q_ARG(int, speedParams.speedTable),
+        Q_ARG(int, speedParams.startSpeedPps),
+        Q_ARG(int, speedParams.topSpeedPps),
+        Q_ARG(int, speedParams.accelTime10ms),
+        Q_ARG(int, speedParams.decelTime10ms),
+        Q_ARG(int, speedParams.accelPattern),
+        Q_ARG(QString, speedParams.summary),
         Q_ARG(QString, label));
 }
 

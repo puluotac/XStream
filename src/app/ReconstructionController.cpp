@@ -64,6 +64,7 @@ void ReconstructionController::shutdown()
 
 void ReconstructionController::startReconstruction(const AppConfig& config)
 {
+    appendReconDebug(QStringLiteral("startReconstruction raw enter"));
     appendReconDebug(QStringLiteral("startReconstruction enter method=%1 stripe=%2 level=%3 z=%4 batch=%5 watch=%6 save=%7")
         .arg(toString(config.io.reconMethod))
         .arg(config.stripe.enable)
@@ -78,6 +79,7 @@ void ReconstructionController::startReconstruction(const AppConfig& config)
         return;
     }
 
+    appendReconDebug(QStringLiteral("startReconstruction reset state begin"));
     latestVolume_.reset();
     latestConfig_ = config;
     busy_ = true;

@@ -279,7 +279,10 @@ ReconstructionWorker::ReconstructionWorker(
     , config_(std::move(config))
     , runtimeCache_(std::move(runtimeCache))
 {
+    appendReconDebug(QStringLiteral("worker ctor enter method=%1 watch=%2 save=%3")
+        .arg(toString(config_.io.reconMethod), config_.io.watchDir, config_.io.saveDir));
     previewSliceIndex_.store(config_.preview.liveSliceIndex);
+    appendReconDebug(QStringLiteral("worker ctor exit"));
 }
 
 std::shared_ptr<IReconstructionVolume> ReconstructionWorker::volumeBuffer() const
@@ -325,15 +328,23 @@ void ReconstructionWorker::process()
             || config_.io.reconMethod == ReconMethod::OfflineGridrec)
         {
             appendReconDebug(QStringLiteral("worker entering OfflineTomoReconstruction"));
+            appendReconDebug(QStringLiteral("worker constructing offline callbacks"));
+            OfflineTomoReconstruction::LogCallback offlineLog = [this](const QString& text) { emit logMessage(text); };
+            OfflineTomoReconstruction::ProgressCallback offlineProgress = [this](int current, int total) { emit progressUpdated(current, total); };
+            OfflineTomoReconstruction::CorCallback offlineCor = [this](double shift) { emit corComputed(shift); };
+            OfflineTomoReconstruction::GeometryCallback offlineGeometry = [this](int volW, int volH) { emit volumeGeometryResolved(volW, volH); };
+            OfflineTomoReconstruction::PreviewCallback offlinePreview = [this](bool updateHistogram) { emit previewRefreshSuggested(updateHistogram); };
+            OfflineTomoReconstruction::DirectPreviewCallback offlineDirectPreview = [this](const cv::Mat& slice, bool updateHistogram) {
+                emit directPreviewSliceReady(slice.clone(), updateHistogram);
+            };
+            appendReconDebug(QStringLiteral("worker offline callbacks constructed"));
             auto result = OfflineTomoReconstruction::run(config_, stopRequested_,
-                [this](const QString& text) { emit logMessage(text); },
-                [this](int current, int total) { emit progressUpdated(current, total); },
-                [this](double shift) { emit corComputed(shift); },
-                [this](int volW, int volH) { emit volumeGeometryResolved(volW, volH); },
-                [this](bool updateHistogram) { emit previewRefreshSuggested(updateHistogram); },
-                [this](const cv::Mat& slice, bool updateHistogram) {
-                    emit directPreviewSliceReady(slice.clone(), updateHistogram);
-                });
+                offlineLog,
+                offlineProgress,
+                offlineCor,
+                offlineGeometry,
+                offlinePreview,
+                offlineDirectPreview);
             volumeBuffer_ = result.volume;
             config_ = result.config;
             appendReconDebug(QStringLiteral("worker OfflineTomoReconstruction returned"));

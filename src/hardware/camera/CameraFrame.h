@@ -10,6 +10,8 @@ namespace ct
 struct CameraFrame
 {
     qint64 frameIndex = 0;
+    qint64 logicalIndex = -1;
+    double elapsedMs = 0.0;
     qint64 timestampMs = 0;
     int width = 0;
     int height = 0;

@@ -56,13 +56,44 @@ int main()
     sessionConfig.stripe.sigma = 2.5f;
     sessionConfig.compute.batchSize = 32;
     sessionConfig.preview.enableLive = false;
+    sessionConfig.cameraUi.exposureValue = 123.0;
+    sessionConfig.cameraUi.exposureUnit = "ms";
+    sessionConfig.cameraUi.roiX = 11;
+    sessionConfig.cameraUi.roiY = 12;
+    sessionConfig.cameraUi.roiWidth = 1024;
+    sessionConfig.cameraUi.roiHeight = 768;
+    sessionConfig.cameraUi.snapPrefix = "snap_";
+    sessionConfig.cameraUi.snapPadding = 5;
+    sessionConfig.cameraUi.snapIndex = 42;
+    sessionConfig.cameraUi.saveDir = "E:/demo/camera";
+    sessionConfig.ctAcquisitionUi.beginningAngleDeg = -12.5;
+    sessionConfig.ctAcquisitionUi.modeIndex = 1;
+    sessionConfig.ctAcquisitionUi.savePath = "E:/demo/ct";
+    sessionConfig.ctAcquisitionUi.projectionNum = 1440;
+    sessionConfig.ctAcquisitionUi.flatGap = 180;
+    sessionConfig.ctAcquisitionUi.flatMoveUm = 10000.0;
+    sessionConfig.ctAcquisitionUi.flatNum = 2;
+    sessionConfig.ctAcquisitionUi.flyLeadAngleDeg = 3.0;
+    sessionConfig.ctAcquisitionUi.autoCorReference = true;
+    sessionConfig.ctAcquisitionUi.tiffThreads = 24;
+    sessionConfig.ctFly.allowedBlurPx = 1.25;
+    sessionConfig.kohzuUi.host = "10.30.92.202";
+    sessionConfig.kohzuUi.port = 12322;
     sessionConfig.io.watchDir = "E:/demo/watch";
     sessionConfig.io.saveDir = "E:/demo/save";
     sessionConfig.motorAxes["R"].hasBaseSpeed = true;
+    sessionConfig.motorAxes["R"].hasRelativeStep = true;
+    sessionConfig.motorAxes["R"].relativeStep = 0.25;
+    sessionConfig.motorAxes["R"].hasAbsoluteTarget = true;
+    sessionConfig.motorAxes["R"].absoluteTarget = 90.0;
     sessionConfig.motorAxes["R"].baseSpeed = 1.0;
     sessionConfig.motorAxes["R"].speed = 2.5;
     sessionConfig.motorAxes["R"].accel = 10.0;
     sessionConfig.motorAxes["Y"].hasBaseSpeed = true;
+    sessionConfig.motorAxes["Y"].hasRelativeStep = true;
+    sessionConfig.motorAxes["Y"].relativeStep = 500.0;
+    sessionConfig.motorAxes["Y"].hasAbsoluteTarget = true;
+    sessionConfig.motorAxes["Y"].absoluteTarget = -1000.0;
     sessionConfig.motorAxes["Y"].baseSpeed = 100.0;
     sessionConfig.motorAxes["Y"].speed = 500.0;
     sessionConfig.motorAxes["Y"].accel = 2000.0;
@@ -98,11 +129,42 @@ int main()
         || loadedConfig.io.watchDir != sessionConfig.io.watchDir
         || std::abs(loadedConfig.geometry.corShift - sessionConfig.geometry.corShift) > 1e-6f
         || loadedConfig.preview.enableLive != sessionConfig.preview.enableLive
+        || std::abs(loadedConfig.cameraUi.exposureValue - sessionConfig.cameraUi.exposureValue) > 1e-9
+        || loadedConfig.cameraUi.exposureUnit != sessionConfig.cameraUi.exposureUnit
+        || loadedConfig.cameraUi.roiX != sessionConfig.cameraUi.roiX
+        || loadedConfig.cameraUi.roiY != sessionConfig.cameraUi.roiY
+        || loadedConfig.cameraUi.roiWidth != sessionConfig.cameraUi.roiWidth
+        || loadedConfig.cameraUi.roiHeight != sessionConfig.cameraUi.roiHeight
+        || loadedConfig.cameraUi.snapPrefix != sessionConfig.cameraUi.snapPrefix
+        || loadedConfig.cameraUi.snapPadding != sessionConfig.cameraUi.snapPadding
+        || loadedConfig.cameraUi.snapIndex != sessionConfig.cameraUi.snapIndex
+        || loadedConfig.cameraUi.saveDir != sessionConfig.cameraUi.saveDir
+        || std::abs(loadedConfig.ctAcquisitionUi.beginningAngleDeg - sessionConfig.ctAcquisitionUi.beginningAngleDeg) > 1e-9
+        || loadedConfig.ctAcquisitionUi.modeIndex != sessionConfig.ctAcquisitionUi.modeIndex
+        || loadedConfig.ctAcquisitionUi.savePath != sessionConfig.ctAcquisitionUi.savePath
+        || loadedConfig.ctAcquisitionUi.projectionNum != sessionConfig.ctAcquisitionUi.projectionNum
+        || loadedConfig.ctAcquisitionUi.flatGap != sessionConfig.ctAcquisitionUi.flatGap
+        || std::abs(loadedConfig.ctAcquisitionUi.flatMoveUm - sessionConfig.ctAcquisitionUi.flatMoveUm) > 1e-9
+        || loadedConfig.ctAcquisitionUi.flatNum != sessionConfig.ctAcquisitionUi.flatNum
+        || std::abs(loadedConfig.ctAcquisitionUi.flyLeadAngleDeg - sessionConfig.ctAcquisitionUi.flyLeadAngleDeg) > 1e-9
+        || loadedConfig.ctAcquisitionUi.autoCorReference != sessionConfig.ctAcquisitionUi.autoCorReference
+        || loadedConfig.ctAcquisitionUi.tiffThreads != sessionConfig.ctAcquisitionUi.tiffThreads
+        || std::abs(loadedConfig.ctFly.allowedBlurPx - sessionConfig.ctFly.allowedBlurPx) > 1e-9
+        || loadedConfig.kohzuUi.host != sessionConfig.kohzuUi.host
+        || loadedConfig.kohzuUi.port != sessionConfig.kohzuUi.port
         || !loadedConfig.motorAxes.value("R").hasBaseSpeed
+        || !loadedConfig.motorAxes.value("R").hasRelativeStep
+        || std::abs(loadedConfig.motorAxes.value("R").relativeStep - 0.25) > 1e-9
+        || !loadedConfig.motorAxes.value("R").hasAbsoluteTarget
+        || std::abs(loadedConfig.motorAxes.value("R").absoluteTarget - 90.0) > 1e-9
         || std::abs(loadedConfig.motorAxes.value("R").baseSpeed - 1.0) > 1e-9
         || std::abs(loadedConfig.motorAxes.value("R").speed - 2.5) > 1e-9
         || std::abs(loadedConfig.motorAxes.value("R").accel - 10.0) > 1e-9
         || !loadedConfig.motorAxes.value("Y").hasBaseSpeed
+        || !loadedConfig.motorAxes.value("Y").hasRelativeStep
+        || std::abs(loadedConfig.motorAxes.value("Y").relativeStep - 500.0) > 1e-9
+        || !loadedConfig.motorAxes.value("Y").hasAbsoluteTarget
+        || std::abs(loadedConfig.motorAxes.value("Y").absoluteTarget + 1000.0) > 1e-9
         || std::abs(loadedConfig.motorAxes.value("Y").baseSpeed - 100.0) > 1e-9
         || std::abs(loadedConfig.motorAxes.value("Y").speed - 500.0) > 1e-9
         || std::abs(loadedConfig.motorAxes.value("Y").accel - 2000.0) > 1e-9)
@@ -142,6 +204,12 @@ int main()
         std::cerr << "Motor base speed config was not saved\n";
         return 23;
     }
+    if (!cleanedDoc.object().value("MOTOR").toObject().value("R").toObject().contains("RELATIVE_STEP")
+        || !cleanedDoc.object().value("MOTOR").toObject().value("R").toObject().contains("ABSOLUTE_TARGET"))
+    {
+        std::cerr << "Motor motion input config was not saved\n";
+        return 29;
+    }
     QJsonObject oldMotorRoot;
     QJsonObject oldMotorAxis;
     oldMotorAxis["SPEED"] = 12.0;
@@ -161,6 +229,13 @@ int main()
     {
         std::cerr << "Stripe config should be saved disabled during commissioning\n";
         return 22;
+    }
+    if (!cleanedDoc.object().contains("CAMERA")
+        || !cleanedDoc.object().contains("CT_ACQUISITION")
+        || !cleanedDoc.object().contains("KOHZU"))
+    {
+        std::cerr << "Left-side UI config objects were not saved\n";
+        return 28;
     }
 
     const QString invalidPath = tempDir.filePath("invalid.json");

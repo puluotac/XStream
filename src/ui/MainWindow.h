@@ -92,8 +92,13 @@ private:
     void advanceCtFlyAcquisition();
     void startCtFlyScanMove();
     void startCtFlyScanMotorSweep();
+    void startCtMotorSpeedTableSetup();
+    void sendNextCtMotorSpeedTableSetup();
+    void finishCtMotorSpeedTableSetup();
     void startCtMotorTiming(const QString& action);
     void finishCtMotorTiming(const QString& action);
+    bool moveCtAxisAbsolute(const QString& axisName, double targetValue, const QString& action, const QString& label);
+    bool moveCtAxisRelative(const QString& axisName, double deltaValue, const QString& action, const QString& label);
     void advanceCtAcquisition();
     void requestCtFrame(CtFrameKind kind);
     void enqueueCtFrame(const CameraFrame& frame);
@@ -139,6 +144,11 @@ private:
     void stopAllMotorAxes();
     void toggleMotorSpeedMode();
     void updateMotorUiEnabled();
+    void updateCtFlyDerivedParams();
+    void updateCtProgressUi();
+    int estimateCtTotalFrames() const;
+    double estimateAxisMoveSeconds(const QString& axisName, double distanceUnits) const;
+    double estimateCtAcquisitionSeconds(int totalFrames) const;
 
     ReconstructionController controller_;
     QThread cameraThread_;
@@ -166,6 +176,9 @@ private:
     bool cameraLiveRunning_ = false;
     bool cameraRestartLiveAfterStop_ = false;
     bool ctRestoreLiveAfterFinish_ = false;
+    bool cameraWarmOpenComplete_ = false;
+    qint64 cameraWarmOpenCompletedMs_ = 0;
+    bool reconStartDeferredForCameraWarmOpen_ = false;
     bool cameraSnapSaveInProgress_ = false;
     bool ctRunning_ = false;
     bool ctStopRequested_ = false;
@@ -213,6 +226,8 @@ private:
     int ctFlyFlatStage_ = 0;
     int ctFlyContinuousFramesReceived_ = 0;
     int ctFlyRawFramePlan_ = 0;
+    double ctFlyDerivedScanTimeS_ = 0.0;
+    double ctFlyDerivedFrameIntervalMs_ = 0.0;
     qint64 ctFlyScanStartedMs_ = 0;
     qint64 ctFlyScanFinishedMs_ = 0;
     qint64 ctAcquisitionStartedMs_ = 0;
@@ -240,6 +255,14 @@ private:
     qint64 ctWriterFrameBytes_ = 0;
     int ctWriterThreads_ = 0;
     int ctWriterQueueCapacity_ = 0;
+    int ctEstimatedTotalFrames_ = 0;
+    double ctEstimatedTotalSeconds_ = 0.0;
+    double ctFlyDerivedSpeedDegPerSec_ = 1.0;
+    double ctFlyDerivedLeadAngleDeg_ = 3.0;
+    double ctFlyFirstKeepDelayMs_ = 0.0;
+    bool ctMotorSpeedTablesReady_ = false;
+    int ctMotorSpeedSetupStage_ = 0;
+    bool ctIdlePollingPausedForCt_ = false;
 
     QLineEdit* watchDirEdit_ = nullptr;
     QLineEdit* saveDirEdit_ = nullptr;
@@ -314,12 +337,20 @@ private:
     QSpinBox* ctFlatGapSpin_ = nullptr;
     QDoubleSpinBox* ctFlatMoveSpin_ = nullptr;
     QSpinBox* ctFlatNumSpin_ = nullptr;
-    QDoubleSpinBox* ctFlySpeedSpin_ = nullptr;
-    QDoubleSpinBox* ctFlyLeadAngleSpin_ = nullptr;
+    QDoubleSpinBox* ctFlyAllowedBlurSpin_ = nullptr;
     QDoubleSpinBox* ctFlyTotalAngleSpin_ = nullptr;
+    QLabel* ctFlyRadiusLabel_ = nullptr;
+    QLabel* ctFlySpeedLabel_ = nullptr;
+    QLabel* ctFlyLeadAngleLabel_ = nullptr;
+    QLabel* ctFlyScanTimeLabel_ = nullptr;
+    QLabel* ctFlyFrameIntervalLabel_ = nullptr;
+    QLabel* ctFlyMaxProjectionLabel_ = nullptr;
+    QLabel* ctFlyValidationLabel_ = nullptr;
     QCheckBox* ctAutoCorCheck_ = nullptr;
     QSpinBox* ctTiffThreadsSpin_ = nullptr;
     QLabel* ctStatusLabel_ = nullptr;
+    QLabel* ctTimingLabel_ = nullptr;
+    QProgressBar* ctProgressBar_ = nullptr;
     QLabel* ctWriterLabel_ = nullptr;
     QLabel* ctBufferLabel_ = nullptr;
     QPushButton* ctStartButton_ = nullptr;
@@ -377,6 +408,7 @@ private:
     QPushButton* motorStopAllButton_ = nullptr;
     bool motorSpeedMode_ = false;
     int ctSmokeAutostartAttempts_ = 0;
+    QTimer* ctProgressTimer_ = nullptr;
     QMap<QString, MotorAxisUi> motorAxes_;
     QMap<int, QString> motorAxisNamesByNumber_;
 };

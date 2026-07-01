@@ -24,6 +24,7 @@ public:
 
     void resetWindow();
     void updateData(const cv::Mat& image);
+    void setWindow(const PreviewWindow& window, bool notify = false);
     PreviewWindow window() const;
     bool hasWindow() const;
     bool isInitializedFromData() const;
@@ -49,6 +50,7 @@ private:
     double valueToX(double value) const;
     double xToValue(double x) const;
     void rebuildHistogram(const cv::Mat& image);
+    void sanitizeWindowForData();
 
     std::vector<double> bins_;
     double dataMin_ = -10.0;

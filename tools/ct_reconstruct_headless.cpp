@@ -3,7 +3,11 @@
 #include "core/recon/ReconstructionWorker.h"
 
 #include <QCoreApplication>
+#include <QDateTime>
+#include <QDir>
 #include <QElapsedTimer>
+#include <QFile>
+#include <QTextStream>
 
 #include <algorithm>
 #include <iostream>
@@ -11,6 +15,16 @@
 
 namespace
 {
+
+void appendHeadlessDebug(const QString& text)
+{
+    QFile file(QCoreApplication::applicationDirPath() + QStringLiteral("/ct_headless_debug.log"));
+    if (file.open(QIODevice::WriteOnly | QIODevice::Append | QIODevice::Text))
+    {
+        QTextStream stream(&file);
+        stream << QDateTime::currentDateTime().toString(Qt::ISODateWithMs) << " " << text << '\n';
+    }
+}
 
 bool parseIntOption(int argc, char** argv, int& index, int* outValue)
 {
@@ -62,6 +76,7 @@ void printUsage()
 int main(int argc, char** argv)
 {
     QCoreApplication app(argc, argv);
+    appendHeadlessDebug(QStringLiteral("main enter argc=%1").arg(argc));
 
     if (argc < 2)
     {
@@ -71,6 +86,7 @@ int main(int argc, char** argv)
 
     ct::AppConfig config;
     QString error;
+    appendHeadlessDebug(QStringLiteral("loading config %1").arg(QString::fromLocal8Bit(argv[1])));
     if (!ct::AppConfig::tryLoadFromJsonFile(QString::fromLocal8Bit(argv[1]), &config, &error))
     {
         std::cerr << "Failed to load config: " << error.toLocal8Bit().constData() << "\n";
@@ -138,6 +154,9 @@ int main(int argc, char** argv)
     }
 
     config.preview.enableLive = false;
+    appendHeadlessDebug(QStringLiteral("config ready method=%1 watch=%2 save=%3 angles=%4")
+        .arg(ct::toString(config.io.reconMethod), config.io.watchDir, config.io.saveDir)
+        .arg(config.geometry.totalAngles));
 
     std::shared_ptr<ct::ReconstructionRuntimeCache> runtimeCache;
     if (config.io.reconMethod != ct::ReconMethod::OfflineFBP
@@ -145,7 +164,9 @@ int main(int argc, char** argv)
     {
         runtimeCache = std::make_shared<ct::ReconstructionRuntimeCache>();
     }
+    appendHeadlessDebug(QStringLiteral("constructing worker"));
     ct::ReconstructionWorker worker(config, runtimeCache);
+    appendHeadlessDebug(QStringLiteral("worker constructed"));
     QElapsedTimer timer;
     timer.start();
     int exitCode = 1;

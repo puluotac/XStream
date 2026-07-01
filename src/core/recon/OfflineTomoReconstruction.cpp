@@ -2063,8 +2063,10 @@ OfflineTomoResult OfflineTomoReconstruction::run(const AppConfig& inputConfig,
     const PreviewCallback& previewSuggested,
     const DirectPreviewCallback& directPreview)
 {
+    appendReconDebug(QStringLiteral("OfflineTomoReconstruction run body enter before config copy"));
     (void)previewSuggested;
     AppConfig config = inputConfig;
+    appendReconDebug(QStringLiteral("OfflineTomoReconstruction config copied"));
     appendReconDebug(QStringLiteral("OfflineTomoReconstruction run enter method=%1 stripe=%2 level=%3 watch=%4 save=%5")
         .arg(toString(config.io.reconMethod))
         .arg(config.stripe.enable)

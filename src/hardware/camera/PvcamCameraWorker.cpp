@@ -16,6 +16,7 @@
 #include <algorithm>
 #include <cmath>
 #include <iomanip>
+#include <limits>
 #include <sstream>
 #include <stdexcept>
 #include <vector>
@@ -90,6 +91,58 @@ bool paramAvailable(int16 hcam, uns32 paramId)
     return PV_OK == pl_get_param(hcam, paramId, ATTR_AVAIL, &available) && available == TRUE;
 }
 
+bool paramWritable(int16 hcam, uns32 paramId, QString* error)
+{
+    if (!paramAvailable(hcam, paramId))
+    {
+        if (error != nullptr)
+        {
+            *error = QStringLiteral("PVCAM parameter %1 is not available.").arg(paramId);
+        }
+        return false;
+    }
+
+    uns16 access = 0;
+    if (PV_OK != pl_get_param(hcam, paramId, ATTR_ACCESS, &access))
+    {
+        if (error != nullptr)
+        {
+            *error = pvcamError();
+        }
+        return false;
+    }
+
+    if (access != ACC_READ_WRITE && access != ACC_WRITE_ONLY)
+    {
+        if (error != nullptr)
+        {
+            *error = QStringLiteral("PVCAM parameter %1 is not writable (access=%2).").arg(paramId).arg(access);
+        }
+        return false;
+    }
+    return true;
+}
+
+template <typename T>
+bool setParamIfAvailable(int16 hcam, uns32 paramId, const T& value, QString* error)
+{
+    if (!paramWritable(hcam, paramId, error))
+    {
+        return false;
+    }
+
+    T mutableValue = value;
+    if (PV_OK != pl_set_param(hcam, paramId, &mutableValue))
+    {
+        if (error != nullptr)
+        {
+            *error = pvcamError();
+        }
+        return false;
+    }
+    return true;
+}
+
 bool firstEnumValue(int16 hcam, uns32 paramId, int32& value, QString& name)
 {
     uns32 count = 0;
@@ -113,6 +166,39 @@ bool firstEnumValue(int16 hcam, uns32 paramId, int32& value, QString& name)
     return true;
 }
 
+struct EnumValue
+{
+    int32 value = 0;
+    QString name;
+};
+
+std::vector<EnumValue> enumValues(int16 hcam, uns32 paramId)
+{
+    std::vector<EnumValue> values;
+    uns32 count = 0;
+    if (PV_OK != pl_get_param(hcam, paramId, ATTR_COUNT, &count))
+    {
+        return values;
+    }
+
+    for (uns32 index = 0; index < count; ++index)
+    {
+        uns32 length = 0;
+        if (PV_OK != pl_enum_str_length(hcam, paramId, index, &length) || length == 0)
+        {
+            continue;
+        }
+
+        std::vector<char> text(length + 1, '\0');
+        int32 value = 0;
+        if (PV_OK == pl_get_enum_param(hcam, paramId, index, &value, text.data(), length))
+        {
+            values.push_back({ value, QString::fromLatin1(text.data()) });
+        }
+    }
+    return values;
+}
+
 QString readStringParam(int16 hcam, uns32 paramId, int maxLength)
 {
     std::vector<char> text(static_cast<size_t>(std::max(1, maxLength)), '\0');
@@ -123,48 +209,248 @@ QString readStringParam(int16 hcam, uns32 paramId, int maxLength)
     return {};
 }
 
+std::vector<int16> int16IndexRange(int16 hcam, uns32 paramId, int16 fallbackMin, int16 fallbackMax)
+{
+    int16 minValue = fallbackMin;
+    int16 maxValue = fallbackMax;
+    getParam(hcam, paramId, ATTR_MIN, minValue);
+    getParam(hcam, paramId, ATTR_MAX, maxValue);
+    if (maxValue < minValue)
+    {
+        return {};
+    }
+
+    minValue = static_cast<int16>(std::max<int>(-1, minValue));
+    maxValue = static_cast<int16>(std::min<int>(64, maxValue));
+    std::vector<int16> values;
+    for (int value = minValue; value <= maxValue; ++value)
+    {
+        values.push_back(static_cast<int16>(value));
+    }
+    return values;
+}
+
+int16 currentCameraBitDepth(int16 hcam)
+{
+    int16 bitDepth = 0;
+    if (!getParam(hcam, PARAM_BIT_DEPTH_HOST, ATTR_CURRENT, bitDepth))
+    {
+        getParam(hcam, PARAM_BIT_DEPTH, ATTR_CURRENT, bitDepth);
+    }
+    return bitDepth;
+}
+
+struct KinetixReadoutCandidate
+{
+    int32 readoutPort = 0;
+    QString readoutPortName;
+    int16 speedIndex = 0;
+    QString speedName;
+    int16 gainIndex = 0;
+    QString gainName;
+    int16 bitDepth = 0;
+    int score = std::numeric_limits<int>::min();
+};
+
+int scoreKinetixDynamicRangeCandidate(const KinetixReadoutCandidate& candidate)
+{
+    const QString text = QStringLiteral("%1 %2 %3")
+        .arg(candidate.readoutPortName, candidate.speedName, candidate.gainName)
+        .toLower();
+    int score = 0;
+    score += candidate.bitDepth >= 16 ? 1000 : -1000;
+    if (text.contains(QStringLiteral("dynamic")) && text.contains(QStringLiteral("range"))) { score += 600; }
+    if (text.contains(QStringLiteral("dynamic"))) { score += 250; }
+    if (text.contains(QStringLiteral("range"))) { score += 150; }
+    if (text.contains(QStringLiteral("16"))) { score += 150; }
+    if (text.contains(QStringLiteral("hdr"))) { score += 150; }
+    if (text.contains(QStringLiteral("sub")) || text.contains(QStringLiteral("electron"))) { score -= 400; }
+    if (text.contains(QStringLiteral("sensitivity"))) { score -= 150; }
+    if (text.contains(QStringLiteral("speed"))) { score -= 150; }
+    if (text.contains(QStringLiteral("12"))) { score -= 150; }
+    if (text.contains(QStringLiteral("8"))) { score -= 250; }
+    return score;
+}
+
+bool selectKinetixDynamicRangeReadout(int16 hcam, QStringList& messages)
+{
+    std::vector<EnumValue> readoutPorts;
+    if (paramAvailable(hcam, PARAM_READOUT_PORT))
+    {
+        readoutPorts = enumValues(hcam, PARAM_READOUT_PORT);
+    }
+    if (readoutPorts.empty())
+    {
+        int32 currentPort = 0;
+        getParam(hcam, PARAM_READOUT_PORT, ATTR_CURRENT, currentPort);
+        readoutPorts.push_back({ currentPort, QStringLiteral("current") });
+    }
+
+    KinetixReadoutCandidate best;
+    QStringList tried;
+    for (const EnumValue& port : readoutPorts)
+    {
+        if (paramAvailable(hcam, PARAM_READOUT_PORT))
+        {
+            int32 readoutPort = port.value;
+            if (PV_OK != pl_set_param(hcam, PARAM_READOUT_PORT, &readoutPort))
+            {
+                tried << QStringLiteral("readout '%1' failed: %2").arg(port.name, pvcamError());
+                continue;
+            }
+        }
+
+        std::vector<int16> speedIndices = paramAvailable(hcam, PARAM_SPDTAB_INDEX)
+            ? int16IndexRange(hcam, PARAM_SPDTAB_INDEX, 0, 0)
+            : std::vector<int16>{ 0 };
+        for (int16 speedIndex : speedIndices)
+        {
+            if (paramAvailable(hcam, PARAM_SPDTAB_INDEX))
+            {
+                int16 mutableSpeedIndex = speedIndex;
+                if (PV_OK != pl_set_param(hcam, PARAM_SPDTAB_INDEX, &mutableSpeedIndex))
+                {
+                    continue;
+                }
+                getParam(hcam, PARAM_SPDTAB_INDEX, ATTR_CURRENT, speedIndex);
+            }
+            const QString speedName = readStringParam(hcam, PARAM_SPDTAB_NAME, MAX_SPDTAB_NAME_LEN);
+
+            std::vector<int16> gainIndices = paramAvailable(hcam, PARAM_GAIN_INDEX)
+                ? int16IndexRange(hcam, PARAM_GAIN_INDEX, 1, 1)
+                : std::vector<int16>{ 0 };
+            for (int16 gainIndex : gainIndices)
+            {
+                if (paramAvailable(hcam, PARAM_GAIN_INDEX))
+                {
+                    int16 mutableGainIndex = gainIndex;
+                    if (PV_OK != pl_set_param(hcam, PARAM_GAIN_INDEX, &mutableGainIndex))
+                    {
+                        continue;
+                    }
+                    getParam(hcam, PARAM_GAIN_INDEX, ATTR_CURRENT, gainIndex);
+                }
+                const QString gainName = readStringParam(hcam, PARAM_GAIN_NAME, MAX_GAIN_NAME_LEN);
+                KinetixReadoutCandidate candidate;
+                candidate.readoutPort = port.value;
+                candidate.readoutPortName = port.name;
+                candidate.speedIndex = speedIndex;
+                candidate.speedName = speedName;
+                candidate.gainIndex = gainIndex;
+                candidate.gainName = gainName;
+                candidate.bitDepth = currentCameraBitDepth(hcam);
+                candidate.score = scoreKinetixDynamicRangeCandidate(candidate);
+                tried << QStringLiteral("port='%1' speed=%2 '%3' gain=%4 '%5' bitDepth=%6 score=%7")
+                    .arg(candidate.readoutPortName)
+                    .arg(candidate.speedIndex)
+                    .arg(candidate.speedName)
+                    .arg(candidate.gainIndex)
+                    .arg(candidate.gainName)
+                    .arg(candidate.bitDepth)
+                    .arg(candidate.score);
+                if (candidate.score > best.score)
+                {
+                    best = candidate;
+                }
+            }
+        }
+    }
+
+    if (best.score <= std::numeric_limits<int>::min() / 2)
+    {
+        messages << QStringLiteral("16-bit Dynamic Range search found no readout candidates");
+        return false;
+    }
+
+    if (paramAvailable(hcam, PARAM_READOUT_PORT))
+    {
+        int32 readoutPort = best.readoutPort;
+        if (PV_OK != pl_set_param(hcam, PARAM_READOUT_PORT, &readoutPort))
+        {
+            messages << QStringLiteral("16-bit Dynamic Range readout port apply failed: %1").arg(pvcamError());
+            return false;
+        }
+    }
+    if (paramAvailable(hcam, PARAM_SPDTAB_INDEX))
+    {
+        int16 speedIndex = best.speedIndex;
+        if (PV_OK != pl_set_param(hcam, PARAM_SPDTAB_INDEX, &speedIndex))
+        {
+            messages << QStringLiteral("16-bit Dynamic Range speed apply failed: %1").arg(pvcamError());
+            return false;
+        }
+    }
+    if (paramAvailable(hcam, PARAM_GAIN_INDEX))
+    {
+        int16 gainIndex = best.gainIndex;
+        if (PV_OK != pl_set_param(hcam, PARAM_GAIN_INDEX, &gainIndex))
+        {
+            messages << QStringLiteral("16-bit Dynamic Range gain apply failed: %1").arg(pvcamError());
+            return false;
+        }
+    }
+
+    const int16 finalBitDepth = currentCameraBitDepth(hcam);
+    messages << QStringLiteral("preferred 16-bit Dynamic Range: readout '%1', speed index %2 '%3', gain index %4 '%5', bitDepth %6")
+        .arg(best.readoutPortName)
+        .arg(best.speedIndex)
+        .arg(best.speedName)
+        .arg(best.gainIndex)
+        .arg(best.gainName)
+        .arg(finalBitDepth);
+    if (finalBitDepth < 16)
+    {
+        messages << QStringLiteral("warning: 16-bit Dynamic Range selection did not report 16-bit output; candidates: %1")
+            .arg(tried.join(QStringLiteral("; ")));
+    }
+    return finalBitDepth >= 16;
+}
+
 QString initializeKinetixReadout(int16 hcam)
 {
     QStringList messages;
 
     pl_pp_reset(hcam);
 
-    int32 readoutPort = 0;
-    QString readoutPortName;
-    if (paramAvailable(hcam, PARAM_READOUT_PORT)
-        && firstEnumValue(hcam, PARAM_READOUT_PORT, readoutPort, readoutPortName))
+    if (!selectKinetixDynamicRangeReadout(hcam, messages))
     {
-        if (PV_OK != pl_set_param(hcam, PARAM_READOUT_PORT, &readoutPort))
+        int32 readoutPort = 0;
+        QString readoutPortName;
+        if (paramAvailable(hcam, PARAM_READOUT_PORT)
+            && firstEnumValue(hcam, PARAM_READOUT_PORT, readoutPort, readoutPortName))
         {
-            throw std::runtime_error(("Failed to set PVCAM readout port: " + pvcamError()).toStdString());
+            if (PV_OK != pl_set_param(hcam, PARAM_READOUT_PORT, &readoutPort))
+            {
+                throw std::runtime_error(("Failed to set PVCAM readout port: " + pvcamError()).toStdString());
+            }
+            messages << QStringLiteral("fallback readout port '%1'").arg(readoutPortName);
         }
-        messages << QStringLiteral("readout port '%1'").arg(readoutPortName);
-    }
 
-    if (paramAvailable(hcam, PARAM_SPDTAB_INDEX))
-    {
-        int16 speedIndex = 0;
-        if (PV_OK != pl_set_param(hcam, PARAM_SPDTAB_INDEX, &speedIndex))
+        if (paramAvailable(hcam, PARAM_SPDTAB_INDEX))
         {
-            throw std::runtime_error(("Failed to set PVCAM speed index: " + pvcamError()).toStdString());
+            int16 speedIndex = 0;
+            if (PV_OK != pl_set_param(hcam, PARAM_SPDTAB_INDEX, &speedIndex))
+            {
+                throw std::runtime_error(("Failed to set PVCAM speed index: " + pvcamError()).toStdString());
+            }
+            const QString speedName = readStringParam(hcam, PARAM_SPDTAB_NAME, MAX_SPDTAB_NAME_LEN);
+            messages << QStringLiteral("fallback speed index %1%2")
+                .arg(speedIndex)
+                .arg(speedName.isEmpty() ? QString() : QStringLiteral(" '%1'").arg(speedName));
         }
-        const QString speedName = readStringParam(hcam, PARAM_SPDTAB_NAME, MAX_SPDTAB_NAME_LEN);
-        messages << QStringLiteral("speed index %1%2")
-            .arg(speedIndex)
-            .arg(speedName.isEmpty() ? QString() : QStringLiteral(" '%1'").arg(speedName));
-    }
 
-    if (paramAvailable(hcam, PARAM_GAIN_INDEX))
-    {
-        int16 gainIndex = 1;
-        if (PV_OK != pl_set_param(hcam, PARAM_GAIN_INDEX, &gainIndex))
+        if (paramAvailable(hcam, PARAM_GAIN_INDEX))
         {
-            throw std::runtime_error(("Failed to set PVCAM gain index: " + pvcamError()).toStdString());
+            int16 gainIndex = 1;
+            if (PV_OK != pl_set_param(hcam, PARAM_GAIN_INDEX, &gainIndex))
+            {
+                throw std::runtime_error(("Failed to set PVCAM gain index: " + pvcamError()).toStdString());
+            }
+            const QString gainName = readStringParam(hcam, PARAM_GAIN_NAME, MAX_GAIN_NAME_LEN);
+            messages << QStringLiteral("fallback gain index %1%2")
+                .arg(gainIndex)
+                .arg(gainName.isEmpty() ? QString() : QStringLiteral(" '%1'").arg(gainName));
         }
-        const QString gainName = readStringParam(hcam, PARAM_GAIN_NAME, MAX_GAIN_NAME_LEN);
-        messages << QStringLiteral("gain index %1%2")
-            .arg(gainIndex)
-            .arg(gainName.isEmpty() ? QString() : QStringLiteral(" '%1'").arg(gainName));
     }
 
     if (paramAvailable(hcam, PARAM_CLEAR_CYCLES))
@@ -626,7 +912,9 @@ void PvcamCameraWorker::warmOpen()
     try
     {
         openCameraIfNeeded();
+        writePvcamTrace(QStringLiteral("PVCAM warmOpen open ok; emitting Ready"));
         emit cameraStateChanged(QStringLiteral("Ready"));
+        writePvcamTrace(QStringLiteral("PVCAM warmOpen emitted Ready; exit"));
     }
     catch (const std::exception& ex)
     {
@@ -634,6 +922,7 @@ void PvcamCameraWorker::warmOpen()
         closeCamera();
         emit cameraStateChanged(QStringLiteral("Error"));
         emit logMessage(QStringLiteral("Kinetix warm open failed: %1").arg(QString::fromLocal8Bit(ex.what())));
+        writePvcamTrace(QStringLiteral("PVCAM warmOpen emitted Error; exit"));
     }
 #endif
 }
@@ -1108,9 +1397,12 @@ void PvcamCameraWorker::startContinuousCapture(const PvcamCaptureSettings& rawSe
     settings.roiWidth = std::max(1, settings.roiWidth);
     settings.roiHeight = std::max(1, settings.roiHeight);
     settings.queueCapacity = std::max(4, settings.queueCapacity);
+    settings.rawFrameLimit = std::max(0, settings.rawFrameLimit);
     settings.saveRaw = false;
     settings.previewOnly = false;
     settings.enqueueFrames = false;
+    settings.frameIntervalMs = std::max(0.0, settings.frameIntervalMs);
+    settings.firstKeepDelayMs = std::max(0.0, settings.firstKeepDelayMs);
 
     stopRequested_.store(false);
     droppedCount_ = 0;
@@ -1145,10 +1437,117 @@ void PvcamCameraWorker::startContinuousCapture(const PvcamCaptureSettings& rawSe
             static_cast<uns32>(std::llround(exposureMs * expResolution.unitsPerMillisecond)));
         const int16 expMode = selectInternalExposureMode(hcam_);
 
+        const bool requireConstantIntervals = settings.frameIntervalMs > 0.0;
+        const bool allowIntervalDecimation = requireConstantIntervals && settings.allowFrameIntervalDecimation;
+        bool useIntervalDecimation = false;
+        bool deliveryModeSet = false;
+        const double requestedIntervalMs = requireConstantIntervals ? std::max(exposureMs, settings.frameIntervalMs) : 0.0;
+        const int64 targetCycleNs = static_cast<int64>(std::llround(requestedIntervalMs * 1000000.0));
+        const int64 exposureNs = static_cast<int64>(std::llround(exposureMs * 1000000.0));
+        int64 postTriggerDelayNs = 0;
+        getParam(hcam_, PARAM_POST_TRIGGER_DELAY, ATTR_CURRENT, postTriggerDelayNs);
+        int64 preTriggerDelayNs = 0;
+        bool preTriggerDelaySet = !requireConstantIntervals;
+        QString preTriggerDelaySetError;
+        if (requireConstantIntervals)
+        {
+            if (enumContains(hcam_, PARAM_FRAME_DELIVERY_MODE, PL_FRAME_DELIVERY_MODE_CONSTANT_INTERVALS))
+            {
+                int32 deliveryMode = PL_FRAME_DELIVERY_MODE_CONSTANT_INTERVALS;
+                QString setError;
+                if (!setParamIfAvailable(hcam_, PARAM_FRAME_DELIVERY_MODE, deliveryMode, &setError))
+                {
+                    throw std::runtime_error(("Failed to enable PVCAM constant-interval frame delivery: " + setError).toStdString());
+                }
+                deliveryModeSet = true;
+            }
+            else
+            {
+                emit logMessage(QStringLiteral("PVCAM frame delivery constant-interval mode is not exposed; trying internal timed frame cycle via PRE_TRIGGER_DELAY."));
+            }
+
+            const int64 postNs = std::max<int64>(0, postTriggerDelayNs);
+            const int64 preNs = std::max<int64>(0, targetCycleNs - exposureNs - postNs);
+            preTriggerDelaySet = setParamIfAvailable(hcam_, PARAM_PRE_TRIGGER_DELAY, preNs, &preTriggerDelaySetError);
+            if (!preTriggerDelaySet && !allowIntervalDecimation)
+            {
+                throw std::runtime_error(("Failed to set PVCAM pre-trigger delay for frame interval before setup: "
+                    + preTriggerDelaySetError).toStdString());
+            }
+        }
+
         uns32 frameBytes = 0;
         if (PV_OK != pl_exp_setup_cont(hcam_, 1, &roi, expMode, exposureUnits, &frameBytes, CIRC_NO_OVERWRITE))
         {
             throw std::runtime_error(pvcamError().toStdString());
+        }
+
+        // PVCAM declares PARAM_READOUT_TIME as TYPE_FLT64, but documents the actual type as uns32 microseconds.
+        uns32 readoutTimeUs = 0;
+        getParam(hcam_, PARAM_READOUT_TIME, ATTR_CURRENT, readoutTimeUs);
+        getParam(hcam_, PARAM_POST_TRIGGER_DELAY, ATTR_CURRENT, postTriggerDelayNs);
+        if (requireConstantIntervals)
+        {
+            const int64 postNs = std::max<int64>(0, postTriggerDelayNs);
+            const int64 preNs = std::max<int64>(0, targetCycleNs - exposureNs - postNs);
+            if (!preTriggerDelaySet)
+            {
+                QString setError;
+                preTriggerDelaySet = setParamIfAvailable(hcam_, PARAM_PRE_TRIGGER_DELAY, preNs, &setError);
+                if (preTriggerDelaySet)
+                {
+                    emit logMessage(QStringLiteral("PVCAM pre-trigger delay accepted after continuous setup; setup-before error was: %1")
+                        .arg(preTriggerDelaySetError));
+                }
+                else
+                {
+                    if (!allowIntervalDecimation)
+                    {
+                        throw std::runtime_error(("Failed to set PVCAM pre-trigger delay for frame interval: " + setError).toStdString());
+                    }
+                    useIntervalDecimation = true;
+                    emit logMessage(QStringLiteral("PVCAM hardware frame interval is unavailable (before setup: %1; after setup: %2); using receive-stream time gating at %3 ms.")
+                        .arg(preTriggerDelaySetError)
+                        .arg(setError)
+                        .arg(settings.frameIntervalMs, 0, 'f', 4));
+                }
+            }
+            if (preTriggerDelaySet && !getParam(hcam_, PARAM_PRE_TRIGGER_DELAY, ATTR_CURRENT, preTriggerDelayNs))
+            {
+                if (!allowIntervalDecimation)
+                {
+                    throw std::runtime_error("Failed to read PVCAM pre-trigger delay after setting the frame interval.");
+                }
+                useIntervalDecimation = true;
+                emit logMessage(QStringLiteral("PVCAM pre-trigger delay could not be read after setting; using receive-stream time gating at %1 ms.")
+                    .arg(settings.frameIntervalMs, 0, 'f', 4));
+            }
+            if (preTriggerDelaySet && !useIntervalDecimation)
+            {
+                getParam(hcam_, PARAM_POST_TRIGGER_DELAY, ATTR_CURRENT, postTriggerDelayNs);
+                const double actualCycleMs =
+                    (static_cast<double>(exposureNs) + static_cast<double>(std::max<int64>(0, preTriggerDelayNs))
+                        + static_cast<double>(std::max<int64>(0, postTriggerDelayNs))) / 1000000.0;
+                const double toleranceMs = std::max(0.25, requestedIntervalMs * 0.01);
+                if (std::abs(actualCycleMs - requestedIntervalMs) > toleranceMs)
+                {
+                    if (!allowIntervalDecimation)
+                    {
+                        throw std::runtime_error(QStringLiteral("PVCAM frame interval verification failed: requested %1 ms, actual-estimate %2 ms.")
+                            .arg(requestedIntervalMs, 0, 'f', 4)
+                            .arg(actualCycleMs, 0, 'f', 4)
+                            .toStdString());
+                    }
+                    useIntervalDecimation = true;
+                    emit logMessage(QStringLiteral("PVCAM frame interval verification failed: requested=%1 ms actual=%2 ms; using receive-stream time gating.")
+                        .arg(requestedIntervalMs, 0, 'f', 4)
+                        .arg(actualCycleMs, 0, 'f', 4));
+                }
+                else if (!deliveryModeSet)
+                {
+                    emit logMessage(QStringLiteral("PVCAM timed continuous frame interval verified by PRE_TRIGGER_DELAY without PARAM_FRAME_DELIVERY_MODE."));
+                }
+            }
         }
 
         int32 activeImageFormat = imageFormat_;
@@ -1192,6 +1591,26 @@ void PvcamCameraWorker::startContinuousCapture(const PvcamCaptureSettings& rawSe
             .arg(exposureUnitLabel(settings.exposureUnit))
             .arg(exposureMs, 0, 'f', 3)
             .arg(exposureUnits));
+        if (requireConstantIntervals && !useIntervalDecimation)
+        {
+            const double actualFrameIntervalMs =
+                (exposureMs * 1000000.0
+                    + static_cast<double>(std::max<int64>(0, preTriggerDelayNs))
+                    + static_cast<double>(std::max<int64>(0, postTriggerDelayNs)))
+                / 1000000.0;
+            emit logMessage(QStringLiteral("Kinetix CT continuous constant intervals: requested=%1 ms, actual-estimate=%2 ms, readout=%3 ms, pre-delay=%4 ms, post-delay=%5 ms, delivery-mode=%6.")
+                .arg(settings.frameIntervalMs, 0, 'f', 4)
+                .arg(actualFrameIntervalMs, 0, 'f', 4)
+                .arg(static_cast<double>(readoutTimeUs) / 1000.0, 0, 'f', 4)
+                .arg(static_cast<double>(preTriggerDelayNs) / 1000000.0, 0, 'f', 4)
+                .arg(static_cast<double>(postTriggerDelayNs) / 1000000.0, 0, 'f', 4)
+                .arg(deliveryModeSet ? QStringLiteral("constant-interval") : QStringLiteral("pre-trigger-delay")));
+        }
+        else if (useIntervalDecimation)
+        {
+            emit logMessage(QStringLiteral("Kinetix CT continuous interval strategy: camera max-rate internal continuous + receive-stream decimation, target=%1 ms.")
+                .arg(settings.frameIntervalMs, 0, 'f', 4));
+        }
 
         if (PV_OK != pl_exp_start_cont(hcam_, ringBuffer.data(), static_cast<uns32>(ringBytes)))
         {
@@ -1206,8 +1625,38 @@ void PvcamCameraWorker::startContinuousCapture(const PvcamCaptureSettings& rawSe
         int selectedCursor = 0;
         int rawCaptured = 0;
         int emitted = 0;
-        while (rawCaptured < settings.frameCount && !stopRequested_.load())
+        const qint64 continuousStartMs = timer.elapsed();
+        const qint64 firstKeepDelayMs = settings.firstKeepDelayMs > 0.0
+            ? std::max<qint64>(0, static_cast<qint64>(std::llround(settings.firstKeepDelayMs)))
+            : 0;
+        const bool useTimeGate = requireConstantIntervals || firstKeepDelayMs > 0;
+        qint64 nextKeepElapsedMs = firstKeepDelayMs;
+        if (useTimeGate && firstKeepDelayMs > 0)
         {
+            emit logMessage(QStringLiteral("Kinetix CT continuous time gate first keep delay: %1 ms.")
+                .arg(firstKeepDelayMs));
+        }
+        const qint64 timeGateTimeoutMs = useTimeGate && settings.frameIntervalMs > 0.0
+            ? static_cast<qint64>(std::ceil(settings.firstKeepDelayMs
+                + settings.frameIntervalMs * static_cast<double>(settings.frameCount)
+                + std::max(5000.0, settings.frameIntervalMs * 100.0)))
+            : 0;
+        const int rawFrameLimit = settings.rawFrameLimit > 0
+            ? settings.rawFrameLimit
+            : settings.frameCount;
+        while ((useTimeGate ? (emitted < settings.frameCount) : (rawCaptured < rawFrameLimit))
+            && !stopRequested_.load())
+        {
+            if (useTimeGate && timeGateTimeoutMs > 0
+                && timer.elapsed() - continuousStartMs > timeGateTimeoutMs)
+            {
+                throw std::runtime_error(QStringLiteral("Kinetix CT continuous time-gated capture timed out: raw=%1 kept=%2 target=%3.")
+                    .arg(rawCaptured)
+                    .arg(emitted)
+                    .arg(settings.frameCount)
+                    .toStdString());
+            }
+
             int16 status = 0;
             uns32 bytesArrived = 0;
             uns32 bufferCount = 0;
@@ -1226,18 +1675,38 @@ void PvcamCameraWorker::startContinuousCapture(const PvcamCaptureSettings& rawSe
                 }
 
                 cv::Mat wrapped(height, width, cvType, framePtr, static_cast<size_t>(strideBytes));
-                while (selectedCursor < selected.size() && selected[selectedCursor] < rawCaptured)
+                const qint64 frameTimestampMs = QDateTime::currentMSecsSinceEpoch();
+
+                bool keepFrame = false;
+                if (useTimeGate)
                 {
-                    ++selectedCursor;
+                    const qint64 elapsedFromStartMs = timer.elapsed() - continuousStartMs;
+                    if (elapsedFromStartMs + 1 >= nextKeepElapsedMs)
+                    {
+                        keepFrame = true;
+                        nextKeepElapsedMs = static_cast<qint64>(std::llround(
+                            settings.firstKeepDelayMs + settings.frameIntervalMs * static_cast<double>(emitted + 1)));
+                    }
                 }
-                const bool keepFrame = selected.isEmpty()
-                    || (selectedCursor < selected.size() && selected[selectedCursor] == rawCaptured);
+                else
+                {
+                    while (selectedCursor < selected.size() && selected[selectedCursor] < rawCaptured)
+                    {
+                        ++selectedCursor;
+                    }
+                    keepFrame = selected.isEmpty()
+                        || (selectedCursor < selected.size() && selected[selectedCursor] == rawCaptured);
+                }
 
                 CameraFrame frame;
                 if (keepFrame)
                 {
                     frame.frameIndex = rawCaptured;
-                    frame.timestampMs = QDateTime::currentMSecsSinceEpoch();
+                    frame.logicalIndex = emitted;
+                    frame.elapsedMs = useTimeGate
+                        ? static_cast<double>(timer.elapsed() - continuousStartMs)
+                        : static_cast<double>(timer.elapsed());
+                    frame.timestampMs = frameTimestampMs;
                     frame.width = width;
                     frame.height = height;
                     frame.bitDepth = bitDepth_;
@@ -1257,7 +1726,10 @@ void PvcamCameraWorker::startContinuousCapture(const PvcamCaptureSettings& rawSe
                 {
                     emit frameReady(frame);
                     ++emitted;
-                    ++selectedCursor;
+                    if (!useTimeGate)
+                    {
+                        ++selectedCursor;
+                    }
                     emit captureStatsChanged(emitted, queue_->size(), queue_->consumedCount(), droppedCount_);
                 }
                 continue;
@@ -1274,6 +1746,14 @@ void PvcamCameraWorker::startContinuousCapture(const PvcamCaptureSettings& rawSe
         {
             pl_exp_stop_cont(hcam_, CCS_HALT);
             continuousStarted = false;
+        }
+        if (!stopRequested_.load() && emitted < settings.frameCount)
+        {
+            throw std::runtime_error(QStringLiteral("Kinetix CT continuous ended before enough kept frames: raw=%1 kept=%2 target=%3.")
+                .arg(rawCaptured)
+                .arg(emitted)
+                .arg(settings.frameCount)
+                .toStdString());
         }
         capturing_.store(false);
         emit cameraStateChanged(QStringLiteral("Ready"));

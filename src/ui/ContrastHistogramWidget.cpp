@@ -49,7 +49,35 @@ void ContrastHistogramWidget::updateData(const cv::Mat& image)
         initializedFromData_ = true;
         emit windowChanged(vmin_, vmax_);
     }
+    else if (initializedFromData_)
+    {
+        const double oldMin = vmin_;
+        const double oldMax = vmax_;
+        sanitizeWindowForData();
+        if (vmin_ != oldMin || vmax_ != oldMax)
+        {
+            emit windowChanged(vmin_, vmax_);
+        }
+    }
 
+    update();
+}
+
+void ContrastHistogramWidget::setWindow(const PreviewWindow& window, bool notify)
+{
+    if (!window.isValid())
+    {
+        return;
+    }
+    vmin_ = window.lower;
+    vmax_ = window.upper;
+    sanitizeWindowForData();
+    hasWindow_ = true;
+    initializedFromData_ = true;
+    if (notify)
+    {
+        emit windowChanged(vmin_, vmax_);
+    }
     update();
 }
 
@@ -150,12 +178,13 @@ void ContrastHistogramWidget::mouseMoveEvent(QMouseEvent* event)
     const double value = xToValue(event->position().x());
     if (dragging_ == DragTarget::Min && value < vmax_)
     {
-        vmin_ = value;
+        vmin_ = std::clamp(value, dataMin_, dataMax_);
     }
     else if (dragging_ == DragTarget::Max && value > vmin_)
     {
-        vmax_ = value;
+        vmax_ = std::clamp(value, dataMin_, dataMax_);
     }
+    sanitizeWindowForData();
 
     hasWindow_ = true;
     initializedFromData_ = true;
@@ -186,6 +215,43 @@ double ContrastHistogramWidget::xToValue(double x) const
     const QRectF plot = plotRect();
     const double t = (x - plot.left()) / std::max(1.0, plot.width());
     return dataMin_ + std::clamp(t, 0.0, 1.0) * ((dataMax_ > dataMin_) ? (dataMax_ - dataMin_) : 1.0);
+}
+
+void ContrastHistogramWidget::sanitizeWindowForData()
+{
+    if (!std::isfinite(dataMin_) || !std::isfinite(dataMax_) || dataMax_ <= dataMin_)
+    {
+        return;
+    }
+    if (!std::isfinite(vmin_) || !std::isfinite(vmax_) || vmax_ <= vmin_)
+    {
+        vmin_ = dataMin_;
+        vmax_ = dataMax_;
+        return;
+    }
+
+    const double dataRange = std::max(1e-9, dataMax_ - dataMin_);
+    const double windowRange = std::clamp(vmax_ - vmin_, dataRange * 1e-6, dataRange);
+    if (vmax_ <= dataMin_ || vmin_ >= dataMax_)
+    {
+        vmin_ = dataMin_;
+        vmax_ = dataMax_;
+        return;
+    }
+
+    vmin_ = std::clamp(vmin_, dataMin_, dataMax_);
+    vmax_ = std::clamp(vmax_, dataMin_, dataMax_);
+    if (vmax_ <= vmin_)
+    {
+        const double center = std::clamp((vmin_ + vmax_) * 0.5, dataMin_, dataMax_);
+        vmin_ = std::clamp(center - windowRange * 0.5, dataMin_, dataMax_);
+        vmax_ = std::clamp(vmin_ + windowRange, dataMin_, dataMax_);
+        if (vmax_ <= vmin_)
+        {
+            vmin_ = dataMin_;
+            vmax_ = dataMax_;
+        }
+    }
 }
 
 void ContrastHistogramWidget::rebuildHistogram(const cv::Mat& image)

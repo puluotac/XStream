@@ -30,6 +30,8 @@ struct CtAcquisitionSettings
     int flatCount = 10;
     double flySpeedDegPerSec = 1.0;
     double flyLeadAngleDeg = 2.0;
+    double flyFrameIntervalMs = 0.0;
+    double flyScanTimeS = 0.0;
     bool autoCor = false;
     int padding = 4;
     QString tomoPrefix = QStringLiteral("Tomo_");

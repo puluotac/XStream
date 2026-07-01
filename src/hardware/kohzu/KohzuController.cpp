@@ -1,5 +1,6 @@
 #include "hardware/kohzu/KohzuController.h"
 
+#include <QDateTime>
 #include <QRegularExpression>
 #include <QThread>
 
@@ -10,12 +11,59 @@ namespace
 {
 
 constexpr int kIdlePollMs = 1500;
-constexpr int kActivePollMs = 80;
-constexpr int kStablePollsBeforeInactive = 6;
+constexpr int kActivePollMs = 50;
+constexpr int kStablePollsBeforeInactive = 2;
+constexpr qint64 kMinPositionStableMs = 160;
 constexpr int kConnectTimeoutMs = 1500;
 constexpr int kHandshakeTimeoutMs = 2500;
 constexpr int kInitialAxisTimeoutMs = 2000;
 constexpr int kPollAxisTimeoutMs = 700;
+
+enum class AxisMotionState
+{
+    Unknown,
+    Moving,
+    Idle
+};
+
+AxisMotionState parseAxisMotionState(const QString& statusRaw)
+{
+    // ARIES/LYNX manual: normal status response is "C STR a b c d e f g".
+    // Field b is the driving state: 0 stopped, 1 operating, 2 feedback operating.
+    static const QRegularExpression statusPattern(
+        QStringLiteral("\\bC\\s+STR\\s+(-?\\d+)\\s+(-?\\d+)\\s+(-?\\d+)\\s+(-?\\d+)\\s+(-?\\d+)\\s+(-?\\d+)\\s+(-?\\d+)\\b"),
+        QRegularExpression::CaseInsensitiveOption);
+    const QRegularExpressionMatch statusMatch = statusPattern.match(statusRaw);
+    if (statusMatch.hasMatch())
+    {
+        const int drivingState = statusMatch.captured(2).toInt();
+        if (drivingState == 0)
+        {
+            return AxisMotionState::Idle;
+        }
+        if (drivingState == 1 || drivingState == 2)
+        {
+            return AxisMotionState::Moving;
+        }
+        return AxisMotionState::Unknown;
+    }
+
+    const QString upper = statusRaw.toUpper();
+    if (upper.contains(QStringLiteral("OPERATING"))
+        || upper.contains(QStringLiteral("FB OPERATING")))
+    {
+        return AxisMotionState::Moving;
+    }
+    if (upper.contains(QStringLiteral("IDLE"))
+        || upper.contains(QStringLiteral("READY"))
+        || upper.contains(QStringLiteral("STOP"))
+        || upper.contains(QStringLiteral("END")))
+    {
+        return AxisMotionState::Idle;
+    }
+
+    return AxisMotionState::Unknown;
+}
 
 } // namespace
 
@@ -44,6 +92,9 @@ void KohzuController::clearAxes()
     axes_.clear();
     activeAxes_.clear();
     lastActivePosition_.clear();
+    lastKnownPosition_.clear();
+    activeTargetPosition_.clear();
+    activeStartedMs_.clear();
     activeStableCount_.clear();
     for (int axis : activeAxes)
     {
@@ -117,7 +168,10 @@ void KohzuController::connectToController(const QString& host, quint16 port)
     emit connectionChanged(true);
     emit logMessage(QStringLiteral("Kohzu connected: %1:%2").arg(host).arg(port));
     pollAllAxesWithTimeout(kInitialAxisTimeoutMs);
-    idlePollTimer_.start();
+    if (idlePollingEnabled_)
+    {
+        idlePollTimer_.start();
+    }
 }
 
 void KohzuController::closeConnection()
@@ -127,6 +181,8 @@ void KohzuController::closeConnection()
     const QList<int> activeAxes = activeAxes_.values();
     activeAxes_.clear();
     lastActivePosition_.clear();
+    activeTargetPosition_.clear();
+    activeStartedMs_.clear();
     activeStableCount_.clear();
     for (int axis : activeAxes)
     {
@@ -170,7 +226,9 @@ void KohzuController::jogRelativePulse(int axis, qint64 pulse, int speedTable, c
     emit commandFinished(label, ok, ok ? response : QStringLiteral("%1 %2").arg(error, response).trimmed());
     if (ok)
     {
-        markAxisActive(axis);
+        const bool hasKnownPosition = lastKnownPosition_.contains(axis);
+        const qint64 targetPulse = hasKnownPosition ? lastKnownPosition_.value(axis) + pulse : 0;
+        markAxisActive(axis, targetPulse, hasKnownPosition);
     }
     else
     {
@@ -194,7 +252,7 @@ void KohzuController::moveAbsolutePulse(int axis, qint64 pulse, int speedTable, 
     emit commandFinished(label, ok, ok ? response : QStringLiteral("%1 %2").arg(error, response).trimmed());
     if (ok)
     {
-        markAxisActive(axis);
+        markAxisActive(axis, pulse, true);
     }
     else
     {
@@ -262,7 +320,54 @@ void KohzuController::configureSpeedTableAndMoveAbsolute(int axis, qint64 pulse,
     emit commandFinished(moveLabel, moveOk, moveOk ? moveResponse : QStringLiteral("%1 %2").arg(error, moveResponse).trimmed());
     if (moveOk)
     {
-        markAxisActive(axis);
+        markAxisActive(axis, pulse, true);
+    }
+    else
+    {
+        emit axisActiveChanged(axis, false);
+    }
+}
+
+void KohzuController::configureSpeedTableAndMoveRelative(int axis, qint64 pulse, int speedTable,
+    int startSpeedPps, int topSpeedPps, int accelTime10ms, int decelTime10ms,
+    int accelPattern, const QString& speedLabel, const QString& moveLabel)
+{
+    if (!isConnected())
+    {
+        emit commandFinished(speedLabel, false, QStringLiteral("Kohzu is not connected."));
+        emit axisActiveChanged(axis, false);
+        return;
+    }
+
+    const QString speedCommand = QStringLiteral("WTB%1/%2/%3/%4/%5/%6/%7")
+        .arg(axis)
+        .arg(speedTable)
+        .arg(startSpeedPps)
+        .arg(topSpeedPps)
+        .arg(accelTime10ms)
+        .arg(decelTime10ms)
+        .arg(accelPattern);
+    QString error;
+    const QString speedResponse = query(speedCommand, &error);
+    const bool speedOk = !speedResponse.isEmpty() && speedResponse.startsWith(QLatin1Char('C'));
+    emit commandFinished(speedLabel, speedOk, speedOk ? speedResponse : QStringLiteral("%1 %2").arg(error, speedResponse).trimmed());
+    if (!speedOk)
+    {
+        emit commandFinished(moveLabel, false, QStringLiteral("speed table setup failed; move not sent"));
+        emit axisActiveChanged(axis, false);
+        return;
+    }
+
+    const QString moveCommand = QStringLiteral("RPS%1/%2/%3/1").arg(axis).arg(speedTable).arg(pulse);
+    error.clear();
+    const QString moveResponse = query(moveCommand, &error);
+    const bool moveOk = !moveResponse.isEmpty() && moveResponse.startsWith(QLatin1Char('C'));
+    emit commandFinished(moveLabel, moveOk, moveOk ? moveResponse : QStringLiteral("%1 %2").arg(error, moveResponse).trimmed());
+    if (moveOk)
+    {
+        const bool hasKnownPosition = lastKnownPosition_.contains(axis);
+        const qint64 targetPulse = hasKnownPosition ? lastKnownPosition_.value(axis) + pulse : 0;
+        markAxisActive(axis, targetPulse, hasKnownPosition);
     }
     else
     {
@@ -285,6 +390,8 @@ void KohzuController::stopAxis(int axis, const QString& label)
 
     activeAxes_.remove(axis);
     lastActivePosition_.remove(axis);
+    activeTargetPosition_.remove(axis);
+    activeStartedMs_.remove(axis);
     activeStableCount_.remove(axis);
     emit axisActiveChanged(axis, false);
     if (activeAxes_.isEmpty())
@@ -309,6 +416,8 @@ void KohzuController::stopAllAxes()
     const QList<int> activeAxes = activeAxes_.values();
     activeAxes_.clear();
     lastActivePosition_.clear();
+    activeTargetPosition_.clear();
+    activeStartedMs_.clear();
     activeStableCount_.clear();
     activePollTimer_.stop();
     for (int axis : activeAxes)
@@ -319,6 +428,10 @@ void KohzuController::stopAllAxes()
 
 void KohzuController::pollAllAxes()
 {
+    if (!idlePollingEnabled_)
+    {
+        return;
+    }
     pollAllAxesWithTimeout(kPollAxisTimeoutMs);
 }
 
@@ -363,13 +476,29 @@ void KohzuController::pollActiveAxes()
             continue;
         }
         emit axisUpdated(axis, position, status);
-        updateActiveAxisState(axis, position);
+        updateActiveAxisState(axis, position, status);
     }
 
     if (activeAxes_.isEmpty())
     {
         activePollTimer_.stop();
     }
+}
+
+void KohzuController::setIdlePollingEnabled(bool enabled)
+{
+    idlePollingEnabled_ = enabled;
+    if (!enabled)
+    {
+        idlePollTimer_.stop();
+        emit logMessage(QStringLiteral("Kohzu idle all-axis polling paused."));
+        return;
+    }
+    if (isConnected() && !idlePollTimer_.isActive())
+    {
+        idlePollTimer_.start();
+    }
+    emit logMessage(QStringLiteral("Kohzu idle all-axis polling resumed."));
 }
 
 bool KohzuController::isConnected() const
@@ -459,6 +588,7 @@ bool KohzuController::readAxis(int axis, qint64* positionPulse, QString* statusR
     {
         *positionPulse = match.captured(1).toLongLong();
     }
+    lastKnownPosition_[axis] = match.captured(1).toLongLong();
     if (statusRaw)
     {
         *statusRaw = statusResponse;
@@ -466,12 +596,21 @@ bool KohzuController::readAxis(int axis, qint64* positionPulse, QString* statusR
     return true;
 }
 
-void KohzuController::markAxisActive(int axis)
+void KohzuController::markAxisActive(int axis, qint64 targetPulse, bool hasTarget)
 {
     const bool wasActive = activeAxes_.contains(axis);
     activeAxes_.insert(axis);
     activeStableCount_[axis] = 0;
+    activeStartedMs_[axis] = QDateTime::currentMSecsSinceEpoch();
     lastActivePosition_.remove(axis);
+    if (hasTarget)
+    {
+        activeTargetPosition_[axis] = targetPulse;
+    }
+    else
+    {
+        activeTargetPosition_.remove(axis);
+    }
     if (!wasActive)
     {
         emit axisActiveChanged(axis, true);
@@ -482,8 +621,37 @@ void KohzuController::markAxisActive(int axis)
     }
 }
 
-void KohzuController::updateActiveAxisState(int axis, qint64 positionPulse)
+void KohzuController::updateActiveAxisState(int axis, qint64 positionPulse, const QString& statusRaw)
 {
+    auto finishAxis = [&]() {
+        activeAxes_.remove(axis);
+        lastActivePosition_.remove(axis);
+        activeTargetPosition_.remove(axis);
+        activeStartedMs_.remove(axis);
+        activeStableCount_.remove(axis);
+        emit axisActiveChanged(axis, false);
+    };
+
+    const AxisMotionState motionState = parseAxisMotionState(statusRaw);
+    if (motionState == AxisMotionState::Moving)
+    {
+        lastActivePosition_[axis] = positionPulse;
+        activeStableCount_[axis] = 0;
+        return;
+    }
+    if (motionState == AxisMotionState::Idle)
+    {
+        finishAxis();
+        return;
+    }
+
+    const auto targetIt = activeTargetPosition_.find(axis);
+    if (targetIt != activeTargetPosition_.end() && std::llabs(positionPulse - targetIt.value()) <= 1)
+    {
+        finishAxis();
+        return;
+    }
+
     if (!lastActivePosition_.contains(axis) || lastActivePosition_.value(axis) != positionPulse)
     {
         lastActivePosition_[axis] = positionPulse;
@@ -491,14 +659,17 @@ void KohzuController::updateActiveAxisState(int axis, qint64 positionPulse)
         return;
     }
 
+    const qint64 startedMs = activeStartedMs_.value(axis, QDateTime::currentMSecsSinceEpoch());
+    if (QDateTime::currentMSecsSinceEpoch() - startedMs < kMinPositionStableMs)
+    {
+        return;
+    }
+
     const int stableCount = activeStableCount_.value(axis, 0) + 1;
     activeStableCount_[axis] = stableCount;
     if (stableCount >= kStablePollsBeforeInactive)
     {
-        activeAxes_.remove(axis);
-        lastActivePosition_.remove(axis);
-        activeStableCount_.remove(axis);
-        emit axisActiveChanged(axis, false);
+        finishAxis();
     }
 }
 

@@ -34,6 +34,10 @@ T readValue(const QJsonObject& object, const char* key, const T& fallback)
     {
         return static_cast<float>(object.value(key).toDouble(fallback));
     }
+    else if constexpr (std::is_same_v<T, double>)
+    {
+        return object.value(key).toDouble(fallback);
+    }
     else if constexpr (std::is_same_v<T, QString>)
     {
         return object.value(key).toString(fallback);
@@ -121,6 +125,52 @@ AppConfig AppConfig::fromJsonObject(const QJsonObject& object)
     cfg.preview.enableLive = readValue(previewObj, "ENABLE_LIVE", cfg.preview.enableLive);
     cfg.preview.liveSliceIndex = readValue(previewObj, "LIVE_SLICE_INDEX", cfg.preview.liveSliceIndex);
 
+    const auto ctFlyObj = object.value("CT_FLY").toObject();
+    cfg.ctFly.allowedBlurPx = std::clamp(
+        readValue(ctFlyObj, "ALLOWED_BLUR_PX", cfg.ctFly.allowedBlurPx),
+        0.01,
+        1000.0);
+
+    const auto cameraObj = object.value("CAMERA").toObject();
+    cfg.cameraUi.exposureValue = std::clamp(
+        readValue(cameraObj, "EXPOSURE_VALUE", cfg.cameraUi.exposureValue),
+        0.001,
+        600000.0);
+    cfg.cameraUi.exposureUnit = readValue(cameraObj, "EXPOSURE_UNIT", cfg.cameraUi.exposureUnit);
+    if (cfg.cameraUi.exposureUnit != QStringLiteral("us")
+        && cfg.cameraUi.exposureUnit != QStringLiteral("ms")
+        && cfg.cameraUi.exposureUnit != QStringLiteral("s"))
+    {
+        cfg.cameraUi.exposureUnit = QStringLiteral("ms");
+    }
+    cfg.cameraUi.roiX = std::clamp(readValue(cameraObj, "ROI_X", cfg.cameraUi.roiX), 0, 3199);
+    cfg.cameraUi.roiY = std::clamp(readValue(cameraObj, "ROI_Y", cfg.cameraUi.roiY), 0, 3199);
+    cfg.cameraUi.roiWidth = std::clamp(readValue(cameraObj, "ROI_WIDTH", cfg.cameraUi.roiWidth), 1, 3200);
+    cfg.cameraUi.roiHeight = std::clamp(readValue(cameraObj, "ROI_HEIGHT", cfg.cameraUi.roiHeight), 1, 3200);
+    cfg.cameraUi.snapPrefix = readValue(cameraObj, "SNAP_PREFIX", cfg.cameraUi.snapPrefix);
+    cfg.cameraUi.snapPadding = std::clamp(readValue(cameraObj, "SNAP_PADDING", cfg.cameraUi.snapPadding), 1, 12);
+    cfg.cameraUi.snapIndex = std::clamp(readValue(cameraObj, "SNAP_INDEX", cfg.cameraUi.snapIndex), 0, 999999999);
+    cfg.cameraUi.saveDir = readValue(cameraObj, "SAVE_DIR", cfg.cameraUi.saveDir);
+
+    const auto ctAcqObj = object.value("CT_ACQUISITION").toObject();
+    cfg.ctAcquisitionUi.beginningAngleDeg = std::clamp(
+        readValue(ctAcqObj, "BEGINNING_ANGLE_DEG", cfg.ctAcquisitionUi.beginningAngleDeg),
+        -360.0,
+        360.0);
+    cfg.ctAcquisitionUi.modeIndex = std::clamp(readValue(ctAcqObj, "MODE_INDEX", cfg.ctAcquisitionUi.modeIndex), 0, 1);
+    cfg.ctAcquisitionUi.savePath = readValue(ctAcqObj, "SAVE_PATH", cfg.ctAcquisitionUi.savePath);
+    cfg.ctAcquisitionUi.projectionNum = std::clamp(readValue(ctAcqObj, "PROJECTION_NUM", cfg.ctAcquisitionUi.projectionNum), 1, 20000);
+    cfg.ctAcquisitionUi.flatGap = std::clamp(readValue(ctAcqObj, "FLAT_GAP", cfg.ctAcquisitionUi.flatGap), 0, 20000);
+    cfg.ctAcquisitionUi.flatMoveUm = std::clamp(readValue(ctAcqObj, "FLAT_MOVE_UM", cfg.ctAcquisitionUi.flatMoveUm), -500000.0, 500000.0);
+    cfg.ctAcquisitionUi.flatNum = std::clamp(readValue(ctAcqObj, "FLAT_NUM", cfg.ctAcquisitionUi.flatNum), 0, 10000);
+    cfg.ctAcquisitionUi.flyLeadAngleDeg = std::clamp(readValue(ctAcqObj, "FLY_LEAD_ANGLE_DEG", cfg.ctAcquisitionUi.flyLeadAngleDeg), 0.0, 90.0);
+    cfg.ctAcquisitionUi.autoCorReference = readValue(ctAcqObj, "AUTO_COR_REFERENCE", cfg.ctAcquisitionUi.autoCorReference);
+    cfg.ctAcquisitionUi.tiffThreads = std::clamp(readValue(ctAcqObj, "TIFF_THREADS", cfg.ctAcquisitionUi.tiffThreads), 1, 64);
+
+    const auto kohzuObj = object.value("KOHZU").toObject();
+    cfg.kohzuUi.host = readValue(kohzuObj, "HOST", cfg.kohzuUi.host);
+    cfg.kohzuUi.port = std::clamp(readValue(kohzuObj, "PORT", cfg.kohzuUi.port), 1, 65535);
+
     const auto ioObj = object.value("IO").toObject();
     cfg.io.watchDir = readValue(ioObj, "WATCH_DIR", cfg.io.watchDir);
     cfg.io.saveDir = readValue(ioObj, "SAVE_DIR", cfg.io.saveDir);
@@ -149,10 +199,20 @@ AppConfig AppConfig::fromJsonObject(const QJsonObject& object)
             continue;
         }
         MotorAxisConfig axisCfg;
-        axisCfg.hasBaseSpeed = axisObj.contains("BASE_SPEED");
-        axisCfg.baseSpeed = axisObj.value("BASE_SPEED").toDouble(axisCfg.baseSpeed);
-        axisCfg.speed = axisObj.value("SPEED").toDouble(axisCfg.speed);
-        axisCfg.accel = axisObj.value("ACCEL").toDouble(axisCfg.accel);
+        axisCfg.hasRelativeStep = axisObj.contains("RELATIVE_STEP");
+        axisCfg.relativeStep = axisObj.value("RELATIVE_STEP").toDouble(axisCfg.relativeStep);
+        axisCfg.hasAbsoluteTarget = axisObj.contains("ABSOLUTE_TARGET");
+        axisCfg.absoluteTarget = axisObj.value("ABSOLUTE_TARGET").toDouble(axisCfg.absoluteTarget);
+        axisCfg.hasBaseSpeed = axisObj.contains("START_SPEED_PER_S") || axisObj.contains("BASE_SPEED");
+        axisCfg.baseSpeed = axisObj.contains("START_SPEED_PER_S")
+            ? axisObj.value("START_SPEED_PER_S").toDouble(axisCfg.baseSpeed)
+            : axisObj.value("BASE_SPEED").toDouble(axisCfg.baseSpeed);
+        axisCfg.speed = axisObj.contains("TOP_SPEED_PER_S")
+            ? axisObj.value("TOP_SPEED_PER_S").toDouble(axisCfg.speed)
+            : axisObj.value("SPEED").toDouble(axisCfg.speed);
+        axisCfg.accel = axisObj.contains("ACCEL_TIME_S")
+            ? axisObj.value("ACCEL_TIME_S").toDouble(axisCfg.accel)
+            : axisObj.value("ACCEL").toDouble(axisCfg.accel);
         cfg.motorAxes.insert(it.key(), axisCfg);
     }
 
@@ -288,6 +348,41 @@ QJsonObject AppConfig::toJsonObject() const
     previewObj["LIVE_SLICE_INDEX"] = preview.liveSliceIndex;
     root["VIS"] = previewObj;
 
+    QJsonObject ctFlyObj;
+    ctFlyObj["ALLOWED_BLUR_PX"] = ctFly.allowedBlurPx;
+    root["CT_FLY"] = ctFlyObj;
+
+    QJsonObject cameraObj;
+    cameraObj["EXPOSURE_VALUE"] = cameraUi.exposureValue;
+    cameraObj["EXPOSURE_UNIT"] = cameraUi.exposureUnit;
+    cameraObj["ROI_X"] = cameraUi.roiX;
+    cameraObj["ROI_Y"] = cameraUi.roiY;
+    cameraObj["ROI_WIDTH"] = cameraUi.roiWidth;
+    cameraObj["ROI_HEIGHT"] = cameraUi.roiHeight;
+    cameraObj["SNAP_PREFIX"] = cameraUi.snapPrefix;
+    cameraObj["SNAP_PADDING"] = cameraUi.snapPadding;
+    cameraObj["SNAP_INDEX"] = cameraUi.snapIndex;
+    cameraObj["SAVE_DIR"] = cameraUi.saveDir;
+    root["CAMERA"] = cameraObj;
+
+    QJsonObject ctAcqObj;
+    ctAcqObj["BEGINNING_ANGLE_DEG"] = ctAcquisitionUi.beginningAngleDeg;
+    ctAcqObj["MODE_INDEX"] = ctAcquisitionUi.modeIndex;
+    ctAcqObj["SAVE_PATH"] = ctAcquisitionUi.savePath;
+    ctAcqObj["PROJECTION_NUM"] = ctAcquisitionUi.projectionNum;
+    ctAcqObj["FLAT_GAP"] = ctAcquisitionUi.flatGap;
+    ctAcqObj["FLAT_MOVE_UM"] = ctAcquisitionUi.flatMoveUm;
+    ctAcqObj["FLAT_NUM"] = ctAcquisitionUi.flatNum;
+    ctAcqObj["FLY_LEAD_ANGLE_DEG"] = ctAcquisitionUi.flyLeadAngleDeg;
+    ctAcqObj["AUTO_COR_REFERENCE"] = ctAcquisitionUi.autoCorReference;
+    ctAcqObj["TIFF_THREADS"] = ctAcquisitionUi.tiffThreads;
+    root["CT_ACQUISITION"] = ctAcqObj;
+
+    QJsonObject kohzuObj;
+    kohzuObj["HOST"] = kohzuUi.host;
+    kohzuObj["PORT"] = kohzuUi.port;
+    root["KOHZU"] = kohzuObj;
+
     QJsonObject ioObj;
     ioObj["WATCH_DIR"] = io.watchDir;
     ioObj["SAVE_DIR"] = io.saveDir;
@@ -310,6 +405,11 @@ QJsonObject AppConfig::toJsonObject() const
     for (auto it = motorAxes.begin(); it != motorAxes.end(); ++it)
     {
         QJsonObject axisObj;
+        axisObj["RELATIVE_STEP"] = it.value().relativeStep;
+        axisObj["ABSOLUTE_TARGET"] = it.value().absoluteTarget;
+        axisObj["START_SPEED_PER_S"] = it.value().baseSpeed;
+        axisObj["TOP_SPEED_PER_S"] = it.value().speed;
+        axisObj["ACCEL_TIME_S"] = it.value().accel;
         axisObj["BASE_SPEED"] = it.value().baseSpeed;
         axisObj["SPEED"] = it.value().speed;
         axisObj["ACCEL"] = it.value().accel;

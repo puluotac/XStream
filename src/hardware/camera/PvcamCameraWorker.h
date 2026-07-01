@@ -41,6 +41,10 @@ struct PvcamCaptureSettings
     QString singleFramePath;
     qint64 previewIntervalMs = 33;
     QVector<int> selectedFrameIndices;
+    int rawFrameLimit = 0;
+    double frameIntervalMs = 0.0;
+    double firstKeepDelayMs = 0.0;
+    bool allowFrameIntervalDecimation = false;
 };
 
 class PvcamCameraWorker : public QObject
