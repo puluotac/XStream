@@ -7,15 +7,19 @@
 #include "core/recon/GpuProjectionBatch.h"
 #include "cuda/offline_tomo_kernels.h"
 #include "cuda/preprocess_kernels.h"
+#include "cuda/stripe_removal_kernels.h"
 
 #include <QDir>
 #include <QElapsedTimer>
+#include <QCoreApplication>
+#include <QDateTime>
 #include <QFile>
 #include <QFileInfo>
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QThread>
+#include <QTextStream>
 
 #include <cuda_runtime.h>
 #include <cufft.h>
@@ -43,6 +47,16 @@ namespace
 {
 
 constexpr double kPi = 3.14159265358979323846;
+
+void appendReconDebug(const QString& text)
+{
+    QFile file(QCoreApplication::applicationDirPath() + QStringLiteral("/ct_recon_debug.log"));
+    if (file.open(QIODevice::WriteOnly | QIODevice::Append | QIODevice::Text))
+    {
+        QTextStream stream(&file);
+        stream << QDateTime::currentDateTime().toString(Qt::ISODateWithMs) << " " << text << '\n';
+    }
+}
 
 QString formatSeconds(qint64 ms)
 {
@@ -318,6 +332,29 @@ void ensureCufft(cufftResult status, const char* message)
 class DeviceFloatBuffer
 {
 public:
+    DeviceFloatBuffer() = default;
+    DeviceFloatBuffer(const DeviceFloatBuffer&) = delete;
+    DeviceFloatBuffer& operator=(const DeviceFloatBuffer&) = delete;
+    DeviceFloatBuffer(DeviceFloatBuffer&& other) noexcept
+        : ptr_(other.ptr_)
+        , count_(other.count_)
+    {
+        other.ptr_ = nullptr;
+        other.count_ = 0;
+    }
+    DeviceFloatBuffer& operator=(DeviceFloatBuffer&& other) noexcept
+    {
+        if (this != &other)
+        {
+            release();
+            ptr_ = other.ptr_;
+            count_ = other.count_;
+            other.ptr_ = nullptr;
+            other.count_ = 0;
+        }
+        return *this;
+    }
+
     ~DeviceFloatBuffer()
     {
         release();
@@ -396,6 +433,15 @@ public:
         release();
         count_ = count;
         return cudaMalloc(&ptr_, count * sizeof(cufftComplex)) == cudaSuccess;
+    }
+
+    bool ensureCapacity(size_t count)
+    {
+        if (count <= count_ && ptr_ != nullptr)
+        {
+            return true;
+        }
+        return allocate(count);
     }
 
     void release()
@@ -1313,6 +1359,204 @@ cv::Mat makePreviewSliceFromChunk(const std::vector<uint16_t>& chunk, int zCount
     return slice;
 }
 
+void applyStripeRemovalFwIfEnabled(const AppConfig& config, float* deviceSino,
+    int zCount, int angleCount, int width, cudaStream_t stream,
+    const OfflineTomoReconstruction::LogCallback& log)
+{
+    if (!config.stripe.enable)
+    {
+        return;
+    }
+
+    if (config.stripe.method.compare(QStringLiteral("FW"), Qt::CaseInsensitive) != 0)
+    {
+        log(QStringLiteral("Stripe removal method '%1' is not implemented in C++; using FW db5.")
+            .arg(config.stripe.method));
+    }
+
+    const int sliceChunk = std::clamp(config.stripe.chunk, 1, std::max(1, zCount));
+    const float sigma = std::max(0.01f, config.stripe.sigma);
+    const int autoLevel = static_cast<int>(std::ceil(std::log2(static_cast<double>(std::max({ zCount, angleCount, width })))));
+    const int requestedLevel = config.stripe.level > 0 ? config.stripe.level : std::min(autoLevel, 4);
+    const int level = std::clamp(requestedLevel, 1, 20);
+    const int paddedAngleCount = config.stripe.pad ? (angleCount + angleCount / 8) : angleCount;
+    const int angleShift = (paddedAngleCount - angleCount) / 2;
+
+    DeviceFloatBuffer current;
+    DeviceFloatBuffer nextApprox;
+    DeviceFloatBuffer tempA;
+    DeviceFloatBuffer tempD;
+    DeviceFloatBuffer horiz;
+    DeviceFloatBuffer low;
+    DeviceFloatBuffer work;
+    DeviceComplexBuffer spectrum;
+    const size_t fullCount = static_cast<size_t>(sliceChunk) * paddedAngleCount * width;
+    if (!current.allocate(fullCount) || !nextApprox.allocate(fullCount)
+        || !tempA.allocate(fullCount) || !tempD.allocate(fullCount)
+        || !horiz.allocate(fullCount) || !low.allocate(fullCount)
+        || !work.allocate(fullCount))
+    {
+        throw std::runtime_error("Failed to allocate FW stripe removal GPU buffers.");
+    }
+
+    struct FwLevel
+    {
+        int angleLen = 0;
+        int widthLen = 0;
+        int angleCoeffLen = 0;
+        int widthCoeffLen = 0;
+        DeviceFloatBuffer cH;
+        DeviceFloatBuffer cV;
+        DeviceFloatBuffer cD;
+    };
+
+    const QString stripeMessage = QStringLiteral("FW stripe removal running: z=%1, angles=%2, width=%3, level=%4, sliceChunk=%5, sigma=%6.")
+        .arg(zCount)
+        .arg(angleCount)
+        .arg(width)
+        .arg(level)
+        .arg(sliceChunk)
+        .arg(sigma, 0, 'g', 6);
+    log(stripeMessage);
+    appendReconDebug(stripeMessage);
+
+    for (int zOffset = 0; zOffset < zCount; zOffset += sliceChunk)
+    {
+        const int currZ = std::min(sliceChunk, zCount - zOffset);
+        appendReconDebug(QStringLiteral("FW stripe zOffset=%1 currZ=%2").arg(zOffset).arg(currZ));
+        float* currSino = deviceSino + static_cast<size_t>(zOffset) * angleCount * width;
+        if (!launchPadStripeInput(currSino, current.ptr(), currZ, angleCount, paddedAngleCount,
+                width, angleShift, stream))
+        {
+            throw std::runtime_error("FW stripe pad input failed.");
+        }
+
+        std::vector<FwLevel> levels;
+        levels.reserve(static_cast<size_t>(level));
+        int currentAngleLen = paddedAngleCount;
+        int currentWidthLen = width;
+        float* currentPtr = current.ptr();
+        for (int lev = 0; lev < level; ++lev)
+        {
+            const int angleCoeffLen = (currentAngleLen + 9) / 2;
+            const int anglePaddedLen = angleCoeffLen * 2;
+            const int widthCoeffLen = (currentWidthLen + 9) / 2;
+            const int widthPaddedLen = widthCoeffLen * 2;
+            FwLevel fw;
+            fw.angleLen = currentAngleLen;
+            fw.widthLen = currentWidthLen;
+            fw.angleCoeffLen = angleCoeffLen;
+            fw.widthCoeffLen = widthCoeffLen;
+            const size_t bandCount = static_cast<size_t>(currZ) * angleCoeffLen * widthCoeffLen;
+            if (!fw.cH.allocate(bandCount) || !fw.cV.allocate(bandCount) || !fw.cD.allocate(bandCount))
+            {
+                throw std::runtime_error("Failed to allocate FW stripe wavelet bands.");
+            }
+            if (!launchDwtAxis1Db5(currentPtr, tempA.ptr(), tempD.ptr(),
+                    currZ, currentAngleLen, currentWidthLen, angleCoeffLen, anglePaddedLen, stream))
+            {
+                throw std::runtime_error("FW stripe DWT axis-angle failed.");
+            }
+            if (!launchDwtAxis2Db5(tempA.ptr(), nextApprox.ptr(), fw.cV.ptr(),
+                    currZ, angleCoeffLen, currentWidthLen, widthCoeffLen, widthPaddedLen, stream))
+            {
+                throw std::runtime_error("FW stripe DWT low detector failed.");
+            }
+            if (!launchDwtAxis2Db5(tempD.ptr(), fw.cH.ptr(), fw.cD.ptr(),
+                    currZ, angleCoeffLen, currentWidthLen, widthCoeffLen, widthPaddedLen, stream))
+            {
+                throw std::runtime_error("FW stripe DWT high detector failed.");
+            }
+            levels.push_back(std::move(fw));
+            std::swap(current, nextApprox);
+            currentPtr = current.ptr();
+            currentAngleLen = angleCoeffLen;
+            currentWidthLen = widthCoeffLen;
+            if (currentAngleLen <= 1 || currentWidthLen <= 1)
+            {
+                break;
+            }
+        }
+
+        for (FwLevel& fw : levels)
+        {
+            const int spectrumLength = fw.angleCoeffLen / 2 + 1;
+            const int vectorCount = currZ * fw.widthCoeffLen;
+            const size_t spectrumCount = static_cast<size_t>(vectorCount) * spectrumLength;
+            if (!spectrum.ensureCapacity(spectrumCount))
+            {
+                throw std::runtime_error("Failed to allocate FW stripe spectrum buffer.");
+            }
+            if (!launchPackSinogramColumnsForStripe(fw.cV.ptr(), work.ptr(),
+                    currZ, fw.angleCoeffLen, fw.widthCoeffLen, stream))
+            {
+                throw std::runtime_error("FW stripe pack vertical detail failed.");
+            }
+
+            CufftHandle r2cPlan;
+            CufftHandle c2rPlan;
+            int n[1] = { fw.angleCoeffLen };
+            int inembed[1] = { fw.angleCoeffLen };
+            int onembed[1] = { spectrumLength };
+            ensureCufft(cufftPlanMany(r2cPlan.out(), 1, n,
+                inembed, 1, fw.angleCoeffLen,
+                onembed, 1, spectrumLength,
+                CUFFT_R2C, vectorCount), "FW stripe vertical detail R2C plan");
+            ensureCufft(cufftPlanMany(c2rPlan.out(), 1, n,
+                onembed, 1, spectrumLength,
+                inembed, 1, fw.angleCoeffLen,
+                CUFFT_C2R, vectorCount), "FW stripe vertical detail C2R plan");
+            cufftSetStream(r2cPlan.get(), stream);
+            cufftSetStream(c2rPlan.get(), stream);
+            ensureCufft(cufftExecR2C(r2cPlan.get(),
+                reinterpret_cast<cufftReal*>(work.ptr()), spectrum.ptr()), "FW stripe vertical detail R2C");
+            if (!launchDampStripeSpectrum(spectrum.ptr(), vectorCount, spectrumLength,
+                    fw.angleCoeffLen, sigma, stream))
+            {
+                throw std::runtime_error("FW stripe vertical detail spectrum damping failed.");
+            }
+            ensureCufft(cufftExecC2R(c2rPlan.get(), spectrum.ptr(),
+                reinterpret_cast<cufftReal*>(work.ptr())), "FW stripe vertical detail C2R");
+            if (!launchUnpackSinogramColumnsForStripe(work.ptr(), fw.cV.ptr(),
+                    currZ, fw.angleCoeffLen, fw.widthCoeffLen, stream))
+            {
+                throw std::runtime_error("FW stripe unpack vertical detail failed.");
+            }
+        }
+
+        currentPtr = current.ptr();
+        for (int lev = static_cast<int>(levels.size()) - 1; lev >= 0; --lev)
+        {
+            FwLevel& fw = levels[static_cast<size_t>(lev)];
+            if (!launchIdwtAxis2Db5(fw.cH.ptr(), fw.cD.ptr(), horiz.ptr(),
+                    currZ, fw.angleCoeffLen, fw.widthCoeffLen, fw.widthLen, stream))
+            {
+                throw std::runtime_error("FW stripe IDWT detector high failed.");
+            }
+            if (!launchIdwtAxis2Db5(currentPtr, fw.cV.ptr(), low.ptr(),
+                    currZ, fw.angleCoeffLen, fw.widthCoeffLen, fw.widthLen, stream))
+            {
+                throw std::runtime_error("FW stripe IDWT detector low failed.");
+            }
+            if (!launchIdwtAxis1Db5(low.ptr(), horiz.ptr(), work.ptr(),
+                    currZ, fw.angleCoeffLen, fw.widthLen, fw.angleLen, stream))
+            {
+                throw std::runtime_error("FW stripe IDWT angle failed.");
+            }
+            std::swap(current, work);
+            currentPtr = current.ptr();
+        }
+
+        if (!launchCropStripeOutput(currentPtr, currSino, currZ, angleCount,
+                paddedAngleCount, width, angleShift, stream))
+        {
+            throw std::runtime_error("FW stripe crop output failed.");
+        }
+    }
+
+    ensureCuda(cudaStreamSynchronize(stream), "FW stripe removal sync");
+}
+
 qint64 runOfflineFbp(const AppConfig& config, const std::vector<float>& projectionStack,
     std::atomic_bool& stopRequested,
     const OfflineTomoReconstruction::LogCallback& log,
@@ -1419,6 +1663,8 @@ qint64 runOfflineFbp(const AppConfig& config, const std::vector<float>& projecti
         ensureCuda(cudaMemcpyAsync(deviceSino.ptr(), hostSino.data(),
             hostSino.size() * sizeof(float), cudaMemcpyHostToDevice, stream), "upload offline FBP sinogram");
         ensureCuda(cudaEventRecord(evAfterUpload.get(), stream), "record offline FBP upload event");
+
+        applyStripeRemovalFwIfEnabled(config, deviceSino.ptr(), currH, angleCount, width, stream, log);
 
         const int transformCount = currH * angleCount;
         if (!launchPrepareFbpInput(deviceSino.ptr(), devicePadded.ptr(), transformCount, width, paddedLength, stream))
@@ -1668,6 +1914,8 @@ qint64 runOfflineGridrec(const AppConfig& config, const std::vector<float>& proj
             hostSino.size() * sizeof(float), cudaMemcpyHostToDevice, stream), "upload offline Gridrec sinogram");
         ensureCuda(cudaEventRecord(evAfterUpload.get(), stream), "record offline Gridrec upload event");
 
+        applyStripeRemovalFwIfEnabled(config, deviceSino.ptr(), currH, angleCount, width, stream, log);
+
         const int transformCount = currH * angleCount;
         if (!launchPrepareFbpInput(deviceSino.ptr(), devicePadded.ptr(), transformCount, width, paddedLength, stream))
         {
@@ -1817,6 +2065,12 @@ OfflineTomoResult OfflineTomoReconstruction::run(const AppConfig& inputConfig,
 {
     (void)previewSuggested;
     AppConfig config = inputConfig;
+    appendReconDebug(QStringLiteral("OfflineTomoReconstruction run enter method=%1 stripe=%2 level=%3 watch=%4 save=%5")
+        .arg(toString(config.io.reconMethod))
+        .arg(config.stripe.enable)
+        .arg(config.stripe.level)
+        .arg(config.io.watchDir)
+        .arg(config.io.saveDir));
     config.io.tiffThreads = std::clamp(config.io.tiffThreads, 1, 64);
     if (config.io.watchDir.isEmpty())
     {
@@ -1837,6 +2091,18 @@ OfflineTomoResult OfflineTomoReconstruction::run(const AppConfig& inputConfig,
 
     log(QStringLiteral("=== Starting %1 ===").arg(toString(config.io.reconMethod)));
     log(QStringLiteral("Offline TIFF writer threads requested: %1.").arg(config.io.tiffThreads));
+    if (config.stripe.enable)
+    {
+        log(QStringLiteral("FW stripe removal enabled: sigma=%1, level=%2, wname=%3, z-chunk=%4. Runs on sinograms before Offline FBP/Gridrec filtering.")
+            .arg(config.stripe.sigma, 0, 'g', 6)
+            .arg(config.stripe.level)
+            .arg(config.stripe.waveletName.isEmpty() ? QStringLiteral("db5") : config.stripe.waveletName)
+            .arg(std::max(1, config.stripe.chunk)));
+        if (config.stripe.level > 0)
+        {
+            log(QStringLiteral("FW stripe uses db5 DWT/IDWT and damps vertical detail coefficients in Fourier space."));
+        }
+    }
     if (config.io.correctionMode == CorrectionMode::FlatDark)
     {
         log(QStringLiteral("Offline waiting for dark reference..."));

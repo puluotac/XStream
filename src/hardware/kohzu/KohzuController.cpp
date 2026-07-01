@@ -1,6 +1,7 @@
 #include "hardware/kohzu/KohzuController.h"
 
 #include <QRegularExpression>
+#include <QThread>
 
 namespace ct
 {
@@ -11,6 +12,10 @@ namespace
 constexpr int kIdlePollMs = 1500;
 constexpr int kActivePollMs = 80;
 constexpr int kStablePollsBeforeInactive = 6;
+constexpr int kConnectTimeoutMs = 1500;
+constexpr int kHandshakeTimeoutMs = 2500;
+constexpr int kInitialAxisTimeoutMs = 2000;
+constexpr int kPollAxisTimeoutMs = 700;
 
 } // namespace
 
@@ -52,7 +57,7 @@ void KohzuController::connectToController(const QString& host, quint16 port)
 
     socket_ = new QTcpSocket(this);
     socket_->connectToHost(host, port);
-    if (!socket_->waitForConnected(1500))
+    if (!socket_->waitForConnected(kConnectTimeoutMs))
     {
         const QString error = socket_->errorString();
         delete socket_;
@@ -62,21 +67,56 @@ void KohzuController::connectToController(const QString& host, quint16 port)
         return;
     }
 
-    emit connectionChanged(true);
-    emit logMessage(QStringLiteral("Kohzu connected: %1:%2").arg(host).arg(port));
+    emit logMessage(QStringLiteral("Kohzu TCP connected: %1:%2, checking controller response...").arg(host).arg(port));
 
     QString idnError;
-    const QString idn = query(QStringLiteral("IDN"), &idnError);
-    if (!idn.isEmpty())
+    QString idn;
+    for (int attempt = 1; attempt <= 3 && idn.isEmpty(); ++attempt)
+    {
+        if (attempt > 1)
+        {
+            emit logMessage(QStringLiteral("Kohzu IDN retry %1/3...").arg(attempt));
+            QThread::msleep(300);
+        }
+        idn = query(QStringLiteral("IDN"), &idnError, kHandshakeTimeoutMs);
+    }
+
+    bool controllerReady = !idn.isEmpty();
+    if (controllerReady)
     {
         emit logMessage(QStringLiteral("Kohzu IDN: %1").arg(idn));
     }
-    else if (!idnError.isEmpty())
+    else
     {
-        emit logMessage(QStringLiteral("Kohzu IDN failed: %1").arg(idnError));
+        emit logMessage(QStringLiteral("Kohzu IDN failed after retries: %1").arg(idnError));
+        for (int axis : axes_)
+        {
+            qint64 position = 0;
+            QString status;
+            QString axisError;
+            if (readAxis(axis, &position, &status, &axisError, kInitialAxisTimeoutMs))
+            {
+                emit logMessage(QStringLiteral("Kohzu controller verified by axis %1 read.").arg(axis));
+                emit axisUpdated(axis, position, status);
+                controllerReady = true;
+                break;
+            }
+        }
     }
 
-    pollAllAxes();
+    if (!controllerReady)
+    {
+        const QString finalError = idnError.isEmpty()
+            ? QStringLiteral("controller did not respond")
+            : idnError;
+        emit logMessage(QStringLiteral("Kohzu protocol handshake failed; socket will be closed: %1").arg(finalError));
+        closeConnection();
+        return;
+    }
+
+    emit connectionChanged(true);
+    emit logMessage(QStringLiteral("Kohzu connected: %1:%2").arg(host).arg(port));
+    pollAllAxesWithTimeout(kInitialAxisTimeoutMs);
     idlePollTimer_.start();
 }
 
@@ -162,6 +202,74 @@ void KohzuController::moveAbsolutePulse(int axis, qint64 pulse, int speedTable, 
     }
 }
 
+void KohzuController::configureSpeedTable(int axis, int speedTable, int startSpeedPps, int topSpeedPps,
+    int accelTime10ms, int decelTime10ms, int accelPattern, const QString& label)
+{
+    if (!isConnected())
+    {
+        emit commandFinished(label, false, QStringLiteral("Kohzu is not connected."));
+        return;
+    }
+
+    const QString command = QStringLiteral("WTB%1/%2/%3/%4/%5/%6/%7")
+        .arg(axis)
+        .arg(speedTable)
+        .arg(startSpeedPps)
+        .arg(topSpeedPps)
+        .arg(accelTime10ms)
+        .arg(decelTime10ms)
+        .arg(accelPattern);
+    QString error;
+    const QString response = query(command, &error);
+    const bool ok = !response.isEmpty() && response.startsWith(QLatin1Char('C'));
+    emit commandFinished(label, ok, ok ? response : QStringLiteral("%1 %2").arg(error, response).trimmed());
+}
+
+void KohzuController::configureSpeedTableAndMoveAbsolute(int axis, qint64 pulse, int speedTable,
+    int startSpeedPps, int topSpeedPps, int accelTime10ms, int decelTime10ms,
+    int accelPattern, const QString& speedLabel, const QString& moveLabel)
+{
+    if (!isConnected())
+    {
+        emit commandFinished(speedLabel, false, QStringLiteral("Kohzu is not connected."));
+        emit axisActiveChanged(axis, false);
+        return;
+    }
+
+    const QString speedCommand = QStringLiteral("WTB%1/%2/%3/%4/%5/%6/%7")
+        .arg(axis)
+        .arg(speedTable)
+        .arg(startSpeedPps)
+        .arg(topSpeedPps)
+        .arg(accelTime10ms)
+        .arg(decelTime10ms)
+        .arg(accelPattern);
+    QString error;
+    const QString speedResponse = query(speedCommand, &error);
+    const bool speedOk = !speedResponse.isEmpty() && speedResponse.startsWith(QLatin1Char('C'));
+    emit commandFinished(speedLabel, speedOk, speedOk ? speedResponse : QStringLiteral("%1 %2").arg(error, speedResponse).trimmed());
+    if (!speedOk)
+    {
+        emit commandFinished(moveLabel, false, QStringLiteral("speed table setup failed; move not sent"));
+        emit axisActiveChanged(axis, false);
+        return;
+    }
+
+    const QString moveCommand = QStringLiteral("APS%1/%2/%3/1").arg(axis).arg(speedTable).arg(pulse);
+    error.clear();
+    const QString moveResponse = query(moveCommand, &error);
+    const bool moveOk = !moveResponse.isEmpty() && moveResponse.startsWith(QLatin1Char('C'));
+    emit commandFinished(moveLabel, moveOk, moveOk ? moveResponse : QStringLiteral("%1 %2").arg(error, moveResponse).trimmed());
+    if (moveOk)
+    {
+        markAxisActive(axis);
+    }
+    else
+    {
+        emit axisActiveChanged(axis, false);
+    }
+}
+
 void KohzuController::stopAxis(int axis, const QString& label)
 {
     if (!isConnected())
@@ -211,6 +319,11 @@ void KohzuController::stopAllAxes()
 
 void KohzuController::pollAllAxes()
 {
+    pollAllAxesWithTimeout(kPollAxisTimeoutMs);
+}
+
+void KohzuController::pollAllAxesWithTimeout(int timeoutMs)
+{
     if (!isConnected())
     {
         return;
@@ -221,7 +334,7 @@ void KohzuController::pollAllAxes()
         qint64 position = 0;
         QString status;
         QString error;
-        if (!readAxis(axis, &position, &status, &error))
+        if (!readAxis(axis, &position, &status, &error, timeoutMs))
         {
             emit logMessage(QStringLiteral("Axis %1 read failed: %2").arg(axis).arg(error));
             continue;
@@ -308,10 +421,10 @@ QString KohzuController::query(const QString& command, QString* error, int timeo
     return QString::fromLatin1(response).trimmed();
 }
 
-bool KohzuController::readAxis(int axis, qint64* positionPulse, QString* statusRaw, QString* error)
+bool KohzuController::readAxis(int axis, qint64* positionPulse, QString* statusRaw, QString* error, int timeoutMs)
 {
     QString localError;
-    const QString posResponse = query(QStringLiteral("RDP%1").arg(axis), &localError, 700);
+    const QString posResponse = query(QStringLiteral("RDP%1").arg(axis), &localError, timeoutMs);
     if (posResponse.isEmpty())
     {
         if (error)
@@ -332,7 +445,7 @@ bool KohzuController::readAxis(int axis, qint64* positionPulse, QString* statusR
         return false;
     }
 
-    const QString statusResponse = query(QStringLiteral("STR%1").arg(axis), &localError, 700);
+    const QString statusResponse = query(QStringLiteral("STR%1").arg(axis), &localError, timeoutMs);
     if (statusResponse.isEmpty())
     {
         if (error)

@@ -66,6 +66,24 @@ AppConfig AppConfig::fromJsonObject(const QJsonObject& object)
     cfg.phase.pixelSizeUm = readValue(phaseObj, "PIXEL_SIZE_UM", cfg.phase.pixelSizeUm);
     cfg.phase.alphaRatio = readValue(phaseObj, "ALPHA_RATIO", cfg.phase.alphaRatio);
 
+    const auto stripeObj = object.value("STRIPE").toObject();
+    cfg.stripe.enable = readValue(stripeObj, "ENABLE", cfg.stripe.enable);
+    cfg.stripe.method = readValue(stripeObj, "METHOD", cfg.stripe.method).toUpper();
+    if (cfg.stripe.method.isEmpty())
+    {
+        cfg.stripe.method = QStringLiteral("FW");
+    }
+    cfg.stripe.level = std::clamp(readValue(stripeObj, "LEVEL", cfg.stripe.level), 0, 20);
+    cfg.stripe.waveletName = readValue(stripeObj, "WNAME", cfg.stripe.waveletName);
+    if (cfg.stripe.waveletName.isEmpty())
+    {
+        cfg.stripe.waveletName = QStringLiteral("db5");
+    }
+    cfg.stripe.sigma = std::max(0.01f, readValue(stripeObj, "SIGMA", cfg.stripe.sigma));
+    cfg.stripe.pad = readValue(stripeObj, "PAD", cfg.stripe.pad);
+    cfg.stripe.chunk = std::clamp(readValue(stripeObj, "NCHUNK", cfg.stripe.chunk), 1, 1024);
+    cfg.stripe.enable = false;
+
     const auto preprocessObj = object.value("PREPROCESS").toObject();
     cfg.preprocess.method = PreprocessMethod::Log;
     cfg.preprocess.airValue = 1.0f;
@@ -131,6 +149,8 @@ AppConfig AppConfig::fromJsonObject(const QJsonObject& object)
             continue;
         }
         MotorAxisConfig axisCfg;
+        axisCfg.hasBaseSpeed = axisObj.contains("BASE_SPEED");
+        axisCfg.baseSpeed = axisObj.value("BASE_SPEED").toDouble(axisCfg.baseSpeed);
         axisCfg.speed = axisObj.value("SPEED").toDouble(axisCfg.speed);
         axisCfg.accel = axisObj.value("ACCEL").toDouble(axisCfg.accel);
         cfg.motorAxes.insert(it.key(), axisCfg);
@@ -225,6 +245,16 @@ QJsonObject AppConfig::toJsonObject() const
     phaseObj["ALPHA_RATIO"] = phase.alphaRatio;
     root["PHASE"] = phaseObj;
 
+    QJsonObject stripeObj;
+    stripeObj["ENABLE"] = false;
+    stripeObj["METHOD"] = stripe.method.isEmpty() ? QStringLiteral("FW") : stripe.method;
+    stripeObj["LEVEL"] = stripe.level;
+    stripeObj["WNAME"] = stripe.waveletName.isEmpty() ? QStringLiteral("db5") : stripe.waveletName;
+    stripeObj["SIGMA"] = stripe.sigma;
+    stripeObj["PAD"] = stripe.pad;
+    stripeObj["NCHUNK"] = stripe.chunk;
+    root["STRIPE"] = stripeObj;
+
     QJsonObject preprocessObj;
     preprocessObj["TAPER_WIDTH"] = preprocess.taperWidth;
     preprocessObj["FILTER_TYPE"] = toString(preprocess.filterType);
@@ -280,6 +310,7 @@ QJsonObject AppConfig::toJsonObject() const
     for (auto it = motorAxes.begin(); it != motorAxes.end(); ++it)
     {
         QJsonObject axisObj;
+        axisObj["BASE_SPEED"] = it.value().baseSpeed;
         axisObj["SPEED"] = it.value().speed;
         axisObj["ACCEL"] = it.value().accel;
         motorObj[it.key()] = axisObj;

@@ -10,6 +10,8 @@
 #include <filesystem>
 #include <iomanip>
 #include <iostream>
+#include <condition_variable>
+#include <mutex>
 #include <sstream>
 #include <string>
 #include <thread>
@@ -25,7 +27,20 @@ struct Options
     int roiWidth = 512;
     int roiHeight = 512;
     bool fullFrame = false;
+    bool useCallback = false;
     std::filesystem::path outputDir = "E:/2026_Chun/2026_06_09/pvcam_capture_test";
+};
+
+struct EofWaitContext
+{
+    int16 hcam = -1;
+    std::mutex mutex;
+    std::condition_variable condition;
+    bool eof = false;
+    bool error = false;
+    uns32 frameCount = 0;
+    FRAME_INFO frameInfo {};
+    void* latestFrame = nullptr;
 };
 
 std::string pvcamError()
@@ -99,6 +114,10 @@ Options parseOptions(int argc, char** argv)
         {
             options.fullFrame = true;
         }
+        else if (arg == "--callback")
+        {
+            options.useCallback = true;
+        }
         else if (arg == "--output")
         {
             options.outputDir = nextValue("--output");
@@ -107,7 +126,7 @@ Options parseOptions(int argc, char** argv)
         {
             std::cout
                 << "Usage: pvcam_capture_test [--frames N] [--exposure-ms N] [--roi WxH]\n"
-                << "                          [--full-frame] [--output DIR]\n";
+                << "                          [--full-frame] [--callback] [--output DIR]\n";
             std::exit(0);
         }
         else
@@ -119,6 +138,38 @@ Options parseOptions(int argc, char** argv)
     options.frames = std::max(1, options.frames);
     options.exposureMs = std::max<uns32>(1, options.exposureMs);
     return options;
+}
+
+void printEnumOptions(int16 hcam, uns32 paramId, const char* label)
+{
+    uns32 count = 0;
+    if (PV_OK != pl_get_param(hcam, paramId, ATTR_COUNT, &count))
+    {
+        std::cout << label << " options unavailable: " << pvcamError() << '\n';
+        return;
+    }
+
+    std::cout << label << " options (" << count << "):\n";
+    for (uns32 index = 0; index < count; ++index)
+    {
+        int32 value = 0;
+        uns32 length = 0;
+        if (PV_OK != pl_enum_str_length(hcam, paramId, index, &length) || length == 0)
+        {
+            std::cout << "  [" << index << "] <name unavailable>\n";
+            continue;
+        }
+
+        std::vector<char> text(length + 1, '\0');
+        if (PV_OK == pl_get_enum_param(hcam, paramId, index, &value, text.data(), length))
+        {
+            std::cout << "  [" << index << "] value=" << value << ", text=" << text.data() << '\n';
+        }
+        else
+        {
+            std::cout << "  [" << index << "] <value unavailable>: " << pvcamError() << '\n';
+        }
+    }
 }
 
 template <typename T>
@@ -157,6 +208,117 @@ bool enumContains(int16 hcam, uns32 paramId, int32 wanted)
         }
     }
     return false;
+}
+
+bool paramAvailable(int16 hcam, uns32 paramId)
+{
+    rs_bool available = FALSE;
+    return PV_OK == pl_get_param(hcam, paramId, ATTR_AVAIL, &available) && available == TRUE;
+}
+
+bool firstEnumValue(int16 hcam, uns32 paramId, int32& value, std::string& name)
+{
+    uns32 count = 0;
+    if (PV_OK != pl_get_param(hcam, paramId, ATTR_COUNT, &count) || count == 0)
+    {
+        return false;
+    }
+
+    uns32 length = 0;
+    if (PV_OK != pl_enum_str_length(hcam, paramId, 0, &length) || length == 0)
+    {
+        return false;
+    }
+
+    std::vector<char> text(length + 1, '\0');
+    if (PV_OK != pl_get_enum_param(hcam, paramId, 0, &value, text.data(), length))
+    {
+        return false;
+    }
+    name = text.data();
+    return true;
+}
+
+std::string readStringParam(int16 hcam, uns32 paramId, size_t maxLength)
+{
+    std::vector<char> text(std::max<size_t>(1, maxLength), '\0');
+    if (PV_OK == pl_get_param(hcam, paramId, ATTR_CURRENT, text.data()))
+    {
+        return text.data();
+    }
+    return {};
+}
+
+void initializeReadoutLikeSdkSample(int16 hcam)
+{
+    pl_pp_reset(hcam);
+
+    int32 readoutPort = 0;
+    std::string readoutPortName;
+    if (paramAvailable(hcam, PARAM_READOUT_PORT)
+        && firstEnumValue(hcam, PARAM_READOUT_PORT, readoutPort, readoutPortName))
+    {
+        if (!check(PV_OK == pl_set_param(hcam, PARAM_READOUT_PORT, &readoutPort), "pl_set_param(PARAM_READOUT_PORT)"))
+        {
+            throw std::runtime_error("Failed to initialize readout port.");
+        }
+        std::cout << "Readout port set to '" << readoutPortName << "'\n";
+    }
+
+    if (paramAvailable(hcam, PARAM_SPDTAB_INDEX))
+    {
+        int16 speedIndex = 0;
+        if (!check(PV_OK == pl_set_param(hcam, PARAM_SPDTAB_INDEX, &speedIndex), "pl_set_param(PARAM_SPDTAB_INDEX)"))
+        {
+            throw std::runtime_error("Failed to initialize readout speed.");
+        }
+        std::cout << "Readout speed index set to " << speedIndex;
+        const std::string speedName = readStringParam(hcam, PARAM_SPDTAB_NAME, MAX_SPDTAB_NAME_LEN);
+        if (!speedName.empty())
+        {
+            std::cout << " ('" << speedName << "')";
+        }
+        std::cout << '\n';
+    }
+
+    if (paramAvailable(hcam, PARAM_GAIN_INDEX))
+    {
+        int16 gainIndex = 1;
+        if (!check(PV_OK == pl_set_param(hcam, PARAM_GAIN_INDEX, &gainIndex), "pl_set_param(PARAM_GAIN_INDEX)"))
+        {
+            throw std::runtime_error("Failed to initialize gain.");
+        }
+        std::cout << "Gain index set to " << gainIndex;
+        const std::string gainName = readStringParam(hcam, PARAM_GAIN_NAME, MAX_GAIN_NAME_LEN);
+        if (!gainName.empty())
+        {
+            std::cout << " ('" << gainName << "')";
+        }
+        std::cout << '\n';
+    }
+
+    if (paramAvailable(hcam, PARAM_CLEAR_CYCLES))
+    {
+        uns16 clearCycles = 2;
+        pl_set_param(hcam, PARAM_CLEAR_CYCLES, &clearCycles);
+    }
+
+    if (paramAvailable(hcam, PARAM_PMODE))
+    {
+        rs_bool frameCapable = FALSE;
+        int32 pMode = PMODE_NORMAL;
+        if (paramAvailable(hcam, PARAM_FRAME_CAPABLE)
+            && PV_OK == pl_get_param(hcam, PARAM_FRAME_CAPABLE, ATTR_CURRENT, &frameCapable)
+            && frameCapable == TRUE)
+        {
+            pMode = PMODE_FT;
+        }
+        if (!check(PV_OK == pl_set_param(hcam, PARAM_PMODE, &pMode), "pl_set_param(PARAM_PMODE)"))
+        {
+            throw std::runtime_error("Failed to initialize PMODE.");
+        }
+        std::cout << "PMODE set to " << (pMode == PMODE_FT ? "FT" : "NORMAL") << '\n';
+    }
 }
 
 int16 selectInternalExposureMode(int16 hcam)
@@ -364,6 +526,52 @@ bool waitForReadout(int16 hcam, uns32 timeoutMs, uns32& bytesArrived)
     return false;
 }
 
+void PV_DECL eofCallback(const FRAME_INFO* frameInfo, void* context)
+{
+    if (context == nullptr)
+    {
+        return;
+    }
+
+    auto* eof = static_cast<EofWaitContext*>(context);
+    {
+        std::lock_guard<std::mutex> lock(eof->mutex);
+        ++eof->frameCount;
+        if (frameInfo != nullptr)
+        {
+            eof->frameInfo = *frameInfo;
+        }
+        eof->latestFrame = nullptr;
+        if (PV_OK != pl_exp_get_latest_frame(eof->hcam, &eof->latestFrame))
+        {
+            eof->error = true;
+        }
+        eof->eof = true;
+    }
+    eof->condition.notify_one();
+}
+
+bool waitForEof(EofWaitContext& eof, uns32 timeoutMs)
+{
+    std::unique_lock<std::mutex> lock(eof.mutex);
+    const bool ready = eof.condition.wait_for(
+        lock,
+        std::chrono::milliseconds(timeoutMs),
+        [&eof]() { return eof.eof || eof.error; });
+    if (!ready)
+    {
+        std::cerr << "Timed out waiting for EOF callback. Frames=" << eof.frameCount << '\n';
+        return false;
+    }
+    if (eof.error)
+    {
+        std::cerr << "EOF callback failed to get latest frame.\n";
+        return false;
+    }
+    eof.eof = false;
+    return eof.latestFrame != nullptr;
+}
+
 std::filesystem::path framePath(const std::filesystem::path& dir, int index)
 {
     std::ostringstream name;
@@ -390,6 +598,8 @@ int main(int argc, char** argv)
     bool initialized = false;
     bool opened = false;
     bool acquisitionSetup = false;
+    bool callbackRegistered = false;
+    EofWaitContext eofContext;
 
     try
     {
@@ -419,6 +629,8 @@ int main(int argc, char** argv)
         }
         opened = true;
         std::cout << "Opened camera: " << cameraName << '\n';
+        eofContext.hcam = hcam;
+        initializeReadoutLikeSdkSample(hcam);
 
         uns16 sensorWidth = 0;
         uns16 sensorHeight = 0;
@@ -436,6 +648,8 @@ int main(int argc, char** argv)
             1,
             static_cast<uns32>(std::llround(static_cast<double>(options.exposureMs) * expResolution.unitsPerMillisecond)));
         const int16 expMode = selectInternalExposureMode(hcam);
+        printEnumOptions(hcam, PARAM_EXPOSURE_MODE, "Exposure mode");
+        printEnumOptions(hcam, PARAM_EXPOSE_OUT_MODE, "Expose out");
 
         std::cout << "Sensor: " << sensorWidth << "x" << sensorHeight << '\n';
         std::cout << "ROI: s=[" << roi.s1 << "," << roi.s2 << "], p=[" << roi.p1 << "," << roi.p2
@@ -443,6 +657,19 @@ int main(int argc, char** argv)
         std::cout << "Frames: " << options.frames << ", exposure: " << options.exposureMs
                   << " ms (" << exposureUnits << " PVCAM units)\n";
         std::cout << "Output: " << options.outputDir.string() << '\n';
+        std::cout << "Wait mode: " << (options.useCallback ? "EOF callback" : "pl_exp_check_status polling") << '\n';
+
+        if (options.useCallback)
+        {
+            if (!check(PV_OK == pl_cam_register_callback_ex3(hcam, PL_CALLBACK_EOF,
+                           reinterpret_cast<void*>(eofCallback), &eofContext),
+                    "pl_cam_register_callback_ex3(EOF)"))
+            {
+                return 1;
+            }
+            callbackRegistered = true;
+            std::cout << "EOF callback registered.\n";
+        }
 
         uns32 exposureBytes = 0;
         if (!check(PV_OK == pl_exp_setup_seq(hcam, 1, 1, const_cast<rgn_type*>(&roi), expMode,
@@ -478,7 +705,22 @@ int main(int argc, char** argv)
 
             uns32 bytesArrived = 0;
             const uns32 timeoutMs = std::max<uns32>(5000, options.exposureMs + 5000);
-            if (!waitForReadout(hcam, timeoutMs, bytesArrived))
+            bool acquired = false;
+            if (options.useCallback)
+            {
+                acquired = waitForEof(eofContext, timeoutMs);
+                bytesArrived = exposureBytes;
+                if (acquired)
+                {
+                    std::cout << "EOF frame " << eofContext.frameInfo.FrameNr
+                              << ", timestamp=" << eofContext.frameInfo.TimeStamp << '\n';
+                }
+            }
+            else
+            {
+                acquired = waitForReadout(hcam, timeoutMs, bytesArrived);
+            }
+            if (!acquired)
             {
                 pl_exp_abort(hcam, CCS_HALT);
                 return 1;
@@ -504,6 +746,11 @@ int main(int argc, char** argv)
         if (!check(PV_OK == pl_exp_uninit_seq(), "pl_exp_uninit_seq"))
         {
             return 1;
+        }
+        if (callbackRegistered)
+        {
+            pl_cam_deregister_callback(hcam, PL_CALLBACK_EOF);
+            callbackRegistered = false;
         }
 
         opened = false;
@@ -533,6 +780,10 @@ int main(int argc, char** argv)
         {
             pl_exp_abort(hcam, CCS_HALT);
             pl_exp_uninit_seq();
+        }
+        if (callbackRegistered)
+        {
+            pl_cam_deregister_callback(hcam, PL_CALLBACK_EOF);
         }
         pl_cam_close(hcam);
     }

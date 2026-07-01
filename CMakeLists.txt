@@ -41,6 +41,8 @@ add_library(ct_workstation_cuda STATIC
     src/cuda/preprocess_kernels.cu
     src/cuda/offline_tomo_kernels.h
     src/cuda/offline_tomo_kernels.cu
+    src/cuda/stripe_removal_kernels.h
+    src/cuda/stripe_removal_kernels.cu
 )
 
 target_include_directories(ct_workstation_cuda
@@ -71,6 +73,8 @@ add_library(ct_workstation_core STATIC
     src/app/ReconstructionController.h
     src/app/ReconstructionController.cpp
     src/core/acq/CtAcquisitionTypes.h
+    src/core/acq/CtReplayAcquisitionWorker.h
+    src/core/acq/CtReplayAcquisitionWorker.cpp
     src/core/acq/CtTiffWriter.h
     src/core/acq/CtTiffWriter.cpp
     src/core/config/AppConfig.h
@@ -86,6 +90,8 @@ add_library(ct_workstation_core STATIC
     src/core/cor/CorEstimatorFft.cpp
     src/core/io/FileProjectionSource.h
     src/core/io/FileProjectionSource.cpp
+    src/core/io/ImageFileIo.h
+    src/core/io/ImageFileIo.cpp
     src/hardware/camera/BoundedFrameQueue.h
     src/hardware/camera/BoundedFrameQueue.cpp
     src/hardware/camera/CameraFrame.h
@@ -217,6 +223,23 @@ target_include_directories(ct_reconstruct_headless
 )
 
 target_link_libraries(ct_reconstruct_headless
+    PRIVATE
+        Qt6::Core
+        ${OpenCV_LIBS}
+        ct_workstation_core
+)
+
+add_executable(ct_pipeline_replay
+    tools/ct_pipeline_replay.cpp
+)
+
+target_include_directories(ct_pipeline_replay
+    PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src
+        ${OpenCV_INCLUDE_DIRS}
+)
+
+target_link_libraries(ct_pipeline_replay
     PRIVATE
         Qt6::Core
         ${OpenCV_LIBS}

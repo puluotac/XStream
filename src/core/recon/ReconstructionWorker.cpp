@@ -13,7 +13,11 @@
 #include "core/recon/ReconstructionRuntimeCache.h"
 
 #include <QElapsedTimer>
+#include <QCoreApplication>
+#include <QDateTime>
+#include <QFile>
 #include <QThread>
+#include <QTextStream>
 
 #include <cuda_runtime.h>
 
@@ -45,6 +49,16 @@ constexpr size_t kMaxPinnedSlabBytes = static_cast<size_t>(1024) * 1024 * 1024;
 QString formatGiB(size_t bytes)
 {
     return QString::number(static_cast<double>(bytes) / (1024.0 * 1024.0 * 1024.0), 'f', 2);
+}
+
+void appendReconDebug(const QString& text)
+{
+    QFile file(QCoreApplication::applicationDirPath() + QStringLiteral("/ct_recon_debug.log"));
+    if (file.open(QIODevice::WriteOnly | QIODevice::Append | QIODevice::Text))
+    {
+        QTextStream stream(&file);
+        stream << QDateTime::currentDateTime().toString(Qt::ISODateWithMs) << " " << text << '\n';
+    }
 }
 
 size_t volumeBytes(int depth, int height, int width)
@@ -293,6 +307,10 @@ void ReconstructionWorker::process()
 {
     try
     {
+        appendReconDebug(QStringLiteral("worker process enter method=%1 stripe=%2 level=%3")
+            .arg(toString(config_.io.reconMethod))
+            .arg(config_.stripe.enable)
+            .arg(config_.stripe.level));
         const auto finishStopped = [this]() {
             emit logMessage(QStringLiteral(">>> Reconstruction stopped."));
             emit reconstructionFinished();
@@ -301,10 +319,12 @@ void ReconstructionWorker::process()
         stopRequested_.store(false);
         emit logMessage(QStringLiteral("=== Starting C++ Custom Recon ==="));
         emit logMessage(QStringLiteral("Recon method dispatch: %1.").arg(toString(config_.io.reconMethod)));
+        appendReconDebug(QStringLiteral("worker emitted start logs"));
 
         if (config_.io.reconMethod == ReconMethod::OfflineFBP
             || config_.io.reconMethod == ReconMethod::OfflineGridrec)
         {
+            appendReconDebug(QStringLiteral("worker entering OfflineTomoReconstruction"));
             auto result = OfflineTomoReconstruction::run(config_, stopRequested_,
                 [this](const QString& text) { emit logMessage(text); },
                 [this](int current, int total) { emit progressUpdated(current, total); },
@@ -316,6 +336,7 @@ void ReconstructionWorker::process()
                 });
             volumeBuffer_ = result.volume;
             config_ = result.config;
+            appendReconDebug(QStringLiteral("worker OfflineTomoReconstruction returned"));
             if (stopRequested_.load())
             {
                 finishStopped();
@@ -937,6 +958,7 @@ void ReconstructionWorker::process()
     }
     catch (const std::exception& ex)
     {
+        appendReconDebug(QStringLiteral("worker caught exception: %1").arg(QString::fromLocal8Bit(ex.what())));
         emit reconstructionFailed(QString::fromLocal8Bit(ex.what()));
     }
 }

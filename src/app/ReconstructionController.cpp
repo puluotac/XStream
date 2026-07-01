@@ -7,6 +7,11 @@
 
 #include <algorithm>
 
+#include <QCoreApplication>
+#include <QDateTime>
+#include <QFile>
+#include <QTextStream>
+
 namespace ct
 {
 
@@ -16,6 +21,16 @@ namespace
 bool isOfflineMethod(ReconMethod method)
 {
     return method == ReconMethod::OfflineFBP || method == ReconMethod::OfflineGridrec;
+}
+
+void appendReconDebug(const QString& text)
+{
+    QFile file(QCoreApplication::applicationDirPath() + QStringLiteral("/ct_recon_debug.log"));
+    if (file.open(QIODevice::WriteOnly | QIODevice::Append | QIODevice::Text))
+    {
+        QTextStream stream(&file);
+        stream << QDateTime::currentDateTime().toString(Qt::ISODateWithMs) << " " << text << '\n';
+    }
 }
 
 } // namespace
@@ -49,14 +64,24 @@ void ReconstructionController::shutdown()
 
 void ReconstructionController::startReconstruction(const AppConfig& config)
 {
+    appendReconDebug(QStringLiteral("startReconstruction enter method=%1 stripe=%2 level=%3 z=%4 batch=%5 watch=%6 save=%7")
+        .arg(toString(config.io.reconMethod))
+        .arg(config.stripe.enable)
+        .arg(config.stripe.level)
+        .arg(config.compute.zChunkSize)
+        .arg(config.compute.batchSize)
+        .arg(config.io.watchDir)
+        .arg(config.io.saveDir));
     if (busy_)
     {
+        appendReconDebug(QStringLiteral("startReconstruction ignored: busy"));
         return;
     }
 
     latestVolume_.reset();
     latestConfig_ = config;
     busy_ = true;
+    appendReconDebug(QStringLiteral("startReconstruction emit busy true"));
     emit busyChanged(true);
     if (previewWorker_ != nullptr)
     {
@@ -65,11 +90,15 @@ void ReconstructionController::startReconstruction(const AppConfig& config)
         }, Qt::QueuedConnection);
     }
 
+    appendReconDebug(QStringLiteral("startReconstruction allocate thread"));
     reconstructionThread_ = new QThread(this);
+    appendReconDebug(QStringLiteral("startReconstruction allocate worker"));
     reconstructionWorker_ = new ReconstructionWorker(config,
         isOfflineMethod(config.io.reconMethod) ? nullptr : runtimeCache_);
+    appendReconDebug(QStringLiteral("startReconstruction move worker"));
     reconstructionWorker_->moveToThread(reconstructionThread_);
 
+    appendReconDebug(QStringLiteral("startReconstruction connect signals"));
     connect(reconstructionThread_, &QThread::started, reconstructionWorker_, &ReconstructionWorker::process);
     connect(reconstructionWorker_, &ReconstructionWorker::logMessage, this, &ReconstructionController::logMessage);
     connect(reconstructionWorker_, &ReconstructionWorker::progressUpdated, this, &ReconstructionController::progressUpdated);
@@ -115,7 +144,9 @@ void ReconstructionController::startReconstruction(const AppConfig& config)
         emit reconstructionFailed(error);
     });
 
+    appendReconDebug(QStringLiteral("startReconstruction thread start"));
     reconstructionThread_->start();
+    appendReconDebug(QStringLiteral("startReconstruction thread start returned"));
 }
 
 void ReconstructionController::stopReconstruction()

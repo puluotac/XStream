@@ -13,14 +13,23 @@
 namespace ct
 {
 
+enum class CtAcquisitionMode
+{
+    StepAndShoot,
+    FlyScan
+};
+
 struct CtAcquisitionSettings
 {
+    CtAcquisitionMode mode = CtAcquisitionMode::StepAndShoot;
     QString savePath;
     double beginningAngleDeg = 0.0;
     int projectionCount = 1080;
     int flatGap = 0;
     double flatMoveDistanceUm = 0.0;
     int flatCount = 10;
+    double flySpeedDegPerSec = 1.0;
+    double flyLeadAngleDeg = 2.0;
     bool autoCor = false;
     int padding = 4;
     QString tomoPrefix = QStringLiteral("Tomo_");

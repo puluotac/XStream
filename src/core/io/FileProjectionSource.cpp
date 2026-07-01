@@ -1,47 +1,17 @@
 #include "core/io/FileProjectionSource.h"
 
+#include "core/io/ImageFileIo.h"
+
 #include <QDir>
 #include <QFile>
 #include <QFileInfo>
 #include <QRegularExpression>
 #include <QThread>
 
-#include <opencv2/imgcodecs.hpp>
-#include <opencv2/imgproc.hpp>
-
 #include <utility>
 
 namespace ct
 {
-
-namespace
-{
-
-cv::Mat loadImageWithQtPath(const QString& filePath)
-{
-    cv::Mat image = cv::imread(filePath.toLocal8Bit().constData(), cv::IMREAD_UNCHANGED);
-    if (!image.empty())
-    {
-        return image;
-    }
-
-    QFile file(filePath);
-    if (!file.open(QIODevice::ReadOnly))
-    {
-        return {};
-    }
-
-    const QByteArray encoded = file.readAll();
-    if (encoded.isEmpty())
-    {
-        return {};
-    }
-
-    std::vector<uchar> buffer(encoded.begin(), encoded.end());
-    return cv::imdecode(buffer, cv::IMREAD_UNCHANGED);
-}
-
-} // namespace
 
 FileProjectionSource::FileProjectionSource(IoConfig config)
     : config_(std::move(config))
@@ -172,13 +142,9 @@ cv::Mat FileProjectionSource::readImageRobust(const QString& filePath) const
         QFileInfo info(filePath);
         if (info.exists() && info.size() > 0)
         {
-            cv::Mat image = loadImageWithQtPath(filePath);
+            cv::Mat image = readImageFile(filePath);
             if (!image.empty())
             {
-                if (image.channels() > 1)
-                {
-                    cv::cvtColor(image, image, cv::COLOR_BGR2GRAY);
-                }
                 return image;
             }
         }

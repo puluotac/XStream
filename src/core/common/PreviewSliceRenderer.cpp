@@ -16,10 +16,18 @@ constexpr int kMaxSamples = 65536;
 
 PreviewWindow minMaxWindow(const cv::Mat& slice)
 {
+    if (slice.empty())
+    {
+        return {};
+    }
     double minValue = 0.0;
     double maxValue = 0.0;
     cv::minMaxLoc(slice, &minValue, &maxValue);
 
+    if (!std::isfinite(minValue) || !std::isfinite(maxValue))
+    {
+        return {};
+    }
     if (maxValue <= minValue)
     {
         maxValue = minValue + 1.0;
@@ -148,7 +156,11 @@ QImage PreviewSliceRenderer::renderFloatSlice(const cv::Mat& slice, const Previe
         return {};
     }
 
-    const PreviewWindow effectiveWindow = window.isValid() ? window : minMaxWindow(slice);
+    PreviewWindow effectiveWindow = window.isValid() ? window : minMaxWindow(slice);
+    if (!effectiveWindow.isValid())
+    {
+        effectiveWindow = { 0.0, 1.0 };
+    }
     const double range = effectiveWindow.upper - effectiveWindow.lower;
 
     cv::Mat normalized;

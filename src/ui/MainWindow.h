@@ -2,6 +2,7 @@
 
 #include "app/ReconstructionController.h"
 #include "core/acq/CtAcquisitionTypes.h"
+#include "core/acq/CtReplayAcquisitionWorker.h"
 #include "core/acq/CtTiffWriter.h"
 #include "core/common/PreviewSliceRenderer.h"
 #include "core/config/AppConfig.h"
@@ -29,6 +30,7 @@ class QCloseEvent;
 class QListWidget;
 class QFileSystemWatcher;
 class QTimer;
+class QTabWidget;
 
 namespace ct
 {
@@ -75,10 +77,23 @@ private:
     void updateCameraFrame(const CameraFrame& frame);
     void updateCameraFrameForCtPreview(const CameraFrame& frame);
     void renderCameraPreviewWithCurrentWindow();
+    void updateCameraPixelHover(int previewX, int previewY);
+    void updateReconPixelHover(int x, int y);
     void startReconstruction();
     void startCtAcquisition();
     void stopCtAcquisition();
     void maybeStartCtSmokeAutostart();
+    void maybeStartCtReplayAutostart();
+    void startInternalCtReplay();
+    void handleReplayCtFrame(const CameraFrame& frame, const QString& filePath, bool isFlat, bool isCor180);
+    void finishInternalCtReplay(bool ok, const QString& message);
+    void startCtInitialMotorMove();
+    void startCtFlyInitialMove();
+    void advanceCtFlyAcquisition();
+    void startCtFlyScanMove();
+    void startCtFlyScanMotorSweep();
+    void startCtMotorTiming(const QString& action);
+    void finishCtMotorTiming(const QString& action);
     void advanceCtAcquisition();
     void requestCtFrame(CtFrameKind kind);
     void enqueueCtFrame(const CameraFrame& frame);
@@ -130,6 +145,8 @@ private:
     PvcamCameraWorker* cameraWorker_ = nullptr;
     QThread ctWriterThread_;
     CtTiffWriter* ctWriter_ = nullptr;
+    QThread ctReplayThread_;
+    CtReplayAcquisitionWorker* ctReplayWorker_ = nullptr;
     QThread kohzuThread_;
     KohzuController* kohzuController_ = nullptr;
     bool motorConnected_ = false;
@@ -137,14 +154,18 @@ private:
     AppConfig sessionConfig_ = AppConfig::defaults();
     cv::Mat lastRawCameraFrame_;
     cv::Mat lastCameraSaveFrame_;
+    cv::Mat lastCameraHoverFrame_;
     cv::Mat lastRawReconPreviewSlice_;
     PreviewWindow currentCameraPreviewWindow_;
     PreviewWindow currentReconPreviewWindow_;
     qint64 cameraPreviewFrameCount_ = 0;
     qint64 lastCameraPreviewRenderMs_ = 0;
+    double cameraPreviewScaleX_ = 1.0;
+    double cameraPreviewScaleY_ = 1.0;
     int pendingSingleSnapIndex_ = -1;
     bool cameraLiveRunning_ = false;
     bool cameraRestartLiveAfterStop_ = false;
+    bool ctRestoreLiveAfterFinish_ = false;
     bool cameraSnapSaveInProgress_ = false;
     bool ctRunning_ = false;
     bool ctStopRequested_ = false;
@@ -153,11 +174,13 @@ private:
     bool ctWaitingForMotor_ = false;
     bool ctPendingFrameIsFlat_ = false;
     CtFrameKind ctPendingFrameKind_ = CtFrameKind::Tomo;
+    int ctPendingFrameBatchRemaining_ = 0;
     bool ctProjectionNeedsMove_ = false;
     bool ctCorReferencePending_ = false;
     bool ctCorReferenceCaptured_ = false;
     bool ctYIsOutForFlat_ = false;
     bool ctFinalFlatDone_ = false;
+    bool ctReplayRunning_ = false;
     QString ctPendingMotorAction_;
     int ctProjectionIndex_ = 0;
     int ctFlatIndex_ = 0;
@@ -166,6 +189,9 @@ private:
     int ctLastFlatAfterProjectionCount_ = -1;
     double ctCurrentAngleDeg_ = 0.0;
     QString ctManifestPath_;
+    QVector<QString> ctReplayJobQueue_;
+    QVector<QString> ctReplayTargetQueue_;
+    QVector<QString> ctReplayOutputQueue_;
     QString activeQueueJobPath_;
     QString activeQueueProjectionDir_;
     QString activeQueueOutputDir_;
@@ -179,6 +205,41 @@ private:
     QStringList recentLogLines_;
     CtAcquisitionSettings ctSettings_;
     QVector<CtFlatGroup> ctFlatGroups_;
+    QVector<QJsonObject> ctFlyFrames_;
+    bool ctFlyScanRequested_ = false;
+    bool ctFlyScanCapturing_ = false;
+    bool ctFlyScanMoveDone_ = false;
+    bool ctFlyRestartingPreparedAfterScan_ = false;
+    int ctFlyFlatStage_ = 0;
+    int ctFlyContinuousFramesReceived_ = 0;
+    int ctFlyRawFramePlan_ = 0;
+    qint64 ctFlyScanStartedMs_ = 0;
+    qint64 ctFlyScanFinishedMs_ = 0;
+    qint64 ctAcquisitionStartedMs_ = 0;
+    qint64 ctFirstFrameRequestedMs_ = 0;
+    qint64 ctLastFrameEnqueuedMs_ = 0;
+    qint64 ctWriterFinishRequestedMs_ = 0;
+    qint64 ctPreparedStartedMs_ = 0;
+    qint64 ctPreparedReadyMs_ = 0;
+    qint64 ctCurrentFrameBatchStartedMs_ = 0;
+    qint64 ctCurrentMotorMoveStartedMs_ = 0;
+    qint64 ctPreparedSetupMs_ = 0;
+    qint64 ctMotorMoveMs_ = 0;
+    qint64 ctRMoveMs_ = 0;
+    qint64 ctYMoveMs_ = 0;
+    qint64 ctFrameCaptureMs_ = 0;
+    qint64 ctFrameEnqueueMs_ = 0;
+    qint64 ctWriterDrainMs_ = 0;
+    qint64 ctCompletedMs_ = 0;
+    int ctMotorMoveCount_ = 0;
+    int ctRMoveCount_ = 0;
+    int ctYMoveCount_ = 0;
+    int ctFrameBatchCount_ = 0;
+    int ctFrameSavedCount_ = 0;
+    qint64 ctWriterStartedMs_ = 0;
+    qint64 ctWriterFrameBytes_ = 0;
+    int ctWriterThreads_ = 0;
+    int ctWriterQueueCapacity_ = 0;
 
     QLineEdit* watchDirEdit_ = nullptr;
     QLineEdit* saveDirEdit_ = nullptr;
@@ -202,6 +263,9 @@ private:
     QDoubleSpinBox* distanceSpin_ = nullptr;
     QDoubleSpinBox* pixelSpin_ = nullptr;
     QDoubleSpinBox* alphaSpin_ = nullptr;
+    QCheckBox* stripeEnableCheck_ = nullptr;
+    QSpinBox* stripeLevelSpin_ = nullptr;
+    QDoubleSpinBox* stripeSigmaSpin_ = nullptr;
     QSpinBox* taperSpin_ = nullptr;
     QSpinBox* flatGapSpin_ = nullptr;
     QSpinBox* flatNumSpin_ = nullptr;
@@ -240,18 +304,24 @@ private:
     QSpinBox* cameraSnapIndexSpin_ = nullptr;
     QLineEdit* cameraSaveDirEdit_ = nullptr;
     QLabel* cameraStateLabel_ = nullptr;
+    QLabel* cameraPixelLabel_ = nullptr;
     QPushButton* cameraSnapButton_ = nullptr;
     QPushButton* cameraLiveButton_ = nullptr;
     QDoubleSpinBox* ctBeginningAngleSpin_ = nullptr;
+    QTabWidget* ctModeTabs_ = nullptr;
     QLineEdit* ctSavePathEdit_ = nullptr;
     QSpinBox* ctProjectionNumSpin_ = nullptr;
     QSpinBox* ctFlatGapSpin_ = nullptr;
     QDoubleSpinBox* ctFlatMoveSpin_ = nullptr;
     QSpinBox* ctFlatNumSpin_ = nullptr;
+    QDoubleSpinBox* ctFlySpeedSpin_ = nullptr;
+    QDoubleSpinBox* ctFlyLeadAngleSpin_ = nullptr;
+    QDoubleSpinBox* ctFlyTotalAngleSpin_ = nullptr;
     QCheckBox* ctAutoCorCheck_ = nullptr;
     QSpinBox* ctTiffThreadsSpin_ = nullptr;
     QLabel* ctStatusLabel_ = nullptr;
-    QLabel* ctQueueLabel_ = nullptr;
+    QLabel* ctWriterLabel_ = nullptr;
+    QLabel* ctBufferLabel_ = nullptr;
     QPushButton* ctStartButton_ = nullptr;
     QPushButton* ctStopButton_ = nullptr;
 
@@ -259,6 +329,7 @@ private:
     ZoomPanImageView* reconPreviewView_ = nullptr;
     QSlider* previewSliceSlider_ = nullptr;
     QLabel* previewSliceValueLabel_ = nullptr;
+    QLabel* reconPixelLabel_ = nullptr;
     ContrastHistogramWidget* cameraHistogramWidget_ = nullptr;
     ContrastHistogramWidget* reconHistogramWidget_ = nullptr;
     bool cameraPreviewFitInitialized_ = false;
@@ -290,6 +361,8 @@ private:
         QDoubleSpinBox* absoluteSpin = nullptr;
         QPushButton* goButton = nullptr;
         QLabel* speedUnitLabel = nullptr;
+        QWidget* speedWidget = nullptr;
+        QDoubleSpinBox* baseSpeedSpin = nullptr;
         QDoubleSpinBox* speedSpin = nullptr;
         QDoubleSpinBox* accelSpin = nullptr;
         bool active = false;

@@ -4,6 +4,7 @@
 
 #include <opencv2/core.hpp>
 
+#include <cmath>
 #include <vector>
 
 namespace ct
@@ -16,7 +17,7 @@ struct PreviewWindow
 
     bool isValid() const
     {
-        return upper > lower;
+        return std::isfinite(lower) && std::isfinite(upper) && upper > lower;
     }
 };
 

@@ -1,12 +1,17 @@
 #include "hardware/camera/PvcamCameraWorker.h"
 
+#include "core/io/ImageFileIo.h"
+
 #include <QDateTime>
 #include <QDir>
 #include <QElapsedTimer>
+#include <QFile>
 #include <QFileInfo>
+#include <QCoreApplication>
 #include <QMetaType>
-
-#include <opencv2/imgcodecs.hpp>
+#include <QStringList>
+#include <QTextStream>
+#include <QThread>
 
 #include <algorithm>
 #include <cmath>
@@ -25,6 +30,16 @@ namespace ct
 
 namespace
 {
+
+void writePvcamTrace(const QString& text)
+{
+    QFile file(QDir(QCoreApplication::applicationDirPath()).filePath(QStringLiteral("ct_startup_trace.log")));
+    if (file.open(QIODevice::WriteOnly | QIODevice::Append | QIODevice::Text))
+    {
+        QTextStream stream(&file);
+        stream << QDateTime::currentDateTime().toString(Qt::ISODateWithMs) << " " << text << '\n';
+    }
+}
 
 #ifdef CT_HAS_PVCAM
 
@@ -67,6 +82,115 @@ bool enumContains(int16 hcam, uns32 paramId, int32 wanted)
         }
     }
     return false;
+}
+
+bool paramAvailable(int16 hcam, uns32 paramId)
+{
+    rs_bool available = FALSE;
+    return PV_OK == pl_get_param(hcam, paramId, ATTR_AVAIL, &available) && available == TRUE;
+}
+
+bool firstEnumValue(int16 hcam, uns32 paramId, int32& value, QString& name)
+{
+    uns32 count = 0;
+    if (PV_OK != pl_get_param(hcam, paramId, ATTR_COUNT, &count) || count == 0)
+    {
+        return false;
+    }
+
+    uns32 length = 0;
+    if (PV_OK != pl_enum_str_length(hcam, paramId, 0, &length) || length == 0)
+    {
+        return false;
+    }
+
+    std::vector<char> text(length + 1, '\0');
+    if (PV_OK != pl_get_enum_param(hcam, paramId, 0, &value, text.data(), length))
+    {
+        return false;
+    }
+    name = QString::fromLatin1(text.data());
+    return true;
+}
+
+QString readStringParam(int16 hcam, uns32 paramId, int maxLength)
+{
+    std::vector<char> text(static_cast<size_t>(std::max(1, maxLength)), '\0');
+    if (PV_OK == pl_get_param(hcam, paramId, ATTR_CURRENT, text.data()))
+    {
+        return QString::fromLatin1(text.data());
+    }
+    return {};
+}
+
+QString initializeKinetixReadout(int16 hcam)
+{
+    QStringList messages;
+
+    pl_pp_reset(hcam);
+
+    int32 readoutPort = 0;
+    QString readoutPortName;
+    if (paramAvailable(hcam, PARAM_READOUT_PORT)
+        && firstEnumValue(hcam, PARAM_READOUT_PORT, readoutPort, readoutPortName))
+    {
+        if (PV_OK != pl_set_param(hcam, PARAM_READOUT_PORT, &readoutPort))
+        {
+            throw std::runtime_error(("Failed to set PVCAM readout port: " + pvcamError()).toStdString());
+        }
+        messages << QStringLiteral("readout port '%1'").arg(readoutPortName);
+    }
+
+    if (paramAvailable(hcam, PARAM_SPDTAB_INDEX))
+    {
+        int16 speedIndex = 0;
+        if (PV_OK != pl_set_param(hcam, PARAM_SPDTAB_INDEX, &speedIndex))
+        {
+            throw std::runtime_error(("Failed to set PVCAM speed index: " + pvcamError()).toStdString());
+        }
+        const QString speedName = readStringParam(hcam, PARAM_SPDTAB_NAME, MAX_SPDTAB_NAME_LEN);
+        messages << QStringLiteral("speed index %1%2")
+            .arg(speedIndex)
+            .arg(speedName.isEmpty() ? QString() : QStringLiteral(" '%1'").arg(speedName));
+    }
+
+    if (paramAvailable(hcam, PARAM_GAIN_INDEX))
+    {
+        int16 gainIndex = 1;
+        if (PV_OK != pl_set_param(hcam, PARAM_GAIN_INDEX, &gainIndex))
+        {
+            throw std::runtime_error(("Failed to set PVCAM gain index: " + pvcamError()).toStdString());
+        }
+        const QString gainName = readStringParam(hcam, PARAM_GAIN_NAME, MAX_GAIN_NAME_LEN);
+        messages << QStringLiteral("gain index %1%2")
+            .arg(gainIndex)
+            .arg(gainName.isEmpty() ? QString() : QStringLiteral(" '%1'").arg(gainName));
+    }
+
+    if (paramAvailable(hcam, PARAM_CLEAR_CYCLES))
+    {
+        uns16 clearCycles = 2;
+        pl_set_param(hcam, PARAM_CLEAR_CYCLES, &clearCycles);
+    }
+
+    if (paramAvailable(hcam, PARAM_PMODE))
+    {
+        rs_bool frameCapable = FALSE;
+        int32 pMode = PMODE_NORMAL;
+        if (paramAvailable(hcam, PARAM_FRAME_CAPABLE)
+            && PV_OK == pl_get_param(hcam, PARAM_FRAME_CAPABLE, ATTR_CURRENT, &frameCapable)
+            && frameCapable == TRUE)
+        {
+            pMode = PMODE_FT;
+        }
+        if (PV_OK != pl_set_param(hcam, PARAM_PMODE, &pMode))
+        {
+            throw std::runtime_error(("Failed to set PVCAM PMODE: " + pvcamError()).toStdString());
+        }
+        messages << QStringLiteral("PMODE %1").arg(pMode == PMODE_FT ? QStringLiteral("FT") : QStringLiteral("NORMAL"));
+    }
+
+    return messages.join(QStringLiteral(", "));
 }
 
 QString exposureModeLabel(int16 expMode)
@@ -346,9 +470,9 @@ bool waitForReadout(int16 hcam, uns32 timeoutMs, std::atomic_bool& stopRequested
 QString makeFramePath(const QString& outputDir, const QString& filePrefix, int filePadding, qint64 frameIndex)
 {
     const int padding = std::clamp(filePadding, 1, 12);
-    std::ostringstream name;
-    name << filePrefix.toStdString() << std::setw(padding) << std::setfill('0') << frameIndex << ".tiff";
-    return QDir(outputDir).filePath(QString::fromStdString(name.str()));
+    return QDir(outputDir).filePath(QStringLiteral("%1%2.tiff")
+        .arg(filePrefix)
+        .arg(std::max<qint64>(0, frameIndex), padding, 10, QLatin1Char('0')));
 }
 
 #endif
@@ -363,13 +487,34 @@ PvcamCameraWorker::PvcamCameraWorker(QObject* parent)
     qRegisterMetaType<ct::PvcamCaptureSettings>("ct::PvcamCaptureSettings");
 }
 
+#ifdef CT_HAS_PVCAM
+void PvcamCameraWorker::cleanupPreparedSequence(bool abortExposure)
+{
+    if (!preparedActive_)
+    {
+        return;
+    }
+    if (abortExposure && hcam_ >= 0)
+    {
+        pl_exp_abort(hcam_, CCS_HALT);
+    }
+    pl_exp_uninit_seq();
+    preparedFrameBuffer_.clear();
+    preparedActive_ = false;
+    preparedFrameRunning_ = false;
+    preparedFrameIndex_ = 0;
+}
+#endif
+
 void PvcamCameraWorker::openCameraIfNeeded()
 {
 #ifndef CT_HAS_PVCAM
     throw std::runtime_error("PVCAM SDK was not found at build time.");
 #else
+    writePvcamTrace(QStringLiteral("PVCAM openCameraIfNeeded enter"));
     if (cameraOpened_)
     {
+        writePvcamTrace(QStringLiteral("PVCAM hot session already open"));
         emit logMessage(QStringLiteral("Kinetix using hot camera session: %1").arg(cameraName_));
         return;
     }
@@ -380,30 +525,37 @@ void PvcamCameraWorker::openCameraIfNeeded()
 
     if (!pvcamInitialized_)
     {
+        writePvcamTrace(QStringLiteral("PVCAM pl_pvcam_init begin"));
         if (PV_OK != pl_pvcam_init())
         {
             throw std::runtime_error(pvcamError().toStdString());
         }
         pvcamInitialized_ = true;
+        writePvcamTrace(QStringLiteral("PVCAM pl_pvcam_init ok"));
     }
 
     int16 total = 0;
+    writePvcamTrace(QStringLiteral("PVCAM pl_cam_get_total begin"));
     if (PV_OK != pl_cam_get_total(&total) || total <= 0)
     {
         throw std::runtime_error("No PVCAM cameras found.");
     }
+    writePvcamTrace(QStringLiteral("PVCAM pl_cam_get_total ok: %1").arg(total));
 
     char cameraName[CAM_NAME_LEN] = {};
+    writePvcamTrace(QStringLiteral("PVCAM pl_cam_get_name begin"));
     if (PV_OK != pl_cam_get_name(0, cameraName))
     {
         throw std::runtime_error(pvcamError().toStdString());
     }
+    writePvcamTrace(QStringLiteral("PVCAM pl_cam_open begin: %1").arg(QString::fromLatin1(cameraName)));
     if (PV_OK != pl_cam_open(cameraName, &hcam_, OPEN_EXCLUSIVE))
     {
         throw std::runtime_error(pvcamError().toStdString());
     }
     cameraOpened_ = true;
     cameraName_ = QString::fromLatin1(cameraName);
+    const QString readoutSummary = initializeKinetixReadout(hcam_);
 
     uns16 sensorWidth = 0;
     uns16 sensorHeight = 0;
@@ -429,12 +581,18 @@ void PvcamCameraWorker::openCameraIfNeeded()
     emit logMessage(QStringLiteral("Kinetix opened hot session: %1 (%2 ms).")
         .arg(cameraName_)
         .arg(openTimer.elapsed()));
+    if (!readoutSummary.isEmpty())
+    {
+        emit logMessage(QStringLiteral("Kinetix initialized readout: %1.").arg(readoutSummary));
+    }
+    writePvcamTrace(QStringLiteral("PVCAM openCameraIfNeeded ok"));
 #endif
 }
 
 void PvcamCameraWorker::closeCamera()
 {
 #ifdef CT_HAS_PVCAM
+    cleanupPreparedSequence(true);
     if (cameraOpened_)
     {
         pl_cam_close(hcam_);
@@ -460,6 +618,7 @@ void PvcamCameraWorker::warmOpen()
     emit cameraStateChanged(QStringLiteral("PVCAM unavailable"));
     emit logMessage(QStringLiteral("PVCAM SDK was not found at build time."));
 #else
+    writePvcamTrace(QStringLiteral("PVCAM warmOpen enter"));
     if (capturing_.load())
     {
         return;
@@ -471,6 +630,7 @@ void PvcamCameraWorker::warmOpen()
     }
     catch (const std::exception& ex)
     {
+        writePvcamTrace(QStringLiteral("PVCAM warmOpen exception: %1").arg(QString::fromLocal8Bit(ex.what())));
         closeCamera();
         emit cameraStateChanged(QStringLiteral("Error"));
         emit logMessage(QStringLiteral("Kinetix warm open failed: %1").arg(QString::fromLocal8Bit(ex.what())));
@@ -480,6 +640,12 @@ void PvcamCameraWorker::warmOpen()
 
 void PvcamCameraWorker::startCapture(const PvcamCaptureSettings& rawSettings)
 {
+    if (preparedActive_)
+    {
+        emit logMessage(QStringLiteral("Kinetix prepared CT capture is active; stop CT before Live/Snap."));
+        emit captureFinished(false, QStringLiteral("Prepared CT capture is active."));
+        return;
+    }
     if (capturing_.exchange(true))
     {
         emit logMessage(QStringLiteral("Kinetix capture is already running."));
@@ -524,12 +690,9 @@ void PvcamCameraWorker::startCapture(const PvcamCaptureSettings& rawSettings)
         acquisitionTimer.start();
         openCameraIfNeeded();
 
-        const int cvType = cvTypeForImageFormat(imageFormat_);
-        const int bytesPerPixel = bytesPerPixelForCvType(cvType);
         const rgn_type roi = makeExplicitRoi(static_cast<uns16>(sensorWidth_), static_cast<uns16>(sensorHeight_), settings);
         const int width = roiWidth(roi);
         const int height = roiHeight(roi);
-        const int strideBytes = width * bytesPerPixel;
 
         const ExposureResolution expResolution = configureExposureResolution(hcam_, settings.exposureUnit);
         const uns32 exposureUnits = std::max<uns32>(
@@ -545,6 +708,22 @@ void PvcamCameraWorker::startCapture(const PvcamCaptureSettings& rawSettings)
         }
         sequenceInitialized = true;
 
+        int32 activeImageFormat = imageFormat_;
+        if (!getParam(hcam_, PARAM_IMAGE_FORMAT_HOST, ATTR_CURRENT, activeImageFormat))
+        {
+            getParam(hcam_, PARAM_IMAGE_FORMAT, ATTR_CURRENT, activeImageFormat);
+        }
+        imageFormat_ = activeImageFormat;
+        int16 activeBitDepth = bitDepth_;
+        if (!getParam(hcam_, PARAM_BIT_DEPTH_HOST, ATTR_CURRENT, activeBitDepth))
+        {
+            getParam(hcam_, PARAM_BIT_DEPTH, ATTR_CURRENT, activeBitDepth);
+        }
+        bitDepth_ = activeBitDepth;
+
+        const int cvType = cvTypeForImageFormat(imageFormat_);
+        const int bytesPerPixel = bytesPerPixelForCvType(cvType);
+        const int strideBytes = width * bytesPerPixel;
         const uns32 expectedBytes = static_cast<uns32>(height * strideBytes);
         if (exposureBytes < expectedBytes)
         {
@@ -633,9 +812,11 @@ void PvcamCameraWorker::startCapture(const PvcamCaptureSettings& rawSettings)
                 const QString framePath = settings.singleFramePath.isEmpty()
                     ? makeFramePath(settings.outputDir, settings.filePrefix, settings.filePadding, frame.frameIndex)
                     : settings.singleFramePath;
-                if (!cv::imwrite(framePath.toStdString(), frame.image))
+                QString writeError;
+                if (!writeImageFile(framePath, frame.image, &writeError))
                 {
-                    throw std::runtime_error("Failed to save camera frame.");
+                    throw std::runtime_error(QStringLiteral("Failed to save camera frame: %1")
+                        .arg(writeError).toLocal8Bit().constData());
                 }
                 emit logMessage(QStringLiteral("Kinetix snap saved: %1.").arg(framePath));
             }
@@ -649,6 +830,13 @@ void PvcamCameraWorker::startCapture(const PvcamCaptureSettings& rawSettings)
             if (shouldEmitPreview)
             {
                 lastPreviewEmitMs = frame.timestampMs;
+                if (settings.previewOnly && frameIndex == 0)
+                {
+                    emit logMessage(QStringLiteral("Kinetix live emitting first preview frame: %1x%2, bytes=%3.")
+                        .arg(frame.width)
+                        .arg(frame.height)
+                        .arg(frame.image.total() * frame.image.elemSize()));
+                }
                 emit frameReady(frame);
             }
             emit captureStatsChanged(frame.frameIndex + 1, queue_->size(), queue_->consumedCount(), droppedCount_);
@@ -680,14 +868,450 @@ void PvcamCameraWorker::startCapture(const PvcamCaptureSettings& rawSettings)
 #endif
 }
 
+void PvcamCameraWorker::beginPreparedCapture(const PvcamCaptureSettings& rawSettings)
+{
+    if (preparedActive_)
+    {
+        emit preparedCaptureReady(true, QStringLiteral("Kinetix CT prepared capture is already active."));
+        return;
+    }
+    if (capturing_.exchange(true))
+    {
+        emit preparedCaptureReady(false, QStringLiteral("Kinetix capture is already running."));
+        return;
+    }
+
+    PvcamCaptureSettings settings = rawSettings;
+    settings.frameCount = 1;
+    settings.exposureValue = std::max(0.001, settings.exposureValue);
+    settings.roiX = std::max(0, settings.roiX);
+    settings.roiY = std::max(0, settings.roiY);
+    settings.roiWidth = std::max(1, settings.roiWidth);
+    settings.roiHeight = std::max(1, settings.roiHeight);
+    settings.queueCapacity = std::max(1, settings.queueCapacity);
+    settings.saveRaw = false;
+    settings.previewOnly = false;
+    settings.enqueueFrames = false;
+    settings.previewIntervalMs = 0;
+
+    stopRequested_.store(false);
+    droppedCount_ = 0;
+    emit captureStatsChanged(0, 0, 0, 0);
+
+#ifndef CT_HAS_PVCAM
+    capturing_.store(false);
+    emit cameraStateChanged(QStringLiteral("PVCAM unavailable"));
+    emit preparedCaptureReady(false, QStringLiteral("PVCAM SDK was not found at build time."));
+    return;
+#else
+    try
+    {
+        QElapsedTimer setupTimer;
+        setupTimer.start();
+        openCameraIfNeeded();
+
+        const rgn_type roi = makeExplicitRoi(static_cast<uns16>(sensorWidth_), static_cast<uns16>(sensorHeight_), settings);
+        preparedWidth_ = roiWidth(roi);
+        preparedHeight_ = roiHeight(roi);
+        preparedSettings_ = settings;
+        preparedExposureMs_ = std::max(0.001, exposureMilliseconds(settings.exposureValue, settings.exposureUnit));
+
+        const ExposureResolution expResolution = configureExposureResolution(hcam_, settings.exposureUnit);
+        const uns32 exposureUnits = std::max<uns32>(
+            1,
+            static_cast<uns32>(std::llround(preparedExposureMs_ * expResolution.unitsPerMillisecond)));
+        preparedExposureMode_ = selectInternalExposureMode(hcam_);
+        preparedExposureBytes_ = 0;
+        rgn_type mutableRoi = roi;
+        if (PV_OK != pl_exp_setup_seq(hcam_, 1, 1, &mutableRoi, preparedExposureMode_,
+                exposureUnits, &preparedExposureBytes_))
+        {
+            throw std::runtime_error(pvcamError().toStdString());
+        }
+        preparedActive_ = true;
+
+        int32 activeImageFormat = imageFormat_;
+        if (!getParam(hcam_, PARAM_IMAGE_FORMAT_HOST, ATTR_CURRENT, activeImageFormat))
+        {
+            getParam(hcam_, PARAM_IMAGE_FORMAT, ATTR_CURRENT, activeImageFormat);
+        }
+        imageFormat_ = activeImageFormat;
+        int16 activeBitDepth = bitDepth_;
+        if (!getParam(hcam_, PARAM_BIT_DEPTH_HOST, ATTR_CURRENT, activeBitDepth))
+        {
+            getParam(hcam_, PARAM_BIT_DEPTH, ATTR_CURRENT, activeBitDepth);
+        }
+        bitDepth_ = activeBitDepth;
+
+        preparedCvType_ = cvTypeForImageFormat(imageFormat_);
+        preparedBytesPerPixel_ = bytesPerPixelForCvType(preparedCvType_);
+        preparedStrideBytes_ = preparedWidth_ * preparedBytesPerPixel_;
+        const uns32 expectedBytes = static_cast<uns32>(preparedHeight_ * preparedStrideBytes_);
+        if (preparedExposureBytes_ < expectedBytes)
+        {
+            throw std::runtime_error("PVCAM returned fewer bytes than the selected ROI requires.");
+        }
+        preparedFrameBuffer_.assign(preparedExposureBytes_, 0);
+        preparedFrameIndex_ = 0;
+
+        emit cameraStateChanged(QStringLiteral("CT Prepared"));
+        emit logMessage(QStringLiteral("Kinetix CT prepared ROI x=%1 y=%2 w=%3 h=%4, bitDepth=%5, cvType=%6, stride=%7, frameBytes=%8.")
+            .arg(roi.s1)
+            .arg(roi.p1)
+            .arg(preparedWidth_)
+            .arg(preparedHeight_)
+            .arg(bitDepth_)
+            .arg(preparedCvType_)
+            .arg(preparedStrideBytes_)
+            .arg(preparedExposureBytes_));
+        emit logMessage(QStringLiteral("Kinetix CT prepared %1").arg(expResolution.logText));
+        emit logMessage(QStringLiteral("Kinetix CT prepared exposure mode: %1 (%2 %3 = %4 ms, %5 PVCAM units).")
+            .arg(exposureModeLabel(preparedExposureMode_))
+            .arg(settings.exposureValue)
+            .arg(exposureUnitLabel(settings.exposureUnit))
+            .arg(preparedExposureMs_, 0, 'f', 3)
+            .arg(exposureUnits));
+        emit logMessage(QStringLiteral("Kinetix CT prepared setup ready in %1 ms.").arg(setupTimer.elapsed()));
+        emit preparedCaptureReady(true, QStringLiteral("Kinetix CT prepared capture ready."));
+    }
+    catch (const std::exception& ex)
+    {
+        cleanupPreparedSequence(true);
+        closeCamera();
+        capturing_.store(false);
+        emit cameraStateChanged(QStringLiteral("Error"));
+        emit preparedCaptureReady(false, QString::fromLocal8Bit(ex.what()));
+    }
+#endif
+}
+
+void PvcamCameraWorker::capturePreparedFrame(int frameCount)
+{
+    frameCount = std::max(1, frameCount);
+#ifndef CT_HAS_PVCAM
+    emit preparedFrameBatchFinished(false, QStringLiteral("PVCAM SDK was not found at build time."));
+    return;
+#else
+    if (!preparedActive_)
+    {
+        emit preparedFrameBatchFinished(false, QStringLiteral("Kinetix CT prepared capture is not active."));
+        return;
+    }
+    if (preparedFrameRunning_)
+    {
+        emit preparedFrameBatchFinished(false, QStringLiteral("Kinetix CT prepared frame capture is already running."));
+        return;
+    }
+    preparedFrameRunning_ = true;
+    stopRequested_.store(false);
+
+    try
+    {
+        QElapsedTimer frameTimer;
+        frameTimer.start();
+        int capturedThisBatch = 0;
+        for (int i = 0; i < frameCount && !stopRequested_.load(); ++i)
+        {
+            if (PV_OK != pl_exp_start_seq(hcam_, preparedFrameBuffer_.data()))
+            {
+                throw std::runtime_error(pvcamError().toStdString());
+            }
+
+            uns32 bytesArrived = 0;
+            const uns32 timeoutMs = std::max<uns32>(5000, static_cast<uns32>(std::ceil(preparedExposureMs_ + 5000.0)));
+            if (!waitForReadout(hcam_, timeoutMs, stopRequested_, bytesArrived))
+            {
+                pl_exp_abort(hcam_, CCS_HALT);
+                if (stopRequested_.load())
+                {
+                    break;
+                }
+                throw std::runtime_error("Timed out waiting for Kinetix CT prepared frame; check trigger mode/camera state.");
+            }
+
+            cv::Mat wrapped(preparedHeight_, preparedWidth_, preparedCvType_,
+                preparedFrameBuffer_.data(), static_cast<size_t>(preparedStrideBytes_));
+            CameraFrame frame;
+            frame.frameIndex = preparedFrameIndex_;
+            frame.timestampMs = QDateTime::currentMSecsSinceEpoch();
+            frame.width = preparedWidth_;
+            frame.height = preparedHeight_;
+            frame.bitDepth = bitDepth_;
+            frame.bytesPerPixel = preparedBytesPerPixel_;
+            frame.strideBytes = preparedStrideBytes_;
+            frame.cvType = preparedCvType_;
+            frame.image = wrapped.clone();
+
+            if (PV_OK != pl_exp_finish_seq(hcam_, preparedFrameBuffer_.data(), 0))
+            {
+                emit logMessage(QStringLiteral("pl_exp_finish_seq warning during CT prepared capture: %1").arg(pvcamError()));
+            }
+
+            emit frameReady(frame);
+            ++preparedFrameIndex_;
+            ++capturedThisBatch;
+            emit captureStatsChanged(preparedFrameIndex_, queue_->size(), queue_->consumedCount(), droppedCount_);
+        }
+        preparedFrameRunning_ = false;
+        emit preparedFrameBatchFinished(!stopRequested_.load(),
+            stopRequested_.load()
+                ? QStringLiteral("Kinetix CT prepared capture stopped.")
+                : QStringLiteral("Kinetix CT prepared captured %1 frame(s) in %2 ms.").arg(capturedThisBatch).arg(frameTimer.elapsed()));
+    }
+    catch (const std::exception& ex)
+    {
+        preparedFrameRunning_ = false;
+        cleanupPreparedSequence(true);
+        closeCamera();
+        capturing_.store(false);
+        emit cameraStateChanged(QStringLiteral("Error"));
+        emit preparedFrameBatchFinished(false, QString::fromLocal8Bit(ex.what()));
+    }
+#endif
+}
+
+void PvcamCameraWorker::endPreparedCapture()
+{
+#ifndef CT_HAS_PVCAM
+    capturing_.store(false);
+    return;
+#else
+    const bool hadPrepared = preparedActive_;
+    cleanupPreparedSequence(stopRequested_.load());
+    capturing_.store(false);
+    if (hadPrepared)
+    {
+        emit cameraStateChanged(QStringLiteral("Ready"));
+        emit logMessage(QStringLiteral("Kinetix CT prepared capture ended."));
+    }
+#endif
+}
+
+void PvcamCameraWorker::startContinuousCapture(const PvcamCaptureSettings& rawSettings)
+{
+    if (preparedActive_)
+    {
+        emit captureFinished(false, QStringLiteral("Prepared CT capture is active."));
+        return;
+    }
+    if (capturing_.exchange(true))
+    {
+        emit logMessage(QStringLiteral("Kinetix capture is already running."));
+        return;
+    }
+
+    PvcamCaptureSettings settings = rawSettings;
+    settings.frameCount = std::max(1, settings.frameCount);
+    settings.exposureValue = std::max(0.001, settings.exposureValue);
+    settings.roiX = std::max(0, settings.roiX);
+    settings.roiY = std::max(0, settings.roiY);
+    settings.roiWidth = std::max(1, settings.roiWidth);
+    settings.roiHeight = std::max(1, settings.roiHeight);
+    settings.queueCapacity = std::max(4, settings.queueCapacity);
+    settings.saveRaw = false;
+    settings.previewOnly = false;
+    settings.enqueueFrames = false;
+
+    stopRequested_.store(false);
+    droppedCount_ = 0;
+    emit captureStatsChanged(0, 0, 0, 0);
+
+#ifndef CT_HAS_PVCAM
+    capturing_.store(false);
+    emit cameraStateChanged(QStringLiteral("PVCAM unavailable"));
+    emit captureFinished(false, QStringLiteral("PVCAM SDK was not found at build time."));
+    return;
+#else
+    bool continuousStarted = false;
+    try
+    {
+        QElapsedTimer timer;
+        timer.start();
+        openCameraIfNeeded();
+
+        rs_bool circularAvailable = FALSE;
+        if (PV_OK != pl_get_param(hcam_, PARAM_CIRC_BUFFER, ATTR_AVAIL, &circularAvailable) || circularAvailable != TRUE)
+        {
+            throw std::runtime_error("PVCAM circular buffer acquisition is not available for this camera/interface.");
+        }
+
+        const rgn_type roi = makeExplicitRoi(static_cast<uns16>(sensorWidth_), static_cast<uns16>(sensorHeight_), settings);
+        const int width = roiWidth(roi);
+        const int height = roiHeight(roi);
+        const double exposureMs = std::max(0.001, exposureMilliseconds(settings.exposureValue, settings.exposureUnit));
+        const ExposureResolution expResolution = configureExposureResolution(hcam_, settings.exposureUnit);
+        const uns32 exposureUnits = std::max<uns32>(
+            1,
+            static_cast<uns32>(std::llround(exposureMs * expResolution.unitsPerMillisecond)));
+        const int16 expMode = selectInternalExposureMode(hcam_);
+
+        uns32 frameBytes = 0;
+        if (PV_OK != pl_exp_setup_cont(hcam_, 1, &roi, expMode, exposureUnits, &frameBytes, CIRC_NO_OVERWRITE))
+        {
+            throw std::runtime_error(pvcamError().toStdString());
+        }
+
+        int32 activeImageFormat = imageFormat_;
+        if (!getParam(hcam_, PARAM_IMAGE_FORMAT_HOST, ATTR_CURRENT, activeImageFormat))
+        {
+            getParam(hcam_, PARAM_IMAGE_FORMAT, ATTR_CURRENT, activeImageFormat);
+        }
+        imageFormat_ = activeImageFormat;
+        int16 activeBitDepth = bitDepth_;
+        if (!getParam(hcam_, PARAM_BIT_DEPTH_HOST, ATTR_CURRENT, activeBitDepth))
+        {
+            getParam(hcam_, PARAM_BIT_DEPTH, ATTR_CURRENT, activeBitDepth);
+        }
+        bitDepth_ = activeBitDepth;
+
+        const int cvType = cvTypeForImageFormat(imageFormat_);
+        const int bytesPerPixel = bytesPerPixelForCvType(cvType);
+        const int strideBytes = width * bytesPerPixel;
+        const uns32 expectedBytes = static_cast<uns32>(height * strideBytes);
+        if (frameBytes < expectedBytes)
+        {
+            throw std::runtime_error("PVCAM returned fewer bytes than the selected ROI requires.");
+        }
+
+        const int ringFrameCount = std::clamp(settings.queueCapacity, 4, 64);
+        const size_t ringBytes = static_cast<size_t>(frameBytes) * static_cast<size_t>(ringFrameCount);
+        std::vector<unsigned char> ringBuffer(ringBytes);
+
+        emit cameraStateChanged(QStringLiteral("CT Continuous"));
+        emit logMessage(QStringLiteral("Kinetix CT continuous ROI x=%1 y=%2 w=%3 h=%4, bitDepth=%5, frameBytes=%6, ring=%7 frames.")
+            .arg(roi.s1)
+            .arg(roi.p1)
+            .arg(width)
+            .arg(height)
+            .arg(bitDepth_)
+            .arg(frameBytes)
+            .arg(ringFrameCount));
+        emit logMessage(QStringLiteral("Kinetix CT continuous exposure mode: %1 (%2 %3 = %4 ms, %5 PVCAM units).")
+            .arg(exposureModeLabel(expMode))
+            .arg(settings.exposureValue)
+            .arg(exposureUnitLabel(settings.exposureUnit))
+            .arg(exposureMs, 0, 'f', 3)
+            .arg(exposureUnits));
+
+        if (PV_OK != pl_exp_start_cont(hcam_, ringBuffer.data(), static_cast<uns32>(ringBytes)))
+        {
+            throw std::runtime_error(pvcamError().toStdString());
+        }
+        continuousStarted = true;
+        emit logMessage(QStringLiteral("Kinetix CT continuous started in %1 ms.").arg(timer.elapsed()));
+        emit continuousCaptureStarted(true, QStringLiteral("Kinetix CT continuous started."));
+
+        QVector<int> selected = settings.selectedFrameIndices;
+        std::sort(selected.begin(), selected.end());
+        int selectedCursor = 0;
+        int rawCaptured = 0;
+        int emitted = 0;
+        while (rawCaptured < settings.frameCount && !stopRequested_.load())
+        {
+            int16 status = 0;
+            uns32 bytesArrived = 0;
+            uns32 bufferCount = 0;
+            if (PV_OK != pl_exp_check_cont_status(hcam_, &status, &bytesArrived, &bufferCount))
+            {
+                throw std::runtime_error(pvcamError().toStdString());
+            }
+
+            if (status == FRAME_AVAILABLE || status == READOUT_COMPLETE)
+            {
+                void* framePtr = nullptr;
+                if (PV_OK != pl_exp_get_oldest_frame(hcam_, &framePtr) || framePtr == nullptr)
+                {
+                    QThread::msleep(1);
+                    continue;
+                }
+
+                cv::Mat wrapped(height, width, cvType, framePtr, static_cast<size_t>(strideBytes));
+                while (selectedCursor < selected.size() && selected[selectedCursor] < rawCaptured)
+                {
+                    ++selectedCursor;
+                }
+                const bool keepFrame = selected.isEmpty()
+                    || (selectedCursor < selected.size() && selected[selectedCursor] == rawCaptured);
+
+                CameraFrame frame;
+                if (keepFrame)
+                {
+                    frame.frameIndex = rawCaptured;
+                    frame.timestampMs = QDateTime::currentMSecsSinceEpoch();
+                    frame.width = width;
+                    frame.height = height;
+                    frame.bitDepth = bitDepth_;
+                    frame.bytesPerPixel = bytesPerPixel;
+                    frame.strideBytes = strideBytes;
+                    frame.cvType = cvType;
+                    frame.image = wrapped.clone();
+                }
+
+                if (PV_OK != pl_exp_unlock_oldest_frame(hcam_))
+                {
+                    throw std::runtime_error(pvcamError().toStdString());
+                }
+
+                ++rawCaptured;
+                if (keepFrame)
+                {
+                    emit frameReady(frame);
+                    ++emitted;
+                    ++selectedCursor;
+                    emit captureStatsChanged(emitted, queue_->size(), queue_->consumedCount(), droppedCount_);
+                }
+                continue;
+            }
+
+            if (status != EXPOSURE_IN_PROGRESS && status != READOUT_IN_PROGRESS)
+            {
+                throw std::runtime_error("Unexpected PVCAM continuous acquisition status: " + std::to_string(status));
+            }
+            QThread::msleep(1);
+        }
+
+        if (continuousStarted)
+        {
+            pl_exp_stop_cont(hcam_, CCS_HALT);
+            continuousStarted = false;
+        }
+        capturing_.store(false);
+        emit cameraStateChanged(QStringLiteral("Ready"));
+        emit captureFinished(!stopRequested_.load(),
+            stopRequested_.load()
+                ? QStringLiteral("Kinetix CT continuous stopped after raw=%1 kept=%2 frame(s).").arg(rawCaptured).arg(emitted)
+                : QStringLiteral("Kinetix CT continuous captured raw=%1 kept=%2 frame(s) in %3 ms.").arg(rawCaptured).arg(emitted).arg(timer.elapsed()));
+    }
+    catch (const std::exception& ex)
+    {
+        if (continuousStarted)
+        {
+            pl_exp_stop_cont(hcam_, CCS_HALT);
+        }
+        closeCamera();
+        capturing_.store(false);
+        emit cameraStateChanged(QStringLiteral("Error"));
+        emit continuousCaptureStarted(false, QString::fromLocal8Bit(ex.what()));
+        emit captureFinished(false, QString::fromLocal8Bit(ex.what()));
+    }
+#endif
+}
+
 void PvcamCameraWorker::stopCapture()
 {
     stopRequested_.store(true);
+#ifdef CT_HAS_PVCAM
+    if (capturing_.load() && cameraOpened_ && hcam_ >= 0)
+    {
+        pl_exp_abort(hcam_, CCS_HALT);
+    }
+#endif
 }
 
 void PvcamCameraWorker::shutdown()
 {
     stopCapture();
+    endPreparedCapture();
     closeCamera();
 }
 

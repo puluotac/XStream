@@ -26,6 +26,11 @@ public slots:
     void shutdown();
     void jogRelativePulse(int axis, qint64 pulse, int speedTable, const QString& label);
     void moveAbsolutePulse(int axis, qint64 pulse, int speedTable, const QString& label);
+    void configureSpeedTable(int axis, int speedTable, int startSpeedPps, int topSpeedPps,
+        int accelTime10ms, int decelTime10ms, int accelPattern, const QString& label);
+    void configureSpeedTableAndMoveAbsolute(int axis, qint64 pulse, int speedTable,
+        int startSpeedPps, int topSpeedPps, int accelTime10ms, int decelTime10ms,
+        int accelPattern, const QString& speedLabel, const QString& moveLabel);
     void stopAxis(int axis, const QString& label);
     void stopAllAxes();
 
@@ -44,7 +49,8 @@ private:
     bool isConnected() const;
     void closeConnection();
     QString query(const QString& command, QString* error = nullptr, int timeoutMs = 1500);
-    bool readAxis(int axis, qint64* positionPulse, QString* statusRaw, QString* error = nullptr);
+    bool readAxis(int axis, qint64* positionPulse, QString* statusRaw, QString* error = nullptr, int timeoutMs = 700);
+    void pollAllAxesWithTimeout(int timeoutMs);
     void markAxisActive(int axis);
     void updateActiveAxisState(int axis, qint64 positionPulse);
 

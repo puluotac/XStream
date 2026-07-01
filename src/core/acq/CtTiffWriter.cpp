@@ -1,6 +1,6 @@
 #include "core/acq/CtTiffWriter.h"
 
-#include <opencv2/imgcodecs.hpp>
+#include "core/io/ImageFileIo.h"
 
 #include <algorithm>
 #include <stdexcept>
@@ -145,10 +145,10 @@ void CtTiffWriter::workerLoop(int workerIndex)
 
         try
         {
-            const std::vector<int> params { cv::IMWRITE_TIFF_COMPRESSION, 1 };
-            if (item.image.empty() || !cv::imwrite(item.filePath.toStdString(), item.image, params))
+            QString error;
+            if (!writeImageFile(item.filePath, item.image, &error))
             {
-                throw std::runtime_error("failed to write TIFF");
+                throw std::runtime_error(error.toLocal8Bit().constData());
             }
         }
         catch (const std::exception& ex)

@@ -4,6 +4,7 @@
 #include "core/cor/CorEstimatorFft.h"
 #include "core/preprocess/ImageNormalizer.h"
 #include "core/recon/GpuProjectionBatch.h"
+#include "cuda/stripe_removal_kernels.h"
 
 #include <QFile>
 #include <QJsonDocument>
@@ -15,6 +16,7 @@
 #include <opencv2/core.hpp>
 #include <opencv2/imgproc.hpp>
 
+#include <cufft.h>
 #include <cmath>
 #include <iostream>
 #include <vector>
@@ -25,7 +27,9 @@ int main()
     const ct::AppConfig roundTrip = ct::AppConfig::fromJsonObject(defaults.toJsonObject());
     if (roundTrip.compute.batchSize != defaults.compute.batchSize
         || roundTrip.compute.zChunkSize != defaults.compute.zChunkSize
-        || roundTrip.compute.gpuIndex != defaults.compute.gpuIndex)
+        || roundTrip.compute.gpuIndex != defaults.compute.gpuIndex
+        || roundTrip.stripe.method != defaults.stripe.method
+        || roundTrip.stripe.enable != defaults.stripe.enable)
     {
         std::cerr << "Compute config round-trip mismatch\n";
         return 3;
@@ -47,12 +51,19 @@ int main()
     sessionConfig.geometry.corShift = 12.5f;
     sessionConfig.phase.enable = true;
     sessionConfig.phase.energyKev = 18.0f;
+    sessionConfig.stripe.enable = true;
+    sessionConfig.stripe.level = 1;
+    sessionConfig.stripe.sigma = 2.5f;
     sessionConfig.compute.batchSize = 32;
     sessionConfig.preview.enableLive = false;
     sessionConfig.io.watchDir = "E:/demo/watch";
     sessionConfig.io.saveDir = "E:/demo/save";
+    sessionConfig.motorAxes["R"].hasBaseSpeed = true;
+    sessionConfig.motorAxes["R"].baseSpeed = 1.0;
     sessionConfig.motorAxes["R"].speed = 2.5;
     sessionConfig.motorAxes["R"].accel = 10.0;
+    sessionConfig.motorAxes["Y"].hasBaseSpeed = true;
+    sessionConfig.motorAxes["Y"].baseSpeed = 100.0;
     sessionConfig.motorAxes["Y"].speed = 500.0;
     sessionConfig.motorAxes["Y"].accel = 2000.0;
 
@@ -81,11 +92,18 @@ int main()
 
     if (!loadedConfig.phase.enable
         || loadedConfig.compute.batchSize != sessionConfig.compute.batchSize
+        || loadedConfig.stripe.enable
+        || loadedConfig.stripe.level != sessionConfig.stripe.level
+        || std::abs(loadedConfig.stripe.sigma - sessionConfig.stripe.sigma) > 1e-6f
         || loadedConfig.io.watchDir != sessionConfig.io.watchDir
         || std::abs(loadedConfig.geometry.corShift - sessionConfig.geometry.corShift) > 1e-6f
         || loadedConfig.preview.enableLive != sessionConfig.preview.enableLive
+        || !loadedConfig.motorAxes.value("R").hasBaseSpeed
+        || std::abs(loadedConfig.motorAxes.value("R").baseSpeed - 1.0) > 1e-9
         || std::abs(loadedConfig.motorAxes.value("R").speed - 2.5) > 1e-9
         || std::abs(loadedConfig.motorAxes.value("R").accel - 10.0) > 1e-9
+        || !loadedConfig.motorAxes.value("Y").hasBaseSpeed
+        || std::abs(loadedConfig.motorAxes.value("Y").baseSpeed - 100.0) > 1e-9
         || std::abs(loadedConfig.motorAxes.value("Y").speed - 500.0) > 1e-9
         || std::abs(loadedConfig.motorAxes.value("Y").accel - 2000.0) > 1e-9)
     {
@@ -118,6 +136,31 @@ int main()
     {
         std::cerr << "Motor speed/accel config was not saved\n";
         return 21;
+    }
+    if (!cleanedDoc.object().value("MOTOR").toObject().value("R").toObject().contains("BASE_SPEED"))
+    {
+        std::cerr << "Motor base speed config was not saved\n";
+        return 23;
+    }
+    QJsonObject oldMotorRoot;
+    QJsonObject oldMotorAxis;
+    oldMotorAxis["SPEED"] = 12.0;
+    oldMotorAxis["ACCEL"] = 3.0;
+    oldMotorRoot["R"] = oldMotorAxis;
+    QJsonObject oldRoot;
+    oldRoot["MOTOR"] = oldMotorRoot;
+    const ct::AppConfig oldMotorConfig = ct::AppConfig::fromJsonObject(oldRoot);
+    if (oldMotorConfig.motorAxes.value("R").hasBaseSpeed
+        || std::abs(oldMotorConfig.motorAxes.value("R").speed - 12.0) > 1e-9
+        || std::abs(oldMotorConfig.motorAxes.value("R").accel - 3.0) > 1e-9)
+    {
+        std::cerr << "Legacy motor config base speed compatibility failed\n";
+        return 24;
+    }
+    if (cleanedDoc.object().value("STRIPE").toObject().value("ENABLE").toBool(false))
+    {
+        std::cerr << "Stripe config should be saved disabled during commissioning\n";
+        return 22;
     }
 
     const QString invalidPath = tempDir.filePath("invalid.json");
@@ -256,6 +299,114 @@ int main()
             return 20;
         }
     }
+
+    constexpr int stripeZ = 2;
+    constexpr int stripeAngles = 8;
+    constexpr int stripeWidth = 8;
+    constexpr int paddedAngles = 9;
+    constexpr int angleShift = 0;
+    constexpr int angleCoeff = (paddedAngles + 9) / 2;
+    constexpr int anglePadded = angleCoeff * 2;
+    constexpr int widthCoeff = (stripeWidth + 9) / 2;
+    constexpr int widthPadded = widthCoeff * 2;
+    const size_t stripeInputCount = static_cast<size_t>(stripeZ) * stripeAngles * stripeWidth;
+    const size_t paddedCount = static_cast<size_t>(stripeZ) * paddedAngles * stripeWidth;
+    const size_t bandCount = static_cast<size_t>(stripeZ) * angleCoeff * widthCoeff;
+    std::vector<float> stripeHost(stripeInputCount);
+    for (int z = 0; z < stripeZ; ++z)
+    {
+        for (int a = 0; a < stripeAngles; ++a)
+        {
+            for (int x = 0; x < stripeWidth; ++x)
+            {
+                const float stripe = (x % 4 < 2) ? 0.25f : -0.25f;
+                stripeHost[(static_cast<size_t>(z) * stripeAngles + a) * stripeWidth + x] =
+                    1.0f + 0.02f * static_cast<float>(z) + 0.01f * static_cast<float>(a) + stripe;
+            }
+        }
+    }
+    float* stripeDevice = nullptr;
+    float* paddedDevice = nullptr;
+    float* tempA = nullptr;
+    float* tempD = nullptr;
+    float* approx = nullptr;
+    float* cV = nullptr;
+    float* cH = nullptr;
+    float* cD = nullptr;
+    float* packed = nullptr;
+    cufftComplex* spectrum = nullptr;
+    cufftHandle r2c = 0;
+    cufftHandle c2r = 0;
+    const int spectrumLength = angleCoeff / 2 + 1;
+    const int vectorCount = stripeZ * widthCoeff;
+    if (cudaMalloc(&stripeDevice, stripeInputCount * sizeof(float)) != cudaSuccess
+        || cudaMalloc(&paddedDevice, paddedCount * sizeof(float)) != cudaSuccess
+        || cudaMalloc(&tempA, paddedCount * sizeof(float)) != cudaSuccess
+        || cudaMalloc(&tempD, paddedCount * sizeof(float)) != cudaSuccess
+        || cudaMalloc(&approx, bandCount * sizeof(float)) != cudaSuccess
+        || cudaMalloc(&cV, bandCount * sizeof(float)) != cudaSuccess
+        || cudaMalloc(&cH, bandCount * sizeof(float)) != cudaSuccess
+        || cudaMalloc(&cD, bandCount * sizeof(float)) != cudaSuccess
+        || cudaMalloc(&packed, bandCount * sizeof(float)) != cudaSuccess
+        || cudaMalloc(&spectrum, static_cast<size_t>(vectorCount) * spectrumLength * sizeof(cufftComplex)) != cudaSuccess)
+    {
+        std::cerr << "Failed to allocate stripe kernel smoke buffers\n";
+        return 23;
+    }
+    if (cudaMemcpy(stripeDevice, stripeHost.data(), stripeInputCount * sizeof(float), cudaMemcpyHostToDevice) != cudaSuccess
+        || !ct::launchPadStripeInput(stripeDevice, paddedDevice, stripeZ, stripeAngles, paddedAngles, stripeWidth, angleShift, nullptr)
+        || !ct::launchDwtAxis1Db5(paddedDevice, tempA, tempD, stripeZ, paddedAngles, stripeWidth, angleCoeff, anglePadded, nullptr)
+        || !ct::launchDwtAxis2Db5(tempA, approx, cV, stripeZ, angleCoeff, stripeWidth, widthCoeff, widthPadded, nullptr)
+        || !ct::launchDwtAxis2Db5(tempD, cH, cD, stripeZ, angleCoeff, stripeWidth, widthCoeff, widthPadded, nullptr)
+        || !ct::launchPackSinogramColumnsForStripe(cV, packed, stripeZ, angleCoeff, widthCoeff, nullptr))
+    {
+        std::cerr << "Stripe FW CUDA smoke launch failed before FFT\n";
+        return 24;
+    }
+    int n[1] = { angleCoeff };
+    int inembed[1] = { angleCoeff };
+    int onembed[1] = { spectrumLength };
+    if (cufftPlanMany(&r2c, 1, n, inembed, 1, angleCoeff, onembed, 1, spectrumLength, CUFFT_R2C, vectorCount) != CUFFT_SUCCESS
+        || cufftPlanMany(&c2r, 1, n, onembed, 1, spectrumLength, inembed, 1, angleCoeff, CUFFT_C2R, vectorCount) != CUFFT_SUCCESS
+        || cufftExecR2C(r2c, reinterpret_cast<cufftReal*>(packed), spectrum) != CUFFT_SUCCESS
+        || !ct::launchDampStripeSpectrum(spectrum, vectorCount, spectrumLength, angleCoeff, 2.0f, nullptr)
+        || cufftExecC2R(c2r, spectrum, reinterpret_cast<cufftReal*>(packed)) != CUFFT_SUCCESS
+        || !ct::launchUnpackSinogramColumnsForStripe(packed, cV, stripeZ, angleCoeff, widthCoeff, nullptr)
+        || !ct::launchIdwtAxis2Db5(cH, cD, tempD, stripeZ, angleCoeff, widthCoeff, stripeWidth, nullptr)
+        || !ct::launchIdwtAxis2Db5(approx, cV, tempA, stripeZ, angleCoeff, widthCoeff, stripeWidth, nullptr)
+        || !ct::launchIdwtAxis1Db5(tempA, tempD, paddedDevice, stripeZ, angleCoeff, stripeWidth, paddedAngles, nullptr)
+        || !ct::launchCropStripeOutput(paddedDevice, stripeDevice, stripeZ, stripeAngles, paddedAngles, stripeWidth, angleShift, nullptr)
+        || cudaDeviceSynchronize() != cudaSuccess)
+    {
+        std::cerr << "Stripe FW CUDA smoke failed after FFT\n";
+        return 25;
+    }
+    std::vector<float> stripeOut(stripeInputCount);
+    if (cudaMemcpy(stripeOut.data(), stripeDevice, stripeInputCount * sizeof(float), cudaMemcpyDeviceToHost) != cudaSuccess)
+    {
+        std::cerr << "Failed to download stripe smoke output\n";
+        return 26;
+    }
+    for (float value : stripeOut)
+    {
+        if (!std::isfinite(value))
+        {
+            std::cerr << "Stripe smoke output contained non-finite value\n";
+            return 27;
+        }
+    }
+    if (r2c != 0) { cufftDestroy(r2c); }
+    if (c2r != 0) { cufftDestroy(c2r); }
+    cudaFree(stripeDevice);
+    cudaFree(paddedDevice);
+    cudaFree(tempA);
+    cudaFree(tempD);
+    cudaFree(approx);
+    cudaFree(cV);
+    cudaFree(cH);
+    cudaFree(cD);
+    cudaFree(packed);
+    cudaFree(spectrum);
 
     std::cout << "ct_workstation_tests passed\n";
     return 0;

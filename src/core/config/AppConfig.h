@@ -63,6 +63,17 @@ struct PhaseConfig
     float alphaRatio = 0.0f;
 };
 
+struct StripeConfig
+{
+    bool enable = false;
+    QString method = "FW";
+    int level = 0;
+    QString waveletName = "db5";
+    float sigma = 2.0f;
+    bool pad = true;
+    int chunk = 16;
+};
+
 struct FlatGroupConfig
 {
     QString label;
@@ -117,6 +128,8 @@ struct IoConfig
 
 struct MotorAxisConfig
 {
+    bool hasBaseSpeed = false;
+    double baseSpeed = 0.0;
     double speed = 0.0;
     double accel = 0.0;
 };
@@ -125,6 +138,7 @@ struct AppConfig
 {
     GeometryConfig geometry;
     PhaseConfig phase;
+    StripeConfig stripe;
     PreprocessConfig preprocess;
     ComputeConfig compute;
     PreviewConfig preview;

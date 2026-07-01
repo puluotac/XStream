@@ -3,9 +3,12 @@
 #include <QGraphicsPixmapItem>
 #include <QGraphicsScene>
 #include <QFrame>
+#include <QMouseEvent>
 #include <QPainter>
 #include <QPixmap>
 #include <QWheelEvent>
+
+#include <cmath>
 
 namespace ct
 {
@@ -30,6 +33,8 @@ ZoomPanImageView::ZoomPanImageView(QWidget* parent)
     setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
     setBackgroundBrush(Qt::black);
     setFrameShape(QFrame::NoFrame);
+    setMouseTracking(true);
+    viewport()->setMouseTracking(true);
 }
 
 void ZoomPanImageView::setImage(const QPixmap& pixmap)
@@ -53,6 +58,32 @@ void ZoomPanImageView::wheelEvent(QWheelEvent* event)
     constexpr double zoomOutFactor = 1.0 / zoomInFactor;
     scale(event->angleDelta().y() > 0 ? zoomInFactor : zoomOutFactor,
         event->angleDelta().y() > 0 ? zoomInFactor : zoomOutFactor);
+}
+
+void ZoomPanImageView::mouseMoveEvent(QMouseEvent* event)
+{
+    QGraphicsView::mouseMoveEvent(event);
+    if (pixmapItem_->pixmap().isNull())
+    {
+        emit imagePositionLeft();
+        return;
+    }
+    const QPointF scenePoint = mapToScene(event->pos());
+    const QPointF imagePoint = pixmapItem_->mapFromScene(scenePoint);
+    const QRectF bounds = pixmapItem_->boundingRect();
+    if (!bounds.contains(imagePoint))
+    {
+        emit imagePositionLeft();
+        return;
+    }
+    emit imagePositionHovered(static_cast<int>(std::floor(imagePoint.x())),
+        static_cast<int>(std::floor(imagePoint.y())));
+}
+
+void ZoomPanImageView::leaveEvent(QEvent* event)
+{
+    QGraphicsView::leaveEvent(event);
+    emit imagePositionLeft();
 }
 
 } // namespace ct
