@@ -2500,7 +2500,10 @@ void MainWindow::startCameraWorker()
         startCtFlyScanMotorSweep();
     });
     cameraThread_.start();
-    QMetaObject::invokeMethod(cameraWorker_, "warmOpen", Qt::QueuedConnection);
+    cameraWarmOpenComplete_ = true;
+    cameraWarmOpenCompletedMs_ = QDateTime::currentMSecsSinceEpoch();
+    appendLog(QStringLiteral("Kinetix warm open deferred; camera will open on Live/Snap/CT."));
+    writeStartupTrace(QStringLiteral("PVCAM warmOpen deferred until first camera use"));
 
     ctWriter_ = new CtTiffWriter();
     ctWriter_->moveToThread(&ctWriterThread_);
@@ -6043,6 +6046,10 @@ void MainWindow::autoSelectZChunk()
 void MainWindow::startMotorWorker()
 {
     kohzuController_ = new KohzuController();
+    for (auto it = motorAxes_.begin(); it != motorAxes_.end(); ++it)
+    {
+        kohzuController_->addAxis(it->axis);
+    }
     kohzuController_->moveToThread(&kohzuThread_);
     connect(kohzuController_, &KohzuController::connectionChanged, this, [this](bool connected) {
         if (shuttingDown_) { return; }
@@ -6072,7 +6079,6 @@ void MainWindow::startMotorWorker()
         }
     });
     kohzuThread_.start();
-    configureMotorAxes();
 }
 
 void MainWindow::configureMotorAxes()

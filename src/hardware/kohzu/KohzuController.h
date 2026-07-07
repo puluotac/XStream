@@ -53,7 +53,8 @@ private:
     bool isConnected() const;
     void closeConnection();
     QString query(const QString& command, QString* error = nullptr, int timeoutMs = 1500);
-    bool readAxis(int axis, qint64* positionPulse, QString* statusRaw, QString* error = nullptr, int timeoutMs = 700);
+    QHash<int, qint64> readAxisPositions(const QList<int>& axisList, int timeoutMs, QString* rawResponse = nullptr);
+    bool readAxis(int axis, qint64* positionPulse, QString* statusRaw, QString* error = nullptr, int timeoutMs = 700, bool readStatus = false);
     void pollAllAxesWithTimeout(int timeoutMs);
     void markAxisActive(int axis, qint64 targetPulse = 0, bool hasTarget = false);
     void updateActiveAxisState(int axis, qint64 positionPulse, const QString& statusRaw);
@@ -66,6 +67,7 @@ private:
     QHash<int, qint64> activeTargetPosition_;
     QHash<int, qint64> activeStartedMs_;
     QHash<int, int> activeStableCount_;
+    QHash<int, int> activeReadMissCount_;
     QTimer idlePollTimer_;
     QTimer activePollTimer_;
     bool idlePollingEnabled_ = true;

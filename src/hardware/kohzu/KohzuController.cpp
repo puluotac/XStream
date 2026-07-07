@@ -2,6 +2,7 @@
 
 #include <QDateTime>
 #include <QRegularExpression>
+#include <QStringList>
 #include <QThread>
 
 namespace ct
@@ -11,7 +12,7 @@ namespace
 {
 
 constexpr int kIdlePollMs = 1500;
-constexpr int kActivePollMs = 50;
+constexpr int kActivePollMs = 150;
 constexpr int kStablePollsBeforeInactive = 2;
 constexpr qint64 kMinPositionStableMs = 160;
 constexpr int kConnectTimeoutMs = 1500;
@@ -65,6 +66,44 @@ AxisMotionState parseAxisMotionState(const QString& statusRaw)
     return AxisMotionState::Unknown;
 }
 
+QString responseTokenForCommand(const QString& command)
+{
+    const QString trimmed = command.trimmed();
+    const int slash = trimmed.indexOf(QLatin1Char('/'));
+    return slash >= 0 ? trimmed.left(slash) : trimmed;
+}
+
+QString findResponseForToken(const QString& responseText, const QString& token)
+{
+    if (token.isEmpty())
+    {
+        return responseText.trimmed();
+    }
+
+    const QRegularExpression responsePattern(
+        QStringLiteral("(?:^|[\\r\\n])\\s*[CE]\\s+%1\\b[^\\r\\n]*")
+            .arg(QRegularExpression::escape(token)),
+        QRegularExpression::CaseInsensitiveOption);
+    const QRegularExpressionMatch match = responsePattern.match(responseText);
+    if (!match.hasMatch())
+    {
+        return {};
+    }
+
+    return match.captured(0).trimmed();
+}
+
+QList<int> toAxisList(const QVector<int>& axes)
+{
+    QList<int> axisList;
+    axisList.reserve(axes.size());
+    for (int axis : axes)
+    {
+        axisList.push_back(axis);
+    }
+    return axisList;
+}
+
 } // namespace
 
 KohzuController::KohzuController(QObject* parent)
@@ -96,6 +135,7 @@ void KohzuController::clearAxes()
     activeTargetPosition_.clear();
     activeStartedMs_.clear();
     activeStableCount_.clear();
+    activeReadMissCount_.clear();
     for (int axis : activeAxes)
     {
         emit axisActiveChanged(axis, false);
@@ -140,18 +180,17 @@ void KohzuController::connectToController(const QString& host, quint16 port)
     else
     {
         emit logMessage(QStringLiteral("Kohzu IDN failed after retries: %1").arg(idnError));
-        for (int axis : axes_)
+        const QHash<int, qint64> positions = readAxisPositions(toAxisList(axes_), kInitialAxisTimeoutMs);
+        if (!positions.isEmpty())
         {
-            qint64 position = 0;
-            QString status;
-            QString axisError;
-            if (readAxis(axis, &position, &status, &axisError, kInitialAxisTimeoutMs))
+            emit logMessage(QStringLiteral("Kohzu controller verified by RDP batch: %1/%2 axes responded.")
+                .arg(positions.size())
+                .arg(axes_.size()));
+            for (auto it = positions.constBegin(); it != positions.constEnd(); ++it)
             {
-                emit logMessage(QStringLiteral("Kohzu controller verified by axis %1 read.").arg(axis));
-                emit axisUpdated(axis, position, status);
-                controllerReady = true;
-                break;
+                emit axisUpdated(it.key(), it.value(), QStringLiteral("RDP batch"));
             }
+            controllerReady = true;
         }
     }
 
@@ -184,6 +223,7 @@ void KohzuController::closeConnection()
     activeTargetPosition_.clear();
     activeStartedMs_.clear();
     activeStableCount_.clear();
+    activeReadMissCount_.clear();
     for (int axis : activeAxes)
     {
         emit axisActiveChanged(axis, false);
@@ -228,6 +268,11 @@ void KohzuController::jogRelativePulse(int axis, qint64 pulse, int speedTable, c
     {
         const bool hasKnownPosition = lastKnownPosition_.contains(axis);
         const qint64 targetPulse = hasKnownPosition ? lastKnownPosition_.value(axis) + pulse : 0;
+        if (hasKnownPosition)
+        {
+            lastKnownPosition_[axis] = targetPulse;
+            emit axisUpdated(axis, targetPulse, QStringLiteral("Estimated after RPS; waiting for RDP refresh."));
+        }
         markAxisActive(axis, targetPulse, hasKnownPosition);
     }
     else
@@ -252,6 +297,8 @@ void KohzuController::moveAbsolutePulse(int axis, qint64 pulse, int speedTable, 
     emit commandFinished(label, ok, ok ? response : QStringLiteral("%1 %2").arg(error, response).trimmed());
     if (ok)
     {
+        lastKnownPosition_[axis] = pulse;
+        emit axisUpdated(axis, pulse, QStringLiteral("Estimated after APS; waiting for RDP refresh."));
         markAxisActive(axis, pulse, true);
     }
     else
@@ -320,6 +367,8 @@ void KohzuController::configureSpeedTableAndMoveAbsolute(int axis, qint64 pulse,
     emit commandFinished(moveLabel, moveOk, moveOk ? moveResponse : QStringLiteral("%1 %2").arg(error, moveResponse).trimmed());
     if (moveOk)
     {
+        lastKnownPosition_[axis] = pulse;
+        emit axisUpdated(axis, pulse, QStringLiteral("Estimated after APS; waiting for RDP refresh."));
         markAxisActive(axis, pulse, true);
     }
     else
@@ -367,6 +416,11 @@ void KohzuController::configureSpeedTableAndMoveRelative(int axis, qint64 pulse,
     {
         const bool hasKnownPosition = lastKnownPosition_.contains(axis);
         const qint64 targetPulse = hasKnownPosition ? lastKnownPosition_.value(axis) + pulse : 0;
+        if (hasKnownPosition)
+        {
+            lastKnownPosition_[axis] = targetPulse;
+            emit axisUpdated(axis, targetPulse, QStringLiteral("Estimated after RPS; waiting for RDP refresh."));
+        }
         markAxisActive(axis, targetPulse, hasKnownPosition);
     }
     else
@@ -393,6 +447,7 @@ void KohzuController::stopAxis(int axis, const QString& label)
     activeTargetPosition_.remove(axis);
     activeStartedMs_.remove(axis);
     activeStableCount_.remove(axis);
+    activeReadMissCount_.remove(axis);
     emit axisActiveChanged(axis, false);
     if (activeAxes_.isEmpty())
     {
@@ -419,6 +474,7 @@ void KohzuController::stopAllAxes()
     activeTargetPosition_.clear();
     activeStartedMs_.clear();
     activeStableCount_.clear();
+    activeReadMissCount_.clear();
     activePollTimer_.stop();
     for (int axis : activeAxes)
     {
@@ -442,17 +498,48 @@ void KohzuController::pollAllAxesWithTimeout(int timeoutMs)
         return;
     }
 
+    QString rawResponse;
+    const QHash<int, qint64> positions = readAxisPositions(toAxisList(axes_), timeoutMs, &rawResponse);
+
+    int updatedCount = 0;
     for (int axis : axes_)
     {
-        qint64 position = 0;
-        QString status;
-        QString error;
-        if (!readAxis(axis, &position, &status, &error, timeoutMs))
+        if (!positions.contains(axis))
         {
-            emit logMessage(QStringLiteral("Axis %1 read failed: %2").arg(axis).arg(error));
             continue;
         }
-        emit axisUpdated(axis, position, status);
+        const qint64 position = positions.value(axis);
+        lastKnownPosition_[axis] = position;
+        emit axisUpdated(axis, position, QStringLiteral("RDP batch"));
+        if (activeAxes_.contains(axis))
+        {
+            updateActiveAxisState(axis, position, QStringLiteral("RDP batch"));
+        }
+        ++updatedCount;
+    }
+
+    if (timeoutMs >= kInitialAxisTimeoutMs)
+    {
+        QStringList missingAxes;
+        for (int axis : axes_)
+        {
+            if (!positions.contains(axis))
+            {
+                missingAxes.push_back(QString::number(axis));
+            }
+        }
+        const QString missingText = missingAxes.isEmpty()
+            ? QStringLiteral("")
+            : QStringLiteral(" Missing axes: %1.").arg(missingAxes.join(QStringLiteral(",")));
+        emit logMessage(QStringLiteral("Kohzu initial position refresh: %1/%2 axes updated.%3")
+            .arg(updatedCount)
+            .arg(axes_.size())
+            .arg(missingText));
+    }
+    else if (updatedCount == 0)
+    {
+        emit logMessage(QStringLiteral("Kohzu position refresh failed: no RDP responses received. Raw: %1")
+            .arg(rawResponse.left(300)));
     }
 }
 
@@ -465,16 +552,24 @@ void KohzuController::pollActiveAxes()
     }
 
     const QList<int> activeAxes = activeAxes_.values();
+    const QHash<int, qint64> positions = readAxisPositions(activeAxes, kPollAxisTimeoutMs);
     for (int axis : activeAxes)
     {
-        qint64 position = 0;
-        QString status;
-        QString error;
-        if (!readAxis(axis, &position, &status, &error))
+        if (!positions.contains(axis))
         {
-            emit logMessage(QStringLiteral("Axis %1 active read failed: %2").arg(axis).arg(error));
+            const int missCount = activeReadMissCount_.value(axis, 0) + 1;
+            activeReadMissCount_[axis] = missCount;
+            if (missCount == 1 || missCount % 10 == 0)
+            {
+                emit logMessage(QStringLiteral("Axis %1 active read missed %2 time(s); waiting for next RDP refresh.")
+                    .arg(axis)
+                    .arg(missCount));
+            }
             continue;
         }
+        const qint64 position = positions.value(axis);
+        const QString status = QStringLiteral("RDP active batch");
+        activeReadMissCount_.remove(axis);
         emit axisUpdated(axis, position, status);
         updateActiveAxisState(axis, position, status);
     }
@@ -532,66 +627,159 @@ QString KohzuController::query(const QString& command, QString* error, int timeo
         return {};
     }
 
+    const QString expectedToken = responseTokenForCommand(command);
     QByteArray response;
-    if (!socket_->waitForReadyRead(timeoutMs))
+    QString lastResponseText;
+    const qint64 deadlineMs = QDateTime::currentMSecsSinceEpoch() + timeoutMs;
+    while (QDateTime::currentMSecsSinceEpoch() < deadlineMs)
     {
-        if (error)
+        if (socket_->bytesAvailable() <= 0)
         {
-            *error = socket_->errorString();
+            const int waitMs = static_cast<int>(std::max<qint64>(1, deadlineMs - QDateTime::currentMSecsSinceEpoch()));
+            if (!socket_->waitForReadyRead(waitMs))
+            {
+                break;
+            }
         }
-        return {};
-    }
-    response += socket_->readAll();
-    while (socket_->waitForReadyRead(20))
-    {
+
         response += socket_->readAll();
+        lastResponseText = QString::fromLatin1(response).trimmed();
+        const QString matchedResponse = findResponseForToken(lastResponseText, expectedToken);
+        if (!matchedResponse.isEmpty())
+        {
+            return matchedResponse;
+        }
     }
 
-    return QString::fromLatin1(response).trimmed();
+    if (error)
+    {
+        *error = lastResponseText.isEmpty()
+            ? QStringLiteral("Timed out waiting for %1: %2").arg(expectedToken, socket_->errorString())
+            : QStringLiteral("Timed out waiting for %1; last response was: %2").arg(expectedToken, lastResponseText);
+    }
+    return {};
 }
 
-bool KohzuController::readAxis(int axis, qint64* positionPulse, QString* statusRaw, QString* error, int timeoutMs)
+QHash<int, qint64> KohzuController::readAxisPositions(const QList<int>& axisList, int timeoutMs, QString* rawResponse)
+{
+    QHash<int, qint64> positions;
+    if (!isConnected() || axisList.isEmpty())
+    {
+        if (rawResponse)
+        {
+            *rawResponse = {};
+        }
+        return positions;
+    }
+
+    QSet<int> axisSet;
+    for (int axis : axisList)
+    {
+        axisSet.insert(axis);
+    }
+
+    for (int axis : axisList)
+    {
+        const QByteArray payload = QStringLiteral("RDP%1\r\n").arg(axis).toLatin1();
+        if (socket_->write(payload) != payload.size() || !socket_->waitForBytesWritten(timeoutMs))
+        {
+            emit logMessage(QStringLiteral("Axis %1 read request failed: %2").arg(axis).arg(socket_->errorString()));
+            if (rawResponse)
+            {
+                *rawResponse = {};
+            }
+            return positions;
+        }
+        QThread::msleep(2);
+    }
+
+    QByteArray responseBytes;
+    static const QRegularExpression rdpPattern(
+        QStringLiteral("\\bC\\s+RDP(\\d+)\\s+(-?\\d+)\\b"),
+        QRegularExpression::CaseInsensitiveOption);
+    const qint64 deadlineMs = QDateTime::currentMSecsSinceEpoch()
+        + std::max(timeoutMs, 500)
+        + static_cast<qint64>(axisSet.size()) * 150;
+    while (QDateTime::currentMSecsSinceEpoch() < deadlineMs && positions.size() < axisSet.size())
+    {
+        if (socket_->bytesAvailable() <= 0)
+        {
+            const int waitMs = static_cast<int>(std::max<qint64>(1, std::min<qint64>(50, deadlineMs - QDateTime::currentMSecsSinceEpoch())));
+            if (!socket_->waitForReadyRead(waitMs))
+            {
+                continue;
+            }
+        }
+
+        responseBytes += socket_->readAll();
+        const QString responseText = QString::fromLatin1(responseBytes);
+        QRegularExpressionMatchIterator matches = rdpPattern.globalMatch(responseText);
+        while (matches.hasNext())
+        {
+            const QRegularExpressionMatch match = matches.next();
+            const int axis = match.captured(1).toInt();
+            if (axisSet.contains(axis))
+            {
+                positions[axis] = match.captured(2).toLongLong();
+            }
+        }
+    }
+
+    if (rawResponse)
+    {
+        *rawResponse = QString::fromLatin1(responseBytes).trimmed();
+    }
+    for (auto it = positions.constBegin(); it != positions.constEnd(); ++it)
+    {
+        lastKnownPosition_[it.key()] = it.value();
+    }
+    return positions;
+}
+
+bool KohzuController::readAxis(int axis, qint64* positionPulse, QString* statusRaw, QString* error, int timeoutMs, bool readStatus)
 {
     QString localError;
-    const QString posResponse = query(QStringLiteral("RDP%1").arg(axis), &localError, timeoutMs);
-    if (posResponse.isEmpty())
+    QString rawResponse;
+    const QHash<int, qint64> positions = readAxisPositions(QList<int>{axis}, timeoutMs, &rawResponse);
+    if (!positions.contains(axis))
     {
         if (error)
         {
-            *error = localError;
+            *error = rawResponse.isEmpty()
+                ? QStringLiteral("Timed out waiting for RDP%1: %2").arg(axis).arg(localError)
+                : QStringLiteral("No matching RDP%1 response; raw response was: %2").arg(axis).arg(rawResponse);
         }
         return false;
     }
 
-    static const QRegularExpression numberAtEnd(QStringLiteral("(-?\\d+)\\s*$"));
-    const QRegularExpressionMatch match = numberAtEnd.match(posResponse);
-    if (!match.hasMatch())
-    {
-        if (error)
-        {
-            *error = QStringLiteral("Unexpected RDP response: %1").arg(posResponse);
-        }
-        return false;
-    }
-
-    const QString statusResponse = query(QStringLiteral("STR%1").arg(axis), &localError, timeoutMs);
-    if (statusResponse.isEmpty())
-    {
-        if (error)
-        {
-            *error = localError;
-        }
-        return false;
-    }
+    const qint64 parsedPosition = positions.value(axis);
 
     if (positionPulse)
     {
-        *positionPulse = match.captured(1).toLongLong();
+        *positionPulse = parsedPosition;
     }
-    lastKnownPosition_[axis] = match.captured(1).toLongLong();
     if (statusRaw)
     {
-        *statusRaw = statusResponse;
+        *statusRaw = QStringLiteral("RDP only");
+    }
+    lastKnownPosition_[axis] = parsedPosition;
+
+    if (!readStatus)
+    {
+        if (statusRaw)
+        {
+            *statusRaw = QStringLiteral("RDP only");
+        }
+        return true;
+    }
+
+    const int statusTimeoutMs = std::max(150, std::min(timeoutMs / 2, 300));
+    const QString statusResponse = query(QStringLiteral("STR%1").arg(axis), &localError, statusTimeoutMs);
+    if (statusRaw)
+    {
+        *statusRaw = statusResponse.isEmpty()
+            ? QStringLiteral("STR read unavailable: %1").arg(localError)
+            : statusResponse;
     }
     return true;
 }
@@ -601,6 +789,7 @@ void KohzuController::markAxisActive(int axis, qint64 targetPulse, bool hasTarge
     const bool wasActive = activeAxes_.contains(axis);
     activeAxes_.insert(axis);
     activeStableCount_[axis] = 0;
+    activeReadMissCount_[axis] = 0;
     activeStartedMs_[axis] = QDateTime::currentMSecsSinceEpoch();
     lastActivePosition_.remove(axis);
     if (hasTarget)
@@ -629,6 +818,7 @@ void KohzuController::updateActiveAxisState(int axis, qint64 positionPulse, cons
         activeTargetPosition_.remove(axis);
         activeStartedMs_.remove(axis);
         activeStableCount_.remove(axis);
+        activeReadMissCount_.remove(axis);
         emit axisActiveChanged(axis, false);
     };
 
