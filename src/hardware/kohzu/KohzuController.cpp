@@ -1,5 +1,7 @@
 #include "hardware/kohzu/KohzuController.h"
 
+#include <cmath>
+
 #include <QDateTime>
 #include <QRegularExpression>
 #include <QStringList>
@@ -19,6 +21,9 @@ constexpr int kConnectTimeoutMs = 1500;
 constexpr int kHandshakeTimeoutMs = 2500;
 constexpr int kInitialAxisTimeoutMs = 2000;
 constexpr int kPollAxisTimeoutMs = 700;
+constexpr int kRdpRetryCount = 2;
+constexpr qint64 kDefaultActiveReleaseMs = 15000;
+constexpr qint64 kActiveReleaseMarginMs = 800;
 
 enum class AxisMotionState
 {
@@ -93,6 +98,15 @@ QString findResponseForToken(const QString& responseText, const QString& token)
     return match.captured(0).trimmed();
 }
 
+bool isKohzuBusyError(const QString& responseText)
+{
+    // ARIES error 803: next command was received before the previous response was completed.
+    static const QRegularExpression busyPattern(
+        QStringLiteral("\\bE\\s+\\S+\\s+803\\b"),
+        QRegularExpression::CaseInsensitiveOption);
+    return busyPattern.match(responseText).hasMatch();
+}
+
 QList<int> toAxisList(const QVector<int>& axes)
 {
     QList<int> axisList;
@@ -102,6 +116,15 @@ QList<int> toAxisList(const QVector<int>& axes)
         axisList.push_back(axis);
     }
     return axisList;
+}
+
+qint64 estimateMoveReleaseMs(qint64 distancePulse, int topSpeedPps, int accelTime10ms, int decelTime10ms)
+{
+    const double cruiseMs = topSpeedPps > 0
+        ? (static_cast<double>(std::llabs(distancePulse)) / static_cast<double>(topSpeedPps)) * 1000.0
+        : static_cast<double>(kDefaultActiveReleaseMs);
+    const qint64 rampMs = static_cast<qint64>(std::max(0, accelTime10ms) + std::max(0, decelTime10ms)) * 10;
+    return std::max<qint64>(700, static_cast<qint64>(std::ceil(cruiseMs)) + rampMs + kActiveReleaseMarginMs);
 }
 
 } // namespace
@@ -134,8 +157,10 @@ void KohzuController::clearAxes()
     lastKnownPosition_.clear();
     activeTargetPosition_.clear();
     activeStartedMs_.clear();
+    activeReleaseAfterMs_.clear();
     activeStableCount_.clear();
     activeReadMissCount_.clear();
+    speedTableCache_.clear();
     for (int axis : activeAxes)
     {
         emit axisActiveChanged(axis, false);
@@ -183,12 +208,12 @@ void KohzuController::connectToController(const QString& host, quint16 port)
         const QHash<int, qint64> positions = readAxisPositions(toAxisList(axes_), kInitialAxisTimeoutMs);
         if (!positions.isEmpty())
         {
-            emit logMessage(QStringLiteral("Kohzu controller verified by RDP batch: %1/%2 axes responded.")
+            emit logMessage(QStringLiteral("Kohzu controller verified by RDP: %1/%2 axes responded.")
                 .arg(positions.size())
                 .arg(axes_.size()));
             for (auto it = positions.constBegin(); it != positions.constEnd(); ++it)
             {
-                emit axisUpdated(it.key(), it.value(), QStringLiteral("RDP batch"));
+                emit axisUpdated(it.key(), it.value(), QStringLiteral("RDP"));
             }
             controllerReady = true;
         }
@@ -206,6 +231,7 @@ void KohzuController::connectToController(const QString& host, quint16 port)
 
     emit connectionChanged(true);
     emit logMessage(QStringLiteral("Kohzu connected: %1:%2").arg(host).arg(port));
+    speedTableCache_.clear();
     pollAllAxesWithTimeout(kInitialAxisTimeoutMs);
     if (idlePollingEnabled_)
     {
@@ -222,8 +248,10 @@ void KohzuController::closeConnection()
     lastActivePosition_.clear();
     activeTargetPosition_.clear();
     activeStartedMs_.clear();
+    activeReleaseAfterMs_.clear();
     activeStableCount_.clear();
     activeReadMissCount_.clear();
+    speedTableCache_.clear();
     for (int axis : activeAxes)
     {
         emit axisActiveChanged(axis, false);
@@ -316,6 +344,13 @@ void KohzuController::configureSpeedTable(int axis, int speedTable, int startSpe
         return;
     }
 
+    if (speedTableCacheMatches(axis, speedTable, startSpeedPps, topSpeedPps,
+        accelTime10ms, decelTime10ms, accelPattern))
+    {
+        emit commandFinished(label, true, QStringLiteral("speed table unchanged"));
+        return;
+    }
+
     const QString command = QStringLiteral("WTB%1/%2/%3/%4/%5/%6/%7")
         .arg(axis)
         .arg(speedTable)
@@ -328,6 +363,11 @@ void KohzuController::configureSpeedTable(int axis, int speedTable, int startSpe
     const QString response = query(command, &error);
     const bool ok = !response.isEmpty() && response.startsWith(QLatin1Char('C'));
     emit commandFinished(label, ok, ok ? response : QStringLiteral("%1 %2").arg(error, response).trimmed());
+    if (ok)
+    {
+        updateSpeedTableCache(axis, speedTable, startSpeedPps, topSpeedPps,
+            accelTime10ms, decelTime10ms, accelPattern);
+    }
 }
 
 void KohzuController::configureSpeedTableAndMoveAbsolute(int axis, qint64 pulse, int speedTable,
@@ -341,23 +381,29 @@ void KohzuController::configureSpeedTableAndMoveAbsolute(int axis, qint64 pulse,
         return;
     }
 
-    const QString speedCommand = QStringLiteral("WTB%1/%2/%3/%4/%5/%6/%7")
-        .arg(axis)
-        .arg(speedTable)
-        .arg(startSpeedPps)
-        .arg(topSpeedPps)
-        .arg(accelTime10ms)
-        .arg(decelTime10ms)
-        .arg(accelPattern);
     QString error;
-    const QString speedResponse = query(speedCommand, &error);
-    const bool speedOk = !speedResponse.isEmpty() && speedResponse.startsWith(QLatin1Char('C'));
-    emit commandFinished(speedLabel, speedOk, speedOk ? speedResponse : QStringLiteral("%1 %2").arg(error, speedResponse).trimmed());
-    if (!speedOk)
+    if (!speedTableCacheMatches(axis, speedTable, startSpeedPps, topSpeedPps,
+        accelTime10ms, decelTime10ms, accelPattern))
     {
-        emit commandFinished(moveLabel, false, QStringLiteral("speed table setup failed; move not sent"));
-        emit axisActiveChanged(axis, false);
-        return;
+        const QString speedCommand = QStringLiteral("WTB%1/%2/%3/%4/%5/%6/%7")
+            .arg(axis)
+            .arg(speedTable)
+            .arg(startSpeedPps)
+            .arg(topSpeedPps)
+            .arg(accelTime10ms)
+            .arg(decelTime10ms)
+            .arg(accelPattern);
+        const QString speedResponse = query(speedCommand, &error);
+        const bool speedOk = !speedResponse.isEmpty() && speedResponse.startsWith(QLatin1Char('C'));
+        emit commandFinished(speedLabel, speedOk, speedOk ? speedResponse : QStringLiteral("%1 %2").arg(error, speedResponse).trimmed());
+        if (!speedOk)
+        {
+            emit commandFinished(moveLabel, false, QStringLiteral("speed table setup failed; move not sent"));
+            emit axisActiveChanged(axis, false);
+            return;
+        }
+        updateSpeedTableCache(axis, speedTable, startSpeedPps, topSpeedPps,
+            accelTime10ms, decelTime10ms, accelPattern);
     }
 
     const QString moveCommand = QStringLiteral("APS%1/%2/%3/1").arg(axis).arg(speedTable).arg(pulse);
@@ -367,9 +413,14 @@ void KohzuController::configureSpeedTableAndMoveAbsolute(int axis, qint64 pulse,
     emit commandFinished(moveLabel, moveOk, moveOk ? moveResponse : QStringLiteral("%1 %2").arg(error, moveResponse).trimmed());
     if (moveOk)
     {
+        const bool hadKnownPosition = lastKnownPosition_.contains(axis);
+        const qint64 previousPulse = lastKnownPosition_.value(axis, pulse);
+        const qint64 releaseAfterMs = hadKnownPosition
+            ? estimateMoveReleaseMs(pulse - previousPulse, topSpeedPps, accelTime10ms, decelTime10ms)
+            : kDefaultActiveReleaseMs;
         lastKnownPosition_[axis] = pulse;
         emit axisUpdated(axis, pulse, QStringLiteral("Estimated after APS; waiting for RDP refresh."));
-        markAxisActive(axis, pulse, true);
+        markAxisActive(axis, pulse, true, releaseAfterMs);
     }
     else
     {
@@ -388,23 +439,29 @@ void KohzuController::configureSpeedTableAndMoveRelative(int axis, qint64 pulse,
         return;
     }
 
-    const QString speedCommand = QStringLiteral("WTB%1/%2/%3/%4/%5/%6/%7")
-        .arg(axis)
-        .arg(speedTable)
-        .arg(startSpeedPps)
-        .arg(topSpeedPps)
-        .arg(accelTime10ms)
-        .arg(decelTime10ms)
-        .arg(accelPattern);
     QString error;
-    const QString speedResponse = query(speedCommand, &error);
-    const bool speedOk = !speedResponse.isEmpty() && speedResponse.startsWith(QLatin1Char('C'));
-    emit commandFinished(speedLabel, speedOk, speedOk ? speedResponse : QStringLiteral("%1 %2").arg(error, speedResponse).trimmed());
-    if (!speedOk)
+    if (!speedTableCacheMatches(axis, speedTable, startSpeedPps, topSpeedPps,
+        accelTime10ms, decelTime10ms, accelPattern))
     {
-        emit commandFinished(moveLabel, false, QStringLiteral("speed table setup failed; move not sent"));
-        emit axisActiveChanged(axis, false);
-        return;
+        const QString speedCommand = QStringLiteral("WTB%1/%2/%3/%4/%5/%6/%7")
+            .arg(axis)
+            .arg(speedTable)
+            .arg(startSpeedPps)
+            .arg(topSpeedPps)
+            .arg(accelTime10ms)
+            .arg(decelTime10ms)
+            .arg(accelPattern);
+        const QString speedResponse = query(speedCommand, &error);
+        const bool speedOk = !speedResponse.isEmpty() && speedResponse.startsWith(QLatin1Char('C'));
+        emit commandFinished(speedLabel, speedOk, speedOk ? speedResponse : QStringLiteral("%1 %2").arg(error, speedResponse).trimmed());
+        if (!speedOk)
+        {
+            emit commandFinished(moveLabel, false, QStringLiteral("speed table setup failed; move not sent"));
+            emit axisActiveChanged(axis, false);
+            return;
+        }
+        updateSpeedTableCache(axis, speedTable, startSpeedPps, topSpeedPps,
+            accelTime10ms, decelTime10ms, accelPattern);
     }
 
     const QString moveCommand = QStringLiteral("RPS%1/%2/%3/1").arg(axis).arg(speedTable).arg(pulse);
@@ -416,12 +473,15 @@ void KohzuController::configureSpeedTableAndMoveRelative(int axis, qint64 pulse,
     {
         const bool hasKnownPosition = lastKnownPosition_.contains(axis);
         const qint64 targetPulse = hasKnownPosition ? lastKnownPosition_.value(axis) + pulse : 0;
+        const qint64 releaseAfterMs = hasKnownPosition
+            ? estimateMoveReleaseMs(pulse, topSpeedPps, accelTime10ms, decelTime10ms)
+            : kDefaultActiveReleaseMs;
         if (hasKnownPosition)
         {
             lastKnownPosition_[axis] = targetPulse;
             emit axisUpdated(axis, targetPulse, QStringLiteral("Estimated after RPS; waiting for RDP refresh."));
         }
-        markAxisActive(axis, targetPulse, hasKnownPosition);
+        markAxisActive(axis, targetPulse, hasKnownPosition, releaseAfterMs);
     }
     else
     {
@@ -446,6 +506,7 @@ void KohzuController::stopAxis(int axis, const QString& label)
     lastActivePosition_.remove(axis);
     activeTargetPosition_.remove(axis);
     activeStartedMs_.remove(axis);
+    activeReleaseAfterMs_.remove(axis);
     activeStableCount_.remove(axis);
     activeReadMissCount_.remove(axis);
     emit axisActiveChanged(axis, false);
@@ -473,8 +534,10 @@ void KohzuController::stopAllAxes()
     lastActivePosition_.clear();
     activeTargetPosition_.clear();
     activeStartedMs_.clear();
+    activeReleaseAfterMs_.clear();
     activeStableCount_.clear();
     activeReadMissCount_.clear();
+    speedTableCache_.clear();
     activePollTimer_.stop();
     for (int axis : activeAxes)
     {
@@ -510,10 +573,10 @@ void KohzuController::pollAllAxesWithTimeout(int timeoutMs)
         }
         const qint64 position = positions.value(axis);
         lastKnownPosition_[axis] = position;
-        emit axisUpdated(axis, position, QStringLiteral("RDP batch"));
+        emit axisUpdated(axis, position, QStringLiteral("RDP"));
         if (activeAxes_.contains(axis))
         {
-            updateActiveAxisState(axis, position, QStringLiteral("RDP batch"));
+            updateActiveAxisState(axis, position, QStringLiteral("RDP"));
         }
         ++updatedCount;
     }
@@ -538,8 +601,17 @@ void KohzuController::pollAllAxesWithTimeout(int timeoutMs)
     }
     else if (updatedCount == 0)
     {
-        emit logMessage(QStringLiteral("Kohzu position refresh failed: no RDP responses received. Raw: %1")
-            .arg(rawResponse.left(300)));
+        const qint64 nowMs = QDateTime::currentMSecsSinceEpoch();
+        const bool busy = isKohzuBusyError(rawResponse);
+        if (nowMs - lastPollFailureLogMs_ >= 10000)
+        {
+            lastPollFailureLogMs_ = nowMs;
+            emit logMessage(QStringLiteral("Kohzu position refresh failed: %1 Raw: %2")
+                .arg(busy
+                    ? QStringLiteral("controller busy/possibly occupied by another client (803).")
+                    : QStringLiteral("no RDP responses received."))
+                .arg(rawResponse.left(300)));
+        }
     }
 }
 
@@ -565,10 +637,26 @@ void KohzuController::pollActiveAxes()
                     .arg(axis)
                     .arg(missCount));
             }
+            const qint64 startedMs = activeStartedMs_.value(axis, QDateTime::currentMSecsSinceEpoch());
+            const qint64 releaseAfterMs = activeReleaseAfterMs_.value(axis, kDefaultActiveReleaseMs);
+            if (QDateTime::currentMSecsSinceEpoch() - startedMs >= releaseAfterMs)
+            {
+                activeAxes_.remove(axis);
+                lastActivePosition_.remove(axis);
+                activeTargetPosition_.remove(axis);
+                activeStartedMs_.remove(axis);
+                activeReleaseAfterMs_.remove(axis);
+                activeStableCount_.remove(axis);
+                activeReadMissCount_.remove(axis);
+                emit axisActiveChanged(axis, false);
+                emit logMessage(QStringLiteral("Axis %1 position/status reads are unavailable; releasing UI after estimated move time %2 ms.")
+                    .arg(axis)
+                    .arg(releaseAfterMs));
+            }
             continue;
         }
         const qint64 position = positions.value(axis);
-        const QString status = QStringLiteral("RDP active batch");
+        const QString status = QStringLiteral("RDP active");
         activeReadMissCount_.remove(axis);
         emit axisUpdated(axis, position, status);
         updateActiveAxisState(axis, position, status);
@@ -660,6 +748,35 @@ QString KohzuController::query(const QString& command, QString* error, int timeo
     return {};
 }
 
+bool KohzuController::speedTableCacheMatches(int axis, int speedTable, int startSpeedPps, int topSpeedPps,
+    int accelTime10ms, int decelTime10ms, int accelPattern) const
+{
+    const auto it = speedTableCache_.constFind(axis);
+    if (it == speedTableCache_.constEnd())
+    {
+        return false;
+    }
+    return it->speedTable == speedTable
+        && it->startSpeedPps == startSpeedPps
+        && it->topSpeedPps == topSpeedPps
+        && it->accelTime10ms == accelTime10ms
+        && it->decelTime10ms == decelTime10ms
+        && it->accelPattern == accelPattern;
+}
+
+void KohzuController::updateSpeedTableCache(int axis, int speedTable, int startSpeedPps, int topSpeedPps,
+    int accelTime10ms, int decelTime10ms, int accelPattern)
+{
+    speedTableCache_[axis] = SpeedTableCache{
+        speedTable,
+        startSpeedPps,
+        topSpeedPps,
+        accelTime10ms,
+        decelTime10ms,
+        accelPattern,
+    };
+}
+
 QHash<int, qint64> KohzuController::readAxisPositions(const QList<int>& axisList, int timeoutMs, QString* rawResponse)
 {
     QHash<int, qint64> positions;
@@ -672,62 +789,53 @@ QHash<int, qint64> KohzuController::readAxisPositions(const QList<int>& axisList
         return positions;
     }
 
-    QSet<int> axisSet;
-    for (int axis : axisList)
-    {
-        axisSet.insert(axis);
-    }
-
-    for (int axis : axisList)
-    {
-        const QByteArray payload = QStringLiteral("RDP%1\r\n").arg(axis).toLatin1();
-        if (socket_->write(payload) != payload.size() || !socket_->waitForBytesWritten(timeoutMs))
-        {
-            emit logMessage(QStringLiteral("Axis %1 read request failed: %2").arg(axis).arg(socket_->errorString()));
-            if (rawResponse)
-            {
-                *rawResponse = {};
-            }
-            return positions;
-        }
-        QThread::msleep(2);
-    }
-
-    QByteArray responseBytes;
     static const QRegularExpression rdpPattern(
         QStringLiteral("\\bC\\s+RDP(\\d+)\\s+(-?\\d+)\\b"),
         QRegularExpression::CaseInsensitiveOption);
-    const qint64 deadlineMs = QDateTime::currentMSecsSinceEpoch()
-        + std::max(timeoutMs, 500)
-        + static_cast<qint64>(axisSet.size()) * 150;
-    while (QDateTime::currentMSecsSinceEpoch() < deadlineMs && positions.size() < axisSet.size())
+    QStringList rawLines;
+    for (int axis : axisList)
     {
-        if (socket_->bytesAvailable() <= 0)
+        QString error;
+        QString response;
+        for (int attempt = 0; attempt <= kRdpRetryCount; ++attempt)
         {
-            const int waitMs = static_cast<int>(std::max<qint64>(1, std::min<qint64>(50, deadlineMs - QDateTime::currentMSecsSinceEpoch())));
-            if (!socket_->waitForReadyRead(waitMs))
+            if (attempt > 0)
             {
-                continue;
+                QThread::msleep(30 * attempt);
+            }
+            response = query(QStringLiteral("RDP%1").arg(axis), &error, timeoutMs);
+            if (!response.isEmpty() && !isKohzuBusyError(response))
+            {
+                break;
             }
         }
 
-        responseBytes += socket_->readAll();
-        const QString responseText = QString::fromLatin1(responseBytes);
-        QRegularExpressionMatchIterator matches = rdpPattern.globalMatch(responseText);
-        while (matches.hasNext())
+        if (response.isEmpty())
         {
-            const QRegularExpressionMatch match = matches.next();
-            const int axis = match.captured(1).toInt();
-            if (axisSet.contains(axis))
-            {
-                positions[axis] = match.captured(2).toLongLong();
-            }
+            rawLines.push_back(error.isEmpty()
+                ? QStringLiteral("RDP%1: no response").arg(axis)
+                : QStringLiteral("RDP%1: %2").arg(axis).arg(error));
+            continue;
         }
+
+        rawLines.push_back(response);
+        const QRegularExpressionMatch match = rdpPattern.match(response);
+        if (!match.hasMatch())
+        {
+            continue;
+        }
+        const int responseAxis = match.captured(1).toInt();
+        if (responseAxis != axis)
+        {
+            rawLines.push_back(QStringLiteral("RDP%1: ignored response for axis %2").arg(axis).arg(responseAxis));
+            continue;
+        }
+        positions[axis] = match.captured(2).toLongLong();
     }
 
     if (rawResponse)
     {
-        *rawResponse = QString::fromLatin1(responseBytes).trimmed();
+        *rawResponse = rawLines.join(QStringLiteral("\n")).trimmed();
     }
     for (auto it = positions.constBegin(); it != positions.constEnd(); ++it)
     {
@@ -784,7 +892,7 @@ bool KohzuController::readAxis(int axis, qint64* positionPulse, QString* statusR
     return true;
 }
 
-void KohzuController::markAxisActive(int axis, qint64 targetPulse, bool hasTarget)
+void KohzuController::markAxisActive(int axis, qint64 targetPulse, bool hasTarget, qint64 releaseAfterMs)
 {
     const bool wasActive = activeAxes_.contains(axis);
     activeAxes_.insert(axis);
@@ -799,6 +907,14 @@ void KohzuController::markAxisActive(int axis, qint64 targetPulse, bool hasTarge
     else
     {
         activeTargetPosition_.remove(axis);
+    }
+    if (releaseAfterMs > 0)
+    {
+        activeReleaseAfterMs_[axis] = releaseAfterMs;
+    }
+    else
+    {
+        activeReleaseAfterMs_[axis] = kDefaultActiveReleaseMs;
     }
     if (!wasActive)
     {
@@ -817,6 +933,7 @@ void KohzuController::updateActiveAxisState(int axis, qint64 positionPulse, cons
         lastActivePosition_.remove(axis);
         activeTargetPosition_.remove(axis);
         activeStartedMs_.remove(axis);
+        activeReleaseAfterMs_.remove(axis);
         activeStableCount_.remove(axis);
         activeReadMissCount_.remove(axis);
         emit axisActiveChanged(axis, false);

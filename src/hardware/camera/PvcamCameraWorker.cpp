@@ -878,16 +878,23 @@ void PvcamCameraWorker::openCameraIfNeeded()
 void PvcamCameraWorker::closeCamera()
 {
 #ifdef CT_HAS_PVCAM
+    writePvcamTrace(QStringLiteral("PVCAM closeCamera enter"));
+    writePvcamTrace(QStringLiteral("PVCAM closeCamera cleanupPreparedSequence begin"));
     cleanupPreparedSequence(true);
+    writePvcamTrace(QStringLiteral("PVCAM closeCamera cleanupPreparedSequence end"));
     if (cameraOpened_)
     {
+        writePvcamTrace(QStringLiteral("PVCAM pl_cam_close begin"));
         pl_cam_close(hcam_);
+        writePvcamTrace(QStringLiteral("PVCAM pl_cam_close end"));
         cameraOpened_ = false;
         hcam_ = -1;
     }
     if (pvcamInitialized_)
     {
+        writePvcamTrace(QStringLiteral("PVCAM pl_pvcam_uninit begin"));
         pl_pvcam_uninit();
+        writePvcamTrace(QStringLiteral("PVCAM pl_pvcam_uninit end"));
         pvcamInitialized_ = false;
     }
     cameraName_.clear();
@@ -895,6 +902,7 @@ void PvcamCameraWorker::closeCamera()
     sensorHeight_ = 0;
     imageFormat_ = 0;
     bitDepth_ = 0;
+    writePvcamTrace(QStringLiteral("PVCAM closeCamera exit"));
 #endif
 }
 
@@ -1779,20 +1787,28 @@ void PvcamCameraWorker::startContinuousCapture(const PvcamCaptureSettings& rawSe
 
 void PvcamCameraWorker::stopCapture()
 {
+    writePvcamTrace(QStringLiteral("PVCAM stopCapture enter"));
     stopRequested_.store(true);
 #ifdef CT_HAS_PVCAM
     if (capturing_.load() && cameraOpened_ && hcam_ >= 0)
     {
+        writePvcamTrace(QStringLiteral("PVCAM pl_exp_abort begin"));
         pl_exp_abort(hcam_, CCS_HALT);
+        writePvcamTrace(QStringLiteral("PVCAM pl_exp_abort end"));
     }
 #endif
+    writePvcamTrace(QStringLiteral("PVCAM stopCapture exit"));
 }
 
 void PvcamCameraWorker::shutdown()
 {
+    writePvcamTrace(QStringLiteral("PVCAM shutdown enter"));
     stopCapture();
+    writePvcamTrace(QStringLiteral("PVCAM shutdown endPreparedCapture begin"));
     endPreparedCapture();
+    writePvcamTrace(QStringLiteral("PVCAM shutdown endPreparedCapture end"));
     closeCamera();
+    writePvcamTrace(QStringLiteral("PVCAM shutdown exit"));
 }
 
 } // namespace ct

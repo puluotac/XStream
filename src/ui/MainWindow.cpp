@@ -314,17 +314,12 @@ MotorSpeedTableParams makeMotorSpeedTableParams(const QString& axisName, int spe
     params.topSpeedPps = static_cast<int>(topPps);
     params.accelTime10ms = accelTicks;
     params.decelTime10ms = accelTicks;
-    params.summary = QStringLiteral("%1 speed table %2: start=%3 %4/s (%5 pps), top=%6 %4/s (%7 pps), accel/decel=%8 s (%9 ticks), pattern=%10")
+    params.summary = QStringLiteral("%1 speed ok: %2 -> %3 %4/s, acc %5 s")
         .arg(axisName)
-        .arg(speedTable)
         .arg(safeStart, 0, 'f', 4)
-        .arg(unit)
-        .arg(params.startSpeedPps)
         .arg(safeTop, 0, 'f', 4)
-        .arg(params.topSpeedPps)
-        .arg(static_cast<double>(params.accelTime10ms) / 100.0, 0, 'f', 2)
-        .arg(params.accelTime10ms)
-        .arg(params.accelPattern);
+        .arg(unit)
+        .arg(static_cast<double>(params.accelTime10ms) / 100.0, 0, 'f', 2);
     return params;
 }
 
@@ -2297,8 +2292,10 @@ void MainWindow::updateCtProgressUi()
 
 void MainWindow::appendLog(const QString& text)
 {
-    logEdit_->append(text);
-    recentLogLines_.append(text);
+    const QDateTime now = QDateTime::currentDateTime();
+    const QString uiText = QStringLiteral("[%1] %2").arg(now.toString(QStringLiteral("HH:mm:ss.zzz")), text);
+    logEdit_->append(uiText);
+    recentLogLines_.append(uiText);
     while (recentLogLines_.size() > 200)
     {
         recentLogLines_.removeFirst();
@@ -2308,7 +2305,7 @@ void MainWindow::appendLog(const QString& text)
     if (file.open(QIODevice::WriteOnly | QIODevice::Append | QIODevice::Text))
     {
         QTextStream stream(&file);
-        stream << QDateTime::currentDateTime().toString(Qt::ISODateWithMs) << " " << text << '\n';
+        stream << now.toString(Qt::ISODateWithMs) << " " << text << '\n';
     }
 }
 
@@ -2737,12 +2734,18 @@ void MainWindow::stopCameraLivePreview(bool restartAfterStop)
     {
         return;
     }
+    const bool wasLiveRunning = cameraLiveRunning_;
     cameraRestartLiveAfterStop_ = restartAfterStop;
+    cameraLiveRunning_ = false;
+    cameraLiveButton_->setText(QStringLiteral("Open Live"));
     cameraLiveButton_->setEnabled(false);
     cameraSnapButton_->setEnabled(false);
     cameraApplyRoiButton_->setEnabled(false);
     cameraResetRoiButton_->setEnabled(false);
-    QMetaObject::invokeMethod(cameraWorker_, "stopCapture", Qt::DirectConnection);
+    if (wasLiveRunning)
+    {
+        QMetaObject::invokeMethod(cameraWorker_, "stopCapture", Qt::DirectConnection);
+    }
 }
 
 void MainWindow::applyCameraRoi()
@@ -3002,9 +3005,9 @@ void MainWindow::startCtAcquisition()
         return;
     }
     const bool requestedFlyMode = ctModeTabs_ && ctModeTabs_->currentIndex() == 1;
-    if (requestedFlyMode && directoryHasAnyEntries(savePath))
+    if (directoryHasAnyEntries(savePath))
     {
-        appendLog(QStringLiteral("CT acquisition failed: FlyScan Save Path must be empty or absent before the production test: %1").arg(savePath));
+        appendLog(QStringLiteral("CT acquisition failed: Save Path must be empty or absent to avoid overwriting existing CT data: %1").arg(savePath));
         return;
     }
     QDir().mkpath(savePath);
@@ -3341,7 +3344,8 @@ void MainWindow::maybeStartCtSmokeAutostart()
         return;
     }
 
-    const bool cameraReady = cameraStateLabel_ && cameraStateLabel_->text().contains(QStringLiteral("Ready"), Qt::CaseInsensitive);
+    const bool cameraReady = cameraWarmOpenComplete_
+        || (cameraStateLabel_ && cameraStateLabel_->text().contains(QStringLiteral("Ready"), Qt::CaseInsensitive));
     const bool axesReady = motorAxes_.contains(QStringLiteral("R"))
         && motorAxes_.contains(QStringLiteral("Y"))
         && motorAxes_[QStringLiteral("R")].hasPosition
@@ -4188,7 +4192,6 @@ bool MainWindow::moveCtAxisAbsolute(const QString& axisName, double targetValue,
     ctWaitingForMotor_ = true;
     ctPendingMotorAction_ = action;
     startCtMotorTiming(action);
-    appendLog(label);
     QMetaObject::invokeMethod(kohzuController_, "moveAbsolutePulse", Qt::QueuedConnection,
         Q_ARG(int, it->axis),
         Q_ARG(qint64, pulse),
@@ -4225,7 +4228,6 @@ bool MainWindow::moveCtAxisRelative(const QString& axisName, double deltaValue, 
     ctWaitingForMotor_ = true;
     ctPendingMotorAction_ = action;
     startCtMotorTiming(action);
-    appendLog(label);
     QMetaObject::invokeMethod(kohzuController_, "jogRelativePulse", Qt::QueuedConnection,
         Q_ARG(int, it->axis),
         Q_ARG(qint64, pulse),
@@ -4497,6 +4499,8 @@ void MainWindow::finishCtAcquisition(bool ok, const QString& message)
     }
     ctStartButton_->setEnabled(true);
     ctStopButton_->setEnabled(false);
+    cameraLiveRunning_ = false;
+    cameraLiveButton_->setText(QStringLiteral("Open Live"));
     cameraSnapButton_->setEnabled(true);
     cameraLiveButton_->setEnabled(true);
     cameraApplyRoiButton_->setEnabled(true);
@@ -6062,7 +6066,18 @@ void MainWindow::startMotorWorker()
     connect(kohzuController_, &KohzuController::logMessage, this, &MainWindow::appendLog);
     connect(kohzuController_, &KohzuController::commandFinished, this, [this](const QString& label, bool ok, const QString& response) {
         if (shuttingDown_) { return; }
-        appendLog(QStringLiteral("%1 %2: %3").arg(label, ok ? QStringLiteral("ok") : QStringLiteral("failed"), response));
+        const bool speedTableLabel = label.contains(QStringLiteral("speed"), Qt::CaseInsensitive);
+        if (!(ok && response == QStringLiteral("speed table unchanged")))
+        {
+            if (ok)
+            {
+                appendLog(speedTableLabel ? label : QStringLiteral("%1 ok").arg(label));
+            }
+            else
+            {
+                appendLog(QStringLiteral("%1 failed: %2").arg(label, response));
+            }
+        }
         if (ctRunning_ && label.startsWith(QStringLiteral("CT speed table ")))
         {
             if (!ok)
@@ -6225,10 +6240,8 @@ void MainWindow::moveMotorAxis(const QString& name)
 
     const qint64 pulse = static_cast<qint64>(std::llround(target * it->pulsePerUnit));
 
-    const QString label = QStringLiteral("%1 absolute %2 pulse (%3 -> %4 %5)")
+    const QString label = QStringLiteral("%1 -> %2 %3")
         .arg(name)
-        .arg(pulse)
-        .arg(it->currentValue, 0, 'f', 4)
         .arg(target, 0, 'f', 4)
         .arg(it->unit);
     const MotorSpeedTableParams speedParams = makeMotorSpeedTableParams(
@@ -6307,11 +6320,10 @@ void MainWindow::moveMotorAxisRelative(const QString& name, int direction)
         return;
     }
 
-    const QString label = QStringLiteral("%1 relative %2 pulse (%3 -> %4 %5)")
+    const QString label = QStringLiteral("%1 %2%3 %4")
         .arg(name)
-        .arg(pulse)
-        .arg(it->currentValue, 0, 'f', 4)
-        .arg(target, 0, 'f', 4)
+        .arg(relative >= 0.0 ? QStringLiteral("+") : QStringLiteral(""))
+        .arg(relative, 0, 'f', 4)
         .arg(it->unit);
     const MotorSpeedTableParams speedParams = makeMotorSpeedTableParams(
         name,
@@ -6428,8 +6440,10 @@ void MainWindow::updateMotorUiEnabled()
 
 void MainWindow::closeEvent(QCloseEvent* event)
 {
+    writeStartupTrace(QStringLiteral("closeEvent enter"));
     saveSessionConfig();
     shutdownWorkers();
+    writeStartupTrace(QStringLiteral("closeEvent accept"));
     event->accept();
 }
 
@@ -6441,15 +6455,19 @@ void MainWindow::shutdownWorkers()
     }
     shuttingDown_ = true;
 
+    writeStartupTrace(QStringLiteral("shutdownWorkers begin"));
     controller_.shutdown();
+    writeStartupTrace(QStringLiteral("shutdownWorkers controller shutdown done"));
 
     if (ctReplayWorker_)
     {
+        writeStartupTrace(QStringLiteral("shutdownWorkers ctReplay begin"));
         disconnect(ctReplayWorker_, nullptr, this, nullptr);
         QMetaObject::invokeMethod(ctReplayWorker_, "stopReplay", Qt::QueuedConnection);
         ctReplayThread_.quit();
         ctReplayThread_.wait(3000);
         ctReplayWorker_ = nullptr;
+        writeStartupTrace(QStringLiteral("shutdownWorkers ctReplay done"));
     }
     else
     {
@@ -6459,6 +6477,7 @@ void MainWindow::shutdownWorkers()
 
     if (ctWriter_)
     {
+        writeStartupTrace(QStringLiteral("shutdownWorkers ctWriter begin"));
         disconnect(ctWriter_, nullptr, this, nullptr);
         CtTiffWriter* writer = ctWriter_;
         QThread* guiThread = thread();
@@ -6472,6 +6491,7 @@ void MainWindow::shutdownWorkers()
         ctWriterThread_.quit();
         ctWriterThread_.wait(3000);
         delete writer;
+        writeStartupTrace(QStringLiteral("shutdownWorkers ctWriter done"));
     }
     else
     {
@@ -6481,10 +6501,10 @@ void MainWindow::shutdownWorkers()
 
     if (cameraWorker_)
     {
+        writeStartupTrace(QStringLiteral("shutdownWorkers camera begin"));
         disconnect(cameraWorker_, nullptr, this, nullptr);
         PvcamCameraWorker* worker = cameraWorker_;
         QThread* guiThread = thread();
-        worker->stopCapture();
         QMetaObject::invokeMethod(worker, [worker]() {
             worker->shutdown();
         }, Qt::BlockingQueuedConnection);
@@ -6495,6 +6515,7 @@ void MainWindow::shutdownWorkers()
         cameraThread_.quit();
         cameraThread_.wait(7000);
         delete worker;
+        writeStartupTrace(QStringLiteral("shutdownWorkers camera done"));
     }
     else
     {
@@ -6504,6 +6525,7 @@ void MainWindow::shutdownWorkers()
 
     if (kohzuController_)
     {
+        writeStartupTrace(QStringLiteral("shutdownWorkers kohzu begin"));
         disconnect(kohzuController_, nullptr, this, nullptr);
         KohzuController* controller = kohzuController_;
         QThread* guiThread = thread();
@@ -6517,12 +6539,14 @@ void MainWindow::shutdownWorkers()
         kohzuThread_.quit();
         kohzuThread_.wait(1500);
         delete controller;
+        writeStartupTrace(QStringLiteral("shutdownWorkers kohzu done"));
     }
     else
     {
         kohzuThread_.quit();
         kohzuThread_.wait(1500);
     }
+    writeStartupTrace(QStringLiteral("shutdownWorkers end"));
 }
 
 } // namespace ct

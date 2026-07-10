@@ -50,13 +50,27 @@ private slots:
     void pollActiveAxes();
 
 private:
+    struct SpeedTableCache
+    {
+        int speedTable = 0;
+        int startSpeedPps = 0;
+        int topSpeedPps = 0;
+        int accelTime10ms = 0;
+        int decelTime10ms = 0;
+        int accelPattern = 0;
+    };
+
     bool isConnected() const;
     void closeConnection();
     QString query(const QString& command, QString* error = nullptr, int timeoutMs = 1500);
+    bool speedTableCacheMatches(int axis, int speedTable, int startSpeedPps, int topSpeedPps,
+        int accelTime10ms, int decelTime10ms, int accelPattern) const;
+    void updateSpeedTableCache(int axis, int speedTable, int startSpeedPps, int topSpeedPps,
+        int accelTime10ms, int decelTime10ms, int accelPattern);
     QHash<int, qint64> readAxisPositions(const QList<int>& axisList, int timeoutMs, QString* rawResponse = nullptr);
     bool readAxis(int axis, qint64* positionPulse, QString* statusRaw, QString* error = nullptr, int timeoutMs = 700, bool readStatus = false);
     void pollAllAxesWithTimeout(int timeoutMs);
-    void markAxisActive(int axis, qint64 targetPulse = 0, bool hasTarget = false);
+    void markAxisActive(int axis, qint64 targetPulse = 0, bool hasTarget = false, qint64 releaseAfterMs = 0);
     void updateActiveAxisState(int axis, qint64 positionPulse, const QString& statusRaw);
 
     QTcpSocket* socket_ = nullptr;
@@ -66,10 +80,13 @@ private:
     QHash<int, qint64> lastKnownPosition_;
     QHash<int, qint64> activeTargetPosition_;
     QHash<int, qint64> activeStartedMs_;
+    QHash<int, qint64> activeReleaseAfterMs_;
     QHash<int, int> activeStableCount_;
     QHash<int, int> activeReadMissCount_;
+    QHash<int, SpeedTableCache> speedTableCache_;
     QTimer idlePollTimer_;
     QTimer activePollTimer_;
+    qint64 lastPollFailureLogMs_ = 0;
     bool idlePollingEnabled_ = true;
 };
 

@@ -9,6 +9,8 @@
 
 #include <opencv2/core.hpp>
 
+#include <memory>
+
 Q_DECLARE_METATYPE(cv::Mat)
 
 namespace
@@ -33,10 +35,12 @@ int main(int argc, char* argv[])
     writeStartupTrace(QStringLiteral("QApplication constructed"));
     qRegisterMetaType<cv::Mat>("cv::Mat");
     writeStartupTrace(QStringLiteral("metatypes registered; constructing MainWindow"));
-    ct::MainWindow window;
+    auto window = std::make_unique<ct::MainWindow>();
     writeStartupTrace(QStringLiteral("MainWindow constructed; showing"));
-    window.show();
+    window->show();
     const int rc = app.exec();
     writeStartupTrace(QStringLiteral("app exec returned %1").arg(rc));
+    window.reset();
+    writeStartupTrace(QStringLiteral("MainWindow destroyed"));
     return rc;
 }
