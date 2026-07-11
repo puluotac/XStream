@@ -136,7 +136,6 @@ struct CtAcquisitionUiConfig
     double flatMoveUm = 0.0;
     int flatNum = 10;
     double flyLeadAngleDeg = 2.0;
-    bool autoCorReference = false;
     int tiffThreads = 24;
 };
 

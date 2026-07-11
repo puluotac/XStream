@@ -32,7 +32,7 @@ struct CtAcquisitionSettings
     double flyLeadAngleDeg = 2.0;
     double flyFrameIntervalMs = 0.0;
     double flyScanTimeS = 0.0;
-    bool autoCor = false;
+    bool autoCor = true;
     int padding = 4;
     QString tomoPrefix = QStringLiteral("Tomo_");
     QString flatPrefix = QStringLiteral("Flat_");

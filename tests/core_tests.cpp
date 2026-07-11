@@ -74,7 +74,6 @@ int main()
     sessionConfig.ctAcquisitionUi.flatMoveUm = 10000.0;
     sessionConfig.ctAcquisitionUi.flatNum = 2;
     sessionConfig.ctAcquisitionUi.flyLeadAngleDeg = 3.0;
-    sessionConfig.ctAcquisitionUi.autoCorReference = true;
     sessionConfig.ctAcquisitionUi.tiffThreads = 24;
     sessionConfig.ctFly.allowedBlurPx = 1.25;
     sessionConfig.kohzuUi.host = "10.30.92.202";
@@ -147,7 +146,6 @@ int main()
         || std::abs(loadedConfig.ctAcquisitionUi.flatMoveUm - sessionConfig.ctAcquisitionUi.flatMoveUm) > 1e-9
         || loadedConfig.ctAcquisitionUi.flatNum != sessionConfig.ctAcquisitionUi.flatNum
         || std::abs(loadedConfig.ctAcquisitionUi.flyLeadAngleDeg - sessionConfig.ctAcquisitionUi.flyLeadAngleDeg) > 1e-9
-        || loadedConfig.ctAcquisitionUi.autoCorReference != sessionConfig.ctAcquisitionUi.autoCorReference
         || loadedConfig.ctAcquisitionUi.tiffThreads != sessionConfig.ctAcquisitionUi.tiffThreads
         || std::abs(loadedConfig.ctFly.allowedBlurPx - sessionConfig.ctFly.allowedBlurPx) > 1e-9
         || loadedConfig.kohzuUi.host != sessionConfig.kohzuUi.host

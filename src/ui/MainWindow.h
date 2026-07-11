@@ -176,6 +176,7 @@ private:
     bool cameraLiveRunning_ = false;
     bool cameraRestartLiveAfterStop_ = false;
     bool ctRestoreLiveAfterFinish_ = false;
+    int liveRestoreGeneration_ = 0;
     bool cameraWarmOpenComplete_ = false;
     qint64 cameraWarmOpenCompletedMs_ = 0;
     bool reconStartDeferredForCameraWarmOpen_ = false;
@@ -346,7 +347,6 @@ private:
     QLabel* ctFlyFrameIntervalLabel_ = nullptr;
     QLabel* ctFlyMaxProjectionLabel_ = nullptr;
     QLabel* ctFlyValidationLabel_ = nullptr;
-    QCheckBox* ctAutoCorCheck_ = nullptr;
     QSpinBox* ctTiffThreadsSpin_ = nullptr;
     QLabel* ctStatusLabel_ = nullptr;
     QLabel* ctTimingLabel_ = nullptr;

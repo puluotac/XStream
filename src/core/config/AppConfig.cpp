@@ -164,7 +164,6 @@ AppConfig AppConfig::fromJsonObject(const QJsonObject& object)
     cfg.ctAcquisitionUi.flatMoveUm = std::clamp(readValue(ctAcqObj, "FLAT_MOVE_UM", cfg.ctAcquisitionUi.flatMoveUm), -500000.0, 500000.0);
     cfg.ctAcquisitionUi.flatNum = std::clamp(readValue(ctAcqObj, "FLAT_NUM", cfg.ctAcquisitionUi.flatNum), 0, 10000);
     cfg.ctAcquisitionUi.flyLeadAngleDeg = std::clamp(readValue(ctAcqObj, "FLY_LEAD_ANGLE_DEG", cfg.ctAcquisitionUi.flyLeadAngleDeg), 0.0, 90.0);
-    cfg.ctAcquisitionUi.autoCorReference = readValue(ctAcqObj, "AUTO_COR_REFERENCE", cfg.ctAcquisitionUi.autoCorReference);
     cfg.ctAcquisitionUi.tiffThreads = std::clamp(readValue(ctAcqObj, "TIFF_THREADS", cfg.ctAcquisitionUi.tiffThreads), 1, 64);
 
     const auto kohzuObj = object.value("KOHZU").toObject();
@@ -374,7 +373,6 @@ QJsonObject AppConfig::toJsonObject() const
     ctAcqObj["FLAT_MOVE_UM"] = ctAcquisitionUi.flatMoveUm;
     ctAcqObj["FLAT_NUM"] = ctAcquisitionUi.flatNum;
     ctAcqObj["FLY_LEAD_ANGLE_DEG"] = ctAcquisitionUi.flyLeadAngleDeg;
-    ctAcqObj["AUTO_COR_REFERENCE"] = ctAcquisitionUi.autoCorReference;
     ctAcqObj["TIFF_THREADS"] = ctAcquisitionUi.tiffThreads;
     root["CT_ACQUISITION"] = ctAcqObj;
 
