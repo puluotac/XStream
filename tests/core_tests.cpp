@@ -1,5 +1,7 @@
 #include "core/common/ProjectionTypes.h"
 #include "core/common/GeometryVectorGenerator.h"
+#include "core/acq/ContinuousTiming.h"
+#include "core/acq/FrameBufferPool.h"
 #include "core/config/AppConfig.h"
 #include "core/cor/CorEstimatorFft.h"
 #include "core/preprocess/ImageNormalizer.h"
@@ -23,6 +25,97 @@
 
 int main()
 {
+    QVector<ct::TimingSample> timingSamples;
+    for (int i = 0; i < 100; ++i)
+    {
+        timingSamples.append({ 1000 + i, static_cast<qint64>(i) * 12000000LL });
+    }
+    const ct::TimingAnalysis timing = ct::analyzeTimingSamples(timingSamples);
+    if (!timing.valid || !timing.stable || timing.droppedFrames != 0
+        || std::abs(timing.medianPeriodMs - 12.0) > 1e-9
+        || std::abs(timing.rawFrameRateFps - (1000.0 / 12.0)) > 1e-9)
+    {
+        std::cerr << "Continuous timing analysis failed\n";
+        return 30;
+    }
+
+    QVector<ct::TimingSample> timingWithGap = timingSamples;
+    for (int i = 50; i < timingWithGap.size(); ++i)
+    {
+        ++timingWithGap[i].frameNumber;
+    }
+    const ct::TimingAnalysis gapTiming = ct::analyzeTimingSamples(timingWithGap);
+    if (!gapTiming.valid || gapTiming.stable || gapTiming.droppedFrames != 1)
+    {
+        std::cerr << "Timing frame-gap detection failed\n";
+        return 31;
+    }
+
+    const ct::FlyTimingPlan flyTiming = ct::makeFlyTimingPlan(180.0, 1080, 1.0, 1600.0, 5.0, 12.0);
+    if (!flyTiming.valid || flyTiming.rawFrameStride != 2
+        || std::abs(flyTiming.projectionIntervalMs - 24.0) > 1e-9
+        || flyTiming.flySpeedDegPerSec > flyTiming.maxFlySpeedDegPerSec)
+    {
+        std::cerr << "Fly integer-stride timing plan failed\n";
+        return 32;
+    }
+
+    const ct::FlyTimingPlan flyTiming3ms = ct::makeFlyTimingPlan(180.0, 1080, 1.0, 1600.0, 3.0, 12.00375);
+    const ct::FlyTimingPlan flyTiming8ms = ct::makeFlyTimingPlan(180.0, 1080, 1.0, 1600.0, 8.0, 12.00375);
+    if (!flyTiming3ms.valid || flyTiming3ms.rawFrameStride != 2
+        || !flyTiming8ms.valid || flyTiming8ms.rawFrameStride != 4)
+    {
+        std::cerr << "Fly exposure-dependent stride planning failed\n";
+        return 38;
+    }
+
+    const ct::TimeSeriesTimingPlan seriesTiming = ct::makeTimeSeriesTimingPlan(50.0, 12.0);
+    if (!seriesTiming.valid || seriesTiming.rawFrameStride != 5
+        || std::abs(seriesTiming.actualIntervalMs - 60.0) > 1e-9)
+    {
+        std::cerr << "2D integer-stride timing plan failed\n";
+        return 33;
+    }
+
+    const ct::TimeSeriesTimingPlan fullRateSeriesTiming = ct::makeTimeSeriesTimingPlan(5.0, 12.0);
+    if (!fullRateSeriesTiming.valid || fullRateSeriesTiming.rawFrameStride != 1
+        || std::abs(fullRateSeriesTiming.actualIntervalMs - 12.0) > 1e-9)
+    {
+        std::cerr << "2D full-rate timing plan failed\n";
+        return 39;
+    }
+
+    ct::FrameBufferPool framePool;
+    QString poolError;
+    if (!framePool.configure(64, 4, true, &poolError))
+    {
+        std::cerr << "Frame pool configuration failed: " << poolError.toStdString() << "\n";
+        return 34;
+    }
+    std::vector<ct::FrameBufferPool::LeasePtr> leases;
+    for (int i = 0; i < 4; ++i)
+    {
+        auto lease = framePool.tryAcquire();
+        if (!lease || lease->data() == nullptr || lease->size() != 64)
+        {
+            std::cerr << "Frame pool acquisition failed\n";
+            return 35;
+        }
+        lease->data()[0] = static_cast<unsigned char>(i);
+        leases.push_back(std::move(lease));
+    }
+    if (framePool.tryAcquire() || framePool.stats().peakInUse != 4)
+    {
+        std::cerr << "Frame pool exhaustion tracking failed\n";
+        return 36;
+    }
+    leases.pop_back();
+    if (!framePool.tryAcquire())
+    {
+        std::cerr << "Frame pool lease return failed\n";
+        return 37;
+    }
+
     const ct::AppConfig defaults = ct::AppConfig::defaults();
     const ct::AppConfig roundTrip = ct::AppConfig::fromJsonObject(defaults.toJsonObject());
     if (roundTrip.compute.batchSize != defaults.compute.batchSize

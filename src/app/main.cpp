@@ -30,9 +30,8 @@ void writeStartupTrace(const QString& text)
 
 int main(int argc, char* argv[])
 {
-    writeStartupTrace(QStringLiteral("main enter"));
     QApplication app(argc, argv);
-    writeStartupTrace(QStringLiteral("QApplication constructed"));
+    writeStartupTrace(QStringLiteral("main enter; QApplication constructed"));
     qRegisterMetaType<cv::Mat>("cv::Mat");
     writeStartupTrace(QStringLiteral("metatypes registered; constructing MainWindow"));
     auto window = std::make_unique<ct::MainWindow>();
