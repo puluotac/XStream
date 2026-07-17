@@ -92,6 +92,7 @@ private:
     void advanceCtFlyAcquisition();
     void startCtFlyScanMove();
     void startCtFlyScanMotorSweep();
+    void startCtTimeSeriesCapture();
     void startCtMotorSpeedTableSetup();
     void sendNextCtMotorSpeedTableSetup();
     void finishCtMotorSpeedTableSetup();
@@ -144,6 +145,7 @@ private:
     void stopAllMotorAxes();
     void toggleMotorSpeedMode();
     void updateMotorUiEnabled();
+    void updateCtModeUiState();
     void updateCtFlyDerivedParams();
     void updateCtProgressUi();
     int estimateCtTotalFrames() const;
@@ -220,10 +222,17 @@ private:
     CtAcquisitionSettings ctSettings_;
     QVector<CtFlatGroup> ctFlatGroups_;
     QVector<QJsonObject> ctFlyFrames_;
+    QVector<QJsonObject> ctTimeSeriesFrames_;
     bool ctFlyScanRequested_ = false;
     bool ctFlyScanCapturing_ = false;
     bool ctFlyScanMoveDone_ = false;
     bool ctFlyRestartingPreparedAfterScan_ = false;
+    bool ctTimeSeriesCapturing_ = false;
+    bool ctContinuousStartPending_ = false;
+    bool ctContinuousCaptureActive_ = false;
+    QString ctContinuousIntervalStrategy_;
+    QString ctContinuousIntervalFallbackReason_;
+    QString ctPendingFinishErrorMessage_;
     int ctFlyFlatStage_ = 0;
     int ctFlyContinuousFramesReceived_ = 0;
     int ctFlyRawFramePlan_ = 0;
@@ -347,6 +356,7 @@ private:
     QLabel* ctFlyFrameIntervalLabel_ = nullptr;
     QLabel* ctFlyMaxProjectionLabel_ = nullptr;
     QLabel* ctFlyValidationLabel_ = nullptr;
+    QDoubleSpinBox* ctTimeSeriesFrameIntervalSpin_ = nullptr;
     QSpinBox* ctTiffThreadsSpin_ = nullptr;
     QLabel* ctStatusLabel_ = nullptr;
     QLabel* ctTimingLabel_ = nullptr;

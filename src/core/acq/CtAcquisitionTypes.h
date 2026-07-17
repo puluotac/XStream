@@ -16,7 +16,8 @@ namespace ct
 enum class CtAcquisitionMode
 {
     StepAndShoot,
-    FlyScan
+    FlyScan,
+    TimeSeries2D
 };
 
 struct CtAcquisitionSettings
@@ -32,10 +33,12 @@ struct CtAcquisitionSettings
     double flyLeadAngleDeg = 2.0;
     double flyFrameIntervalMs = 0.0;
     double flyScanTimeS = 0.0;
+    double timeSeriesFrameIntervalMs = 50.0;
     bool autoCor = true;
     int padding = 4;
     QString tomoPrefix = QStringLiteral("Tomo_");
     QString flatPrefix = QStringLiteral("Flat_");
+    QString timeSeriesPrefix = QStringLiteral("Frame_");
     QString extension = QStringLiteral("tiff");
     int tiffThreads = 16;
     PvcamCaptureSettings camera;

@@ -74,6 +74,7 @@ signals:
     void preparedCaptureReady(bool ok, const QString& message);
     void preparedFrameBatchFinished(bool ok, const QString& message);
     void continuousCaptureStarted(bool ok, const QString& message);
+    void continuousIntervalStrategyResolved(const QString& strategy, const QString& reason);
 
 private:
     void openCameraIfNeeded();

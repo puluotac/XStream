@@ -1449,6 +1449,10 @@ void PvcamCameraWorker::startContinuousCapture(const PvcamCaptureSettings& rawSe
         const bool allowIntervalDecimation = requireConstantIntervals && settings.allowFrameIntervalDecimation;
         bool useIntervalDecimation = false;
         bool deliveryModeSet = false;
+        QString intervalStrategy = requireConstantIntervals
+            ? QStringLiteral("hardware_constant_interval")
+            : QStringLiteral("camera_internal_continuous");
+        QString intervalFallbackReason;
         const double requestedIntervalMs = requireConstantIntervals ? std::max(exposureMs, settings.frameIntervalMs) : 0.0;
         const int64 targetCycleNs = static_cast<int64>(std::llround(requestedIntervalMs * 1000000.0));
         const int64 exposureNs = static_cast<int64>(std::llround(exposureMs * 1000000.0));
@@ -1514,10 +1518,13 @@ void PvcamCameraWorker::startContinuousCapture(const PvcamCaptureSettings& rawSe
                         throw std::runtime_error(("Failed to set PVCAM pre-trigger delay for frame interval: " + setError).toStdString());
                     }
                     useIntervalDecimation = true;
-                    emit logMessage(QStringLiteral("PVCAM hardware frame interval is unavailable (before setup: %1; after setup: %2); using receive-stream time gating at %3 ms.")
+                    intervalStrategy = QStringLiteral("receive_stream_time_gating");
+                    intervalFallbackReason = QStringLiteral("PVCAM pre-trigger delay is unavailable (before setup: %1; after setup: %2).")
                         .arg(preTriggerDelaySetError)
-                        .arg(setError)
-                        .arg(settings.frameIntervalMs, 0, 'f', 4));
+                        .arg(setError);
+                    emit logMessage(QStringLiteral("Kinetix continuous interval strategy: hardware interval unavailable; using receive-stream time gating, target=%1 ms. Reason: %2")
+                        .arg(settings.frameIntervalMs, 0, 'f', 4)
+                        .arg(intervalFallbackReason));
                 }
             }
             if (preTriggerDelaySet && !getParam(hcam_, PARAM_PRE_TRIGGER_DELAY, ATTR_CURRENT, preTriggerDelayNs))
@@ -1527,8 +1534,11 @@ void PvcamCameraWorker::startContinuousCapture(const PvcamCaptureSettings& rawSe
                     throw std::runtime_error("Failed to read PVCAM pre-trigger delay after setting the frame interval.");
                 }
                 useIntervalDecimation = true;
-                emit logMessage(QStringLiteral("PVCAM pre-trigger delay could not be read after setting; using receive-stream time gating at %1 ms.")
-                    .arg(settings.frameIntervalMs, 0, 'f', 4));
+                intervalStrategy = QStringLiteral("receive_stream_time_gating");
+                intervalFallbackReason = QStringLiteral("PVCAM pre-trigger delay could not be read after setting.");
+                emit logMessage(QStringLiteral("Kinetix continuous interval strategy: hardware interval unavailable; using receive-stream time gating, target=%1 ms. Reason: %2")
+                    .arg(settings.frameIntervalMs, 0, 'f', 4)
+                    .arg(intervalFallbackReason));
             }
             if (preTriggerDelaySet && !useIntervalDecimation)
             {
@@ -1547,9 +1557,13 @@ void PvcamCameraWorker::startContinuousCapture(const PvcamCaptureSettings& rawSe
                             .toStdString());
                     }
                     useIntervalDecimation = true;
-                    emit logMessage(QStringLiteral("PVCAM frame interval verification failed: requested=%1 ms actual=%2 ms; using receive-stream time gating.")
+                    intervalStrategy = QStringLiteral("receive_stream_time_gating");
+                    intervalFallbackReason = QStringLiteral("PVCAM frame interval verification failed: requested=%1 ms, actual-estimate=%2 ms.")
                         .arg(requestedIntervalMs, 0, 'f', 4)
-                        .arg(actualCycleMs, 0, 'f', 4));
+                        .arg(actualCycleMs, 0, 'f', 4);
+                    emit logMessage(QStringLiteral("Kinetix continuous interval strategy: hardware interval unavailable; using receive-stream time gating, target=%1 ms. Reason: %2")
+                        .arg(settings.frameIntervalMs, 0, 'f', 4)
+                        .arg(intervalFallbackReason));
                 }
                 else if (!deliveryModeSet)
                 {
@@ -1606,7 +1620,8 @@ void PvcamCameraWorker::startContinuousCapture(const PvcamCaptureSettings& rawSe
                     + static_cast<double>(std::max<int64>(0, preTriggerDelayNs))
                     + static_cast<double>(std::max<int64>(0, postTriggerDelayNs)))
                 / 1000000.0;
-            emit logMessage(QStringLiteral("Kinetix CT continuous constant intervals: requested=%1 ms, actual-estimate=%2 ms, readout=%3 ms, pre-delay=%4 ms, post-delay=%5 ms, delivery-mode=%6.")
+            intervalStrategy = QStringLiteral("hardware_constant_interval");
+            emit logMessage(QStringLiteral("Kinetix continuous interval strategy: hardware constant interval, requested=%1 ms, actual-estimate=%2 ms, readout=%3 ms, pre-delay=%4 ms, post-delay=%5 ms, delivery-mode=%6.")
                 .arg(settings.frameIntervalMs, 0, 'f', 4)
                 .arg(actualFrameIntervalMs, 0, 'f', 4)
                 .arg(static_cast<double>(readoutTimeUs) / 1000.0, 0, 'f', 4)
@@ -1616,9 +1631,13 @@ void PvcamCameraWorker::startContinuousCapture(const PvcamCaptureSettings& rawSe
         }
         else if (useIntervalDecimation)
         {
-            emit logMessage(QStringLiteral("Kinetix CT continuous interval strategy: camera max-rate internal continuous + receive-stream decimation, target=%1 ms.")
-                .arg(settings.frameIntervalMs, 0, 'f', 4));
+            intervalStrategy = QStringLiteral("receive_stream_time_gating");
+            if (intervalFallbackReason.isEmpty())
+            {
+                intervalFallbackReason = QStringLiteral("PVCAM hardware interval is unavailable.");
+            }
         }
+        emit continuousIntervalStrategyResolved(intervalStrategy, intervalFallbackReason);
 
         if (PV_OK != pl_exp_start_cont(hcam_, ringBuffer.data(), static_cast<uns32>(ringBytes)))
         {
