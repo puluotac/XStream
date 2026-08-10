@@ -435,6 +435,7 @@ QJsonObject pvcamSettingsToJson(const PvcamCaptureSettings& settings)
     obj["FIRST_KEEP_DELAY_MS"] = settings.firstKeepDelayMs;
     obj["ALLOW_FRAME_INTERVAL_DECIMATION"] = settings.allowFrameIntervalDecimation;
     obj["RAW_FRAME_STRIDE"] = settings.rawFrameStride;
+    obj["BASELINE_RAW_FRAME_PERIOD_MS"] = settings.baselineRawFramePeriodMs;
     obj["FRAME_POOL_CAPACITY"] = settings.framePoolCapacity;
     obj["RING_FRAME_COUNT"] = settings.ringFrameCount;
     obj["WAIT_FOR_FRAME_GATE"] = settings.waitForFrameGate;
@@ -953,6 +954,7 @@ MainWindow::MainWindow(QWidget* parent)
     qRegisterMetaType<ct::CtReplayAcquisitionSettings>("ct::CtReplayAcquisitionSettings");
     qRegisterMetaType<ct::PvcamTimingCalibrationSettings>("ct::PvcamTimingCalibrationSettings");
     qRegisterMetaType<ct::PvcamTimingCalibrationResult>("ct::PvcamTimingCalibrationResult");
+    qRegisterMetaType<ct::ContinuousTimingStats>("ct::ContinuousTimingStats");
 
     auto* central = new QWidget(this);
     auto* mainLayout = new QHBoxLayout(central);
@@ -976,9 +978,10 @@ MainWindow::MainWindow(QWidget* parent)
     cameraForm->setVerticalSpacing(4);
     cameraForm->setFieldGrowthPolicy(QFormLayout::AllNonFixedFieldsGrow);
     cameraStateLabel_ = new QLabel(QStringLiteral("Idle"), cameraGroup);
-    cameraExposureSpin_ = makeSpin<QDoubleSpinBox>(cameraGroup, 0.001, 600000.0, 1.0);
+    cameraExposureSpin_ = makeSpin<QDoubleSpinBox>(cameraGroup, 1.0, 600000.0, 1.0);
     cameraExposureSpin_->setValue(10.0);
-    cameraExposureSpin_->setDecimals(3);
+    cameraExposureSpin_->setDecimals(0);
+    cameraExposureSpin_->setButtonSymbols(QAbstractSpinBox::NoButtons);
     cameraExposureUnitCombo_ = makeCombo(cameraGroup);
     cameraExposureUnitCombo_->addItems({ "us", "ms", "s" });
     cameraExposureUnitCombo_->setCurrentText(QStringLiteral("ms"));
@@ -1096,11 +1099,14 @@ MainWindow::MainWindow(QWidget* parent)
     ctTimingExposureValueLabel_ = new QLabel(QStringLiteral("-"), ctTimingPage);
     ctTimingRoiValueLabel_ = new QLabel(QStringLiteral("-"), ctTimingPage);
     ctTimingReadoutValueLabel_ = new QLabel(QStringLiteral("16-bit Dynamic Range"), ctTimingPage);
-    ctTimingSamplesValueLabel_ = new QLabel(QStringLiteral("20 warm-up + 200 measured"), ctTimingPage);
+    ctTimingSamplesValueLabel_ = new QLabel(QStringLiteral("3 warm-up + 10 measured"), ctTimingPage);
     ctTimingPeriodValueLabel_ = new QLabel(QStringLiteral("-"), ctTimingPage);
     ctTimingRateValueLabel_ = new QLabel(QStringLiteral("-"), ctTimingPage);
-    ctTimingJitterValueLabel_ = new QLabel(QStringLiteral("-"), ctTimingPage);
+    ctTimingMaxDeviationValueLabel_ = new QLabel(QStringLiteral("-"), ctTimingPage);
     ctTimingRangeValueLabel_ = new QLabel(QStringLiteral("-"), ctTimingPage);
+    ctTimingDriftValueLabel_ = new QLabel(QStringLiteral("-"), ctTimingPage);
+    ctTimingFitResidualValueLabel_ = new QLabel(QStringLiteral("-"), ctTimingPage);
+    ctTimingExposureRangeValueLabel_ = new QLabel(QStringLiteral("-"), ctTimingPage);
     ctTimingFramesValueLabel_ = new QLabel(QStringLiteral("-"), ctTimingPage);
     ctTimingDroppedValueLabel_ = new QLabel(QStringLiteral("-"), ctTimingPage);
     ctTimingCalibrateButton_ = new QPushButton(QStringLiteral("Calibrate Timing"), ctTimingPage);
@@ -1110,10 +1116,13 @@ MainWindow::MainWindow(QWidget* parent)
     ctTimingForm->addRow(QStringLiteral("ROI"), ctTimingRoiValueLabel_);
     ctTimingForm->addRow(QStringLiteral("Readout"), ctTimingReadoutValueLabel_);
     ctTimingForm->addRow(QStringLiteral("Samples"), ctTimingSamplesValueLabel_);
-    ctTimingForm->addRow(QStringLiteral("Raw Frame Period"), ctTimingPeriodValueLabel_);
+    ctTimingForm->addRow(QStringLiteral("Fitted Frame Period"), ctTimingPeriodValueLabel_);
     ctTimingForm->addRow(QStringLiteral("Raw Frame Rate"), ctTimingRateValueLabel_);
-    ctTimingForm->addRow(QStringLiteral("Period Jitter p95"), ctTimingJitterValueLabel_);
+    ctTimingForm->addRow(QStringLiteral("Max Period Deviation"), ctTimingMaxDeviationValueLabel_);
     ctTimingForm->addRow(QStringLiteral("Observed Range"), ctTimingRangeValueLabel_);
+    ctTimingForm->addRow(QStringLiteral("Mean Drift"), ctTimingDriftValueLabel_);
+    ctTimingForm->addRow(QStringLiteral("Max Fit Residual"), ctTimingFitResidualValueLabel_);
+    ctTimingForm->addRow(QStringLiteral("Exposure Range"), ctTimingExposureRangeValueLabel_);
     ctTimingForm->addRow(QStringLiteral("Device Frames"), ctTimingFramesValueLabel_);
     ctTimingForm->addRow(QStringLiteral("Dropped Frames"), ctTimingDroppedValueLabel_);
     ctTimingForm->addRow(ctTimingCalibrateButton_);
@@ -1191,6 +1200,8 @@ MainWindow::MainWindow(QWidget* parent)
     ctProgressBar_->setMaximumHeight(18);
     ctWriterLabel_ = new QLabel(QStringLiteral("24 threads, 0.0 MiB/s, saved 0"), ctGroup);
     ctBufferLabel_ = new QLabel(QStringLiteral("0 / 1024 frames, 0.0 / 20.0 GiB"), ctGroup);
+    ctFrameTimingLabel_ = new QLabel(QStringLiteral("-"), ctGroup);
+    ctFrameTimingLabel_->setWordWrap(true);
     ctStartButton_ = new QPushButton(QStringLiteral("Start CT"), ctGroup);
     ctStopButton_ = new QPushButton(QStringLiteral("Stop CT"), ctGroup);
     ctStopButton_->setEnabled(false);
@@ -1222,6 +1233,7 @@ MainWindow::MainWindow(QWidget* parent)
     ctForm->addRow(QStringLiteral("CT Progress"), ctProgressBar_);
     ctForm->addRow(QStringLiteral("Writer"), ctWriterLabel_);
     ctForm->addRow(QStringLiteral("Buffer"), ctBufferLabel_);
+    ctForm->addRow(QStringLiteral("Frame Timing"), ctFrameTimingLabel_);
     ctForm->addRow(ctButtonWidget);
     hardwareLayout->addWidget(ctGroup);
 
@@ -1677,9 +1689,15 @@ MainWindow::MainWindow(QWidget* parent)
     connect(ctStopButton_, &QPushButton::clicked, this, &MainWindow::stopCtAcquisition);
     connect(ctTimingCalibrateButton_, &QPushButton::clicked, this, &MainWindow::startTimingCalibration);
     connect(ctModeTabs_, &QTabWidget::currentChanged, this, [this](int) {
+        if (!ctRunning_)
+        {
+            ctContinuousTimingStats_ = {};
+            ctContinuousTimingDriftLevel_ = 0;
+        }
         updateCtModeUiState();
         updateCtFlyDerivedParams();
         updateCtTimeSeriesDerivedParams();
+        updateContinuousTimingUi();
     });
     connect(cameraExposureSpin_, qOverload<double>(&QDoubleSpinBox::valueChanged), this, [this](double) {
         invalidateTimingCalibration(QStringLiteral("Exposure changed."));
@@ -2116,8 +2134,8 @@ PvcamTimingCalibrationSettings MainWindow::timingCalibrationSettingsFromUi() con
     settings.roiY = cameraRoiYSpin_ ? cameraRoiYSpin_->value() : 0;
     settings.roiWidth = cameraRoiWidthSpin_ ? cameraRoiWidthSpin_->value() : 3200;
     settings.roiHeight = cameraRoiHeightSpin_ ? cameraRoiHeightSpin_->value() : 3200;
-    settings.warmupFrames = 20;
-    settings.sampleFrames = 200;
+    settings.warmupFrames = 3;
+    settings.sampleFrames = 10;
     settings.ringFrameCount = 64;
     return settings;
 }
@@ -2255,10 +2273,12 @@ void MainWindow::handleTimingCalibrationResult(const PvcamTimingCalibrationResul
 
     if (ctTimingStatusValueLabel_)
     {
-        ctTimingStatusValueLabel_->setText(timingCalibrationValid_ ? QStringLiteral("Ready") : QStringLiteral("Failed"));
-        ctTimingStatusValueLabel_->setStyleSheet(timingCalibrationValid_
-            ? QStringLiteral("color:#1b7f3a;")
-            : QStringLiteral("color:#b00020;"));
+        ctTimingStatusValueLabel_->setText(timingCalibrationValid_
+            ? (result.analysis.stable ? QStringLiteral("Ready") : QStringLiteral("Ready (warning)"))
+            : QStringLiteral("Failed"));
+        ctTimingStatusValueLabel_->setStyleSheet(!timingCalibrationValid_
+            ? QStringLiteral("color:#b00020;")
+            : (result.analysis.stable ? QStringLiteral("color:#1b7f3a;") : QStringLiteral("color:#9a6700;")));
     }
     if (ctTimingSourceValueLabel_)
     {
@@ -2288,7 +2308,7 @@ void MainWindow::handleTimingCalibrationResult(const PvcamTimingCalibrationResul
     if (ctTimingPeriodValueLabel_)
     {
         ctTimingPeriodValueLabel_->setText(result.analysis.valid
-            ? QStringLiteral("%1 ms").arg(result.analysis.medianPeriodMs, 0, 'f', 6)
+            ? QStringLiteral("%1 ms").arg(result.analysis.fittedPeriodMs, 0, 'f', 6)
             : QStringLiteral("-"));
     }
     if (ctTimingRateValueLabel_)
@@ -2297,11 +2317,33 @@ void MainWindow::handleTimingCalibrationResult(const PvcamTimingCalibrationResul
             ? QStringLiteral("%1 fps").arg(result.analysis.rawFrameRateFps, 0, 'f', 3)
             : QStringLiteral("-"));
     }
-    if (ctTimingJitterValueLabel_)
+    if (ctTimingMaxDeviationValueLabel_)
     {
-        ctTimingJitterValueLabel_->setText(result.analysis.valid
-            ? QStringLiteral("%1 ms").arg(result.analysis.p95DeviationMs, 0, 'f', 6)
+        ctTimingMaxDeviationValueLabel_->setText(result.analysis.valid
+            ? QStringLiteral("%1 ms").arg(result.analysis.maxPeriodDeviationMs, 0, 'f', 6)
             : QStringLiteral("-"));
+    }
+    if (ctTimingDriftValueLabel_)
+    {
+        ctTimingDriftValueLabel_->setText(result.analysis.valid
+            ? QStringLiteral("%1 ms (%2%)")
+                .arg(result.analysis.meanDriftMs, 0, 'f', 6)
+                .arg(result.analysis.meanDriftPercent, 0, 'f', 4)
+            : QStringLiteral("-"));
+    }
+    if (ctTimingFitResidualValueLabel_)
+    {
+        ctTimingFitResidualValueLabel_->setText(result.analysis.valid
+            ? QStringLiteral("%1 ms").arg(result.analysis.maxFitResidualMs, 0, 'f', 6)
+            : QStringLiteral("-"));
+    }
+    if (ctTimingExposureRangeValueLabel_)
+    {
+        ctTimingExposureRangeValueLabel_->setText(result.analysis.exposureTimingAvailable
+            ? QStringLiteral("%1 - %2 ms")
+                .arg(result.analysis.minExposureMs, 0, 'f', 6)
+                .arg(result.analysis.maxExposureMs, 0, 'f', 6)
+            : QStringLiteral("Unavailable"));
     }
     if (ctTimingRangeValueLabel_)
     {
@@ -2451,7 +2493,7 @@ void MainWindow::updateCtFlyDerivedParams()
     else
     {
         plan = makeFlyTimingPlan(totalAngleDeg, projectionCount, allowedBlurPx, radiusPx,
-            exposureMs, timingCalibrationResult_.analysis.medianPeriodMs);
+            exposureMs, timingCalibrationResult_.analysis.fittedPeriodMs);
         if (!plan.valid)
         {
             problems.append(plan.error);
@@ -2517,7 +2559,7 @@ void MainWindow::updateCtFlyDerivedParams()
         if (problems.isEmpty() && plan.valid)
         {
             ctFlyValidationLabel_->setText(QStringLiteral("OK: raw %1 ms, stride %2, blur %3 px, first keep delay %4 s.")
-                .arg(timingCalibrationResult_.analysis.medianPeriodMs, 0, 'f', 6)
+                .arg(timingCalibrationResult_.analysis.fittedPeriodMs, 0, 'f', 6)
                 .arg(plan.rawFrameStride)
                 .arg(estimatedBlurPx, 0, 'f', 3)
                 .arg(firstKeepDelayS, 0, 'f', 3));
@@ -2542,7 +2584,7 @@ void MainWindow::updateCtTimeSeriesDerivedParams()
     if (timingReady)
     {
         plan = makeTimeSeriesTimingPlan(ctTimeSeriesFrameIntervalSpin_->value(),
-            timingCalibrationResult_.analysis.medianPeriodMs);
+            timingCalibrationResult_.analysis.fittedPeriodMs);
     }
     ctTimeSeriesRawFrameStride_ = plan.valid ? plan.rawFrameStride : 1;
     ctTimeSeriesActualIntervalMs_ = plan.valid ? plan.actualIntervalMs : 0.0;
@@ -2598,6 +2640,72 @@ void MainWindow::updateCtTimeSeriesDerivedParams()
         ctTimeSeriesValidationLabel_->setStyleSheet(plan.valid
             ? QStringLiteral("color:#1b7f3a;")
             : QStringLiteral("color:#b00020;"));
+    }
+}
+
+void MainWindow::updateContinuousTimingUi()
+{
+    if (!ctFrameTimingLabel_)
+    {
+        return;
+    }
+    const int selectedMode = ctModeTabs_ ? ctModeTabs_->currentIndex() : kCtTabStep;
+    const bool continuousMode = ctRunning_
+        ? (ctSettings_.mode == CtAcquisitionMode::FlyScan
+            || ctSettings_.mode == CtAcquisitionMode::TimeSeries2D)
+        : (selectedMode == kCtTabFly || selectedMode == kCtTabTimeSeries);
+    if (!continuousMode)
+    {
+        ctFrameTimingLabel_->setText(QStringLiteral("-"));
+        ctFrameTimingLabel_->setStyleSheet(QString());
+        return;
+    }
+
+    const ContinuousTimingStats& stats = ctContinuousTimingStats_;
+    if (!stats.valid && !stats.frameLossDetected && !stats.invalidTimestampDetected)
+    {
+        ctFrameTimingLabel_->setText(QStringLiteral("Waiting for hardware timestamps..."));
+        ctFrameTimingLabel_->setStyleSheet(QStringLiteral("color:#555555;"));
+        return;
+    }
+
+    const double calibratedFps = stats.baselinePeriodMs > 0.0
+        ? 1000.0 / stats.baselinePeriodMs
+        : 0.0;
+    const double maxAngleErrorDeg = ctSettings_.mode == CtAcquisitionMode::FlyScan
+        ? ctSettings_.flySpeedDegPerSec * stats.maxAbsPhaseErrorMs / 1000.0
+        : 0.0;
+    QString secondLine = QStringLiteral("Max interval %1 ms | Phase %2 / max %3 ms | Duplicates %4 | Drops %5")
+        .arg(stats.maxIntervalDeviationMs, 0, 'f', 4)
+        .arg(stats.currentPhaseErrorMs, 0, 'f', 4)
+        .arg(stats.maxAbsPhaseErrorMs, 0, 'f', 4)
+        .arg(stats.duplicateNotifications)
+        .arg(stats.deviceDroppedFrames);
+    if (ctSettings_.mode == CtAcquisitionMode::FlyScan)
+    {
+        secondLine += QStringLiteral(" | Max angle %1 deg").arg(maxAngleErrorDeg, 0, 'f', 6);
+    }
+    ctFrameTimingLabel_->setText(QStringLiteral("Cal %1 fps | Run %2 fps | Drift %3%\n%4")
+        .arg(calibratedFps, 0, 'f', 3)
+        .arg(stats.rollingFrameRateFps, 0, 'f', 3)
+        .arg(stats.rollingDriftPercent, 0, 'f', 3)
+        .arg(secondLine));
+
+    if (stats.frameLossDetected || stats.invalidTimestampDetected || stats.keptStrideViolationDetected)
+    {
+        ctFrameTimingLabel_->setStyleSheet(QStringLiteral("color:#b00020; font-weight:600;"));
+    }
+    else if (std::abs(stats.rollingDriftPercent) > 1.0)
+    {
+        ctFrameTimingLabel_->setStyleSheet(QStringLiteral("color:#b00020;"));
+    }
+    else if (std::abs(stats.rollingDriftPercent) > 0.2)
+    {
+        ctFrameTimingLabel_->setStyleSheet(QStringLiteral("color:#9a6700;"));
+    }
+    else
+    {
+        ctFrameTimingLabel_->setStyleSheet(QStringLiteral("color:#1b7f3a;"));
     }
 }
 
@@ -2869,6 +2977,43 @@ void MainWindow::startCameraWorker()
                     .arg(capacityGiB, 0, 'f', 1));
             }
         });
+    connect(cameraWorker_, &PvcamCameraWorker::continuousTimingStatsChanged, this,
+        [this](const ContinuousTimingStats& stats) {
+            if (!ctRunning_ || (ctSettings_.mode != CtAcquisitionMode::FlyScan
+                && ctSettings_.mode != CtAcquisitionMode::TimeSeries2D))
+            {
+                return;
+            }
+            ctContinuousTimingStats_ = stats;
+            ctContinuousDeviceDroppedFrames_ = stats.deviceDroppedFrames;
+            if (stats.valid)
+            {
+                const double absDrift = std::abs(stats.rollingDriftPercent);
+                const int driftLevel = absDrift > 1.0 ? 2 : (absDrift > 0.2 ? 1 : 0);
+                if (driftLevel != ctContinuousTimingDriftLevel_)
+                {
+                    if (driftLevel > 0)
+                    {
+                        appendLog(QStringLiteral("Continuous timing warning: rolling drift=%1%, rolling=%2 ms, baseline=%3 ms.")
+                            .arg(stats.rollingDriftPercent, 0, 'f', 4)
+                            .arg(stats.rollingPeriodMs, 0, 'f', 6)
+                            .arg(stats.baselinePeriodMs, 0, 'f', 6));
+                    }
+                    else if (ctContinuousTimingDriftLevel_ > 0)
+                    {
+                        appendLog(QStringLiteral("Continuous timing recovered: rolling drift=%1%.")
+                            .arg(stats.rollingDriftPercent, 0, 'f', 4));
+                    }
+                    ctContinuousTimingDriftLevel_ = driftLevel;
+                }
+            }
+            updateContinuousTimingUi();
+            if (stats.frameLossDetected && ctStatusLabel_)
+            {
+                ctStatusLabel_->setText(QStringLiteral("Failed: device frame lost"));
+                ctStatusLabel_->setStyleSheet(QStringLiteral("color:#b00020; font-weight:600;"));
+            }
+        });
     connect(cameraWorker_, &PvcamCameraWorker::continuousIntervalStrategyResolved, this, [this](const QString& strategy, const QString& reason) {
         if (!ctRunning_)
         {
@@ -2938,7 +3083,16 @@ void MainWindow::startCameraWorker()
                     .arg(ok ? QStringLiteral("ok") : QStringLiteral("failed"), message));
                 if (!ok)
                 {
-                    finishCtAcquisition(false, QStringLiteral("Kinetix fly scan failed: %1").arg(message));
+                    ctPendingFinishErrorMessage_ = QStringLiteral("Kinetix fly scan failed: %1").arg(message);
+                    if (!ctStopRequested_ && kohzuController_)
+                    {
+                        QMetaObject::invokeMethod(kohzuController_, "stopAllAxes", Qt::QueuedConnection);
+                    }
+                    if (ctWriter_ && ctWriterFinishRequestedMs_ <= 0)
+                    {
+                        ctWriterFinishRequestedMs_ = QDateTime::currentMSecsSinceEpoch();
+                        QMetaObject::invokeMethod(ctWriter_, "finish", Qt::QueuedConnection);
+                    }
                     return;
                 }
                 ctFlyRestartingPreparedAfterScan_ = true;
@@ -3673,7 +3827,7 @@ void MainWindow::startCtAcquisition()
     ctSettings_.timeSeriesFrameIntervalMs = ctTimeSeriesActualIntervalMs_;
     if (requestedFlyMode || requestedTimeSeriesMode)
     {
-        ctSettings_.rawFramePeriodMs = timingCalibrationResult_.analysis.medianPeriodMs;
+        ctSettings_.rawFramePeriodMs = timingCalibrationResult_.analysis.fittedPeriodMs;
         ctSettings_.rawFrameRateFps = timingCalibrationResult_.analysis.rawFrameRateFps;
         ctSettings_.rawFrameStride = requestedFlyMode ? ctFlyRawFrameStride_ : ctTimeSeriesRawFrameStride_;
         ctSettings_.timingSource = timingCalibrationResult_.timingSource;
@@ -3705,6 +3859,7 @@ void MainWindow::startCtAcquisition()
     ctSettings_.camera.queueCapacity = 1;
     ctSettings_.camera.framePoolCapacity = kCtFramePoolCapacity;
     ctSettings_.camera.ringFrameCount = 192;
+    ctSettings_.camera.baselineRawFramePeriodMs = ctSettings_.rawFramePeriodMs;
     ctSettings_.camera.saveRaw = false;
     ctSettings_.camera.previewOnly = false;
     ctSettings_.camera.enqueueFrames = false;
@@ -3837,6 +3992,8 @@ void MainWindow::startCtAcquisition()
     ctContinuousCaptureActive_ = false;
     ctContinuousIntervalStrategy_.clear();
     ctContinuousIntervalFallbackReason_.clear();
+    ctContinuousTimingStats_ = {};
+    ctContinuousTimingDriftLevel_ = 0;
     ctPendingFinishErrorMessage_.clear();
     ctFlyFlatStage_ = 0;
     ctFlyContinuousFramesReceived_ = 0;
@@ -3882,6 +4039,8 @@ void MainWindow::startCtAcquisition()
     ctStartButton_->setEnabled(false);
     ctStopButton_->setEnabled(true);
     ctStatusLabel_->setText(QStringLiteral("Running"));
+    ctStatusLabel_->setStyleSheet(QString());
+    updateContinuousTimingUi();
     if (ctProgressTimer_)
     {
         ctProgressTimer_->start();
@@ -5308,7 +5467,20 @@ void MainWindow::finishCtAcquisition(bool ok, const QString& message)
         QMetaObject::invokeMethod(kohzuController_, "setIdlePollingEnabled", Qt::QueuedConnection,
             Q_ARG(bool, true));
     }
-    ctStatusLabel_->setText(ok ? QStringLiteral("Completed") : QStringLiteral("Failed"));
+    if (!ok && ctContinuousTimingStats_.frameLossDetected)
+    {
+        ctStatusLabel_->setText(QStringLiteral("Failed: device frame lost"));
+        ctStatusLabel_->setStyleSheet(QStringLiteral("color:#b00020; font-weight:600;"));
+        appendLog(QStringLiteral("FATAL device frame loss: previous=%1, current=%2, missing=%3. Acquisition stopped.")
+            .arg(ctContinuousTimingStats_.previousDeviceFrame)
+            .arg(ctContinuousTimingStats_.currentDeviceFrame)
+            .arg(ctContinuousTimingStats_.missingDeviceFrames));
+    }
+    else
+    {
+        ctStatusLabel_->setText(ok ? QStringLiteral("Completed") : QStringLiteral("Failed"));
+        ctStatusLabel_->setStyleSheet(ok ? QStringLiteral("color:#1b7f3a;") : QStringLiteral("color:#b00020;"));
+    }
     if (ctProgressTimer_)
     {
         ctProgressTimer_->stop();
@@ -5402,9 +5574,24 @@ void MainWindow::writeCtManifest(bool completed, const QString& errorMessage)
     }
     QJsonObject root;
     root["TYPE"] = "CT_STREAM_SCAN_MANIFEST";
-    root["VERSION"] = 2;
+    root["VERSION"] = 3;
     root["COMPLETED"] = completed;
     root["ERROR"] = errorMessage;
+    QString failureCode;
+    if (!completed && ctContinuousTimingStats_.frameLossDetected)
+    {
+        failureCode = QStringLiteral("DeviceFrameLoss");
+    }
+    else if (!completed && ctStopRequested_)
+    {
+        failureCode = QStringLiteral("UserStopped");
+    }
+    else if (!completed && !errorMessage.isEmpty()
+        && errorMessage != QStringLiteral("CT acquisition running."))
+    {
+        failureCode = QStringLiteral("AcquisitionFailed");
+    }
+    root["FAILURE_CODE"] = failureCode;
     root["CREATED_AT"] = QDateTime::currentDateTime().toString(Qt::ISODate);
 
     QJsonObject acq;
@@ -5474,10 +5661,21 @@ void MainWindow::writeCtManifest(bool completed, const QString& errorMessage)
         calibration["DROPPED_FRAMES"] = static_cast<double>(timingCalibrationResult_.analysis.droppedFrames);
         calibration["MEAN_PERIOD_MS"] = timingCalibrationResult_.analysis.meanPeriodMs;
         calibration["MEDIAN_PERIOD_MS"] = timingCalibrationResult_.analysis.medianPeriodMs;
+        calibration["FITTED_PERIOD_MS"] = timingCalibrationResult_.analysis.fittedPeriodMs;
         calibration["MIN_PERIOD_MS"] = timingCalibrationResult_.analysis.minPeriodMs;
         calibration["MAX_PERIOD_MS"] = timingCalibrationResult_.analysis.maxPeriodMs;
         calibration["STDDEV_MS"] = timingCalibrationResult_.analysis.standardDeviationMs;
-        calibration["P95_DEVIATION_MS"] = timingCalibrationResult_.analysis.p95DeviationMs;
+        calibration["MAX_PERIOD_DEVIATION_MS"] = timingCalibrationResult_.analysis.maxPeriodDeviationMs;
+        calibration["FIRST_HALF_MEAN_PERIOD_MS"] = timingCalibrationResult_.analysis.firstHalfMeanPeriodMs;
+        calibration["SECOND_HALF_MEAN_PERIOD_MS"] = timingCalibrationResult_.analysis.secondHalfMeanPeriodMs;
+        calibration["MEAN_DRIFT_MS"] = timingCalibrationResult_.analysis.meanDriftMs;
+        calibration["MEAN_DRIFT_PERCENT"] = timingCalibrationResult_.analysis.meanDriftPercent;
+        calibration["MAX_FIT_RESIDUAL_MS"] = timingCalibrationResult_.analysis.maxFitResidualMs;
+        calibration["EXPOSURE_TIMING_AVAILABLE"] = timingCalibrationResult_.analysis.exposureTimingAvailable;
+        calibration["MEAN_EXPOSURE_MS"] = timingCalibrationResult_.analysis.meanExposureMs;
+        calibration["MIN_EXPOSURE_MS"] = timingCalibrationResult_.analysis.minExposureMs;
+        calibration["MAX_EXPOSURE_MS"] = timingCalibrationResult_.analysis.maxExposureMs;
+        calibration["MAX_EXPOSURE_DEVIATION_MS"] = timingCalibrationResult_.analysis.maxExposureDeviationMs;
         calibration["RAW_FRAME_RATE_FPS"] = timingCalibrationResult_.analysis.rawFrameRateFps;
         root["TIMING_CALIBRATION"] = calibration;
     }
@@ -5559,6 +5757,31 @@ void MainWindow::writeCtManifest(bool completed, const QString& errorMessage)
     timing["CONTINUOUS_RAW_FRAMES"] = static_cast<double>(ctContinuousRawFrames_);
     timing["CONTINUOUS_DISCARDED_FRAMES"] = static_cast<double>(ctContinuousDiscardedFrames_);
     timing["CONTINUOUS_DEVICE_DROPPED_FRAMES"] = static_cast<double>(ctContinuousDeviceDroppedFrames_);
+    timing["CONTINUOUS_DUPLICATE_NOTIFICATIONS"] = static_cast<double>(ctContinuousTimingStats_.duplicateNotifications);
+    timing["RAW_BASELINE_PERIOD_MS"] = ctContinuousTimingStats_.baselinePeriodMs;
+    timing["RAW_OVERALL_PERIOD_MS"] = ctContinuousTimingStats_.overallPeriodMs;
+    timing["RAW_OVERALL_FRAME_RATE_FPS"] = ctContinuousTimingStats_.overallFrameRateFps;
+    timing["RAW_ROLLING_PERIOD_FINAL_MS"] = ctContinuousTimingStats_.rollingPeriodMs;
+    timing["RAW_ROLLING_FRAME_RATE_FINAL_FPS"] = ctContinuousTimingStats_.rollingFrameRateFps;
+    timing["RAW_ROLLING_DRIFT_FINAL_PERCENT"] = ctContinuousTimingStats_.rollingDriftPercent;
+    timing["RAW_MIN_INTERVAL_MS"] = ctContinuousTimingStats_.minIntervalMs;
+    timing["RAW_MAX_INTERVAL_MS"] = ctContinuousTimingStats_.maxIntervalMs;
+    timing["RAW_MAX_INTERVAL_DEVIATION_MS"] = ctContinuousTimingStats_.maxIntervalDeviationMs;
+    timing["RAW_FINAL_PHASE_ERROR_MS"] = ctContinuousTimingStats_.currentPhaseErrorMs;
+    timing["RAW_MAX_ABS_PHASE_ERROR_MS"] = ctContinuousTimingStats_.maxAbsPhaseErrorMs;
+    timing["RAW_FITTED_PERIOD_MS"] = ctContinuousTimingStats_.fittedPeriodMs;
+    timing["RAW_FIRST_HALF_MEAN_PERIOD_MS"] = ctContinuousTimingStats_.firstHalfMeanPeriodMs;
+    timing["RAW_SECOND_HALF_MEAN_PERIOD_MS"] = ctContinuousTimingStats_.secondHalfMeanPeriodMs;
+    timing["RAW_MEAN_DRIFT_MS"] = ctContinuousTimingStats_.meanDriftMs;
+    timing["RAW_MEAN_DRIFT_PERCENT"] = ctContinuousTimingStats_.meanDriftPercent;
+    timing["RAW_MAX_FIT_RESIDUAL_MS"] = ctContinuousTimingStats_.maxFitResidualMs;
+    timing["DEVICE_FRAME_LOSS_DETECTED"] = ctContinuousTimingStats_.frameLossDetected;
+    timing["DEVICE_FRAME_LOSS_PREVIOUS"] = static_cast<double>(ctContinuousTimingStats_.previousDeviceFrame);
+    timing["DEVICE_FRAME_LOSS_CURRENT"] = static_cast<double>(ctContinuousTimingStats_.currentDeviceFrame);
+    timing["DEVICE_FRAME_LOSS_MISSING"] = static_cast<double>(ctContinuousTimingStats_.missingDeviceFrames);
+    timing["FLY_MAX_ANGLE_TIMING_ERROR_DEG"] = ctSettings_.mode == CtAcquisitionMode::FlyScan
+        ? ctSettings_.flySpeedDegPerSec * ctContinuousTimingStats_.maxAbsPhaseErrorMs / 1000.0
+        : 0.0;
     timing["FRAME_POOL_CAPACITY"] = kCtFramePoolCapacity;
     timing["FRAME_POOL_PEAK"] = ctFramePoolPeak_;
     if (ctSettings_.mode == CtAcquisitionMode::FlyScan)

@@ -33,6 +33,9 @@ int main()
     const ct::TimingAnalysis timing = ct::analyzeTimingSamples(timingSamples);
     if (!timing.valid || !timing.stable || timing.droppedFrames != 0
         || std::abs(timing.medianPeriodMs - 12.0) > 1e-9
+        || std::abs(timing.fittedPeriodMs - 12.0) > 1e-9
+        || timing.maxPeriodDeviationMs > 1e-9
+        || timing.maxFitResidualMs > 1e-9
         || std::abs(timing.rawFrameRateFps - (1000.0 / 12.0)) > 1e-9)
     {
         std::cerr << "Continuous timing analysis failed\n";
@@ -49,6 +52,118 @@ int main()
     {
         std::cerr << "Timing frame-gap detection failed\n";
         return 31;
+    }
+
+    QVector<ct::TimingSample> exposureTimingSamples;
+    for (int i = 0; i < 10; ++i)
+    {
+        exposureTimingSamples.append({ 2000 + i, static_cast<qint64>(i) * 12000000LL, 10000000LL });
+    }
+    const ct::TimingAnalysis exposureTiming = ct::analyzeTimingSamples(exposureTimingSamples);
+    if (!exposureTiming.valid || !exposureTiming.exposureTimingAvailable
+        || std::abs(exposureTiming.meanExposureMs - 10.0) > 1e-9
+        || exposureTiming.maxExposureDeviationMs > 1e-9)
+    {
+        std::cerr << "Exposure timing analysis failed\n";
+        return 40;
+    }
+
+    ct::ContinuousTimingTracker fixedTracker;
+    fixedTracker.reset(12.0, 2, 4);
+    for (int i = 0; i < 10; ++i)
+    {
+        const qint64 frameNumber = i + 1;
+        if (fixedTracker.observeRaw(frameNumber, static_cast<qint64>(i) * 12000000LL + 1)
+            != ct::ContinuousTimingObservation::Accepted)
+        {
+            std::cerr << "Fixed timing tracker rejected a valid raw frame\n";
+            return 41;
+        }
+        if (i % 2 == 0
+            && fixedTracker.markKept(frameNumber, static_cast<qint64>(i) * 12000000LL + 1)
+                != ct::ContinuousTimingObservation::Accepted)
+        {
+            std::cerr << "Fixed timing tracker rejected a valid kept frame\n";
+            return 42;
+        }
+    }
+    const ct::ContinuousTimingStats fixedStats = fixedTracker.snapshot(true);
+    if (!fixedStats.valid || fixedStats.rawFrames != 10 || fixedStats.keptFrames != 5
+        || std::abs(fixedStats.rollingPeriodMs - 12.0) > 1e-9
+        || fixedStats.maxIntervalDeviationMs > 1e-9
+        || fixedStats.maxAbsPhaseErrorMs > 1e-9)
+    {
+        std::cerr << "Fixed continuous timing statistics failed\n";
+        return 43;
+    }
+
+    ct::ContinuousTimingTracker recoveredTracker;
+    recoveredTracker.reset(12.0, 1, 16);
+    const QVector<qint64> recoveredTimestampsNs {
+        1LL, 12000001LL, 25000001LL, 36000001LL, 48000001LL, 60000001LL
+    };
+    for (int i = 0; i < recoveredTimestampsNs.size(); ++i)
+    {
+        const qint64 frameNumber = i + 1;
+        if (recoveredTracker.observeRaw(frameNumber, recoveredTimestampsNs[i])
+                != ct::ContinuousTimingObservation::Accepted
+            || recoveredTracker.markKept(frameNumber, recoveredTimestampsNs[i])
+                != ct::ContinuousTimingObservation::Accepted)
+        {
+            std::cerr << "Recovered timing tracker rejected a valid frame\n";
+            return 44;
+        }
+    }
+    const ct::ContinuousTimingStats recoveredStats = recoveredTracker.snapshot(true);
+    if (std::abs(recoveredStats.currentPhaseErrorMs) > 1e-9
+        || std::abs(recoveredStats.maxAbsPhaseErrorMs - 1.0) > 1e-9
+        || std::abs(recoveredStats.maxIntervalDeviationMs - 1.0) > 1e-9)
+    {
+        std::cerr << "Local timing recovery statistics failed\n";
+        return 45;
+    }
+
+    ct::ContinuousTimingTracker driftTracker;
+    driftTracker.reset(12.0, 1, 4);
+    for (int i = 0; i < 8; ++i)
+    {
+        const qint64 timestampNs = static_cast<qint64>(i) * 12120000LL + 1;
+        driftTracker.observeRaw(i + 1, timestampNs);
+        driftTracker.markKept(i + 1, timestampNs);
+    }
+    const ct::ContinuousTimingStats driftStats = driftTracker.snapshot(true);
+    if (std::abs(driftStats.rollingDriftPercent - 1.0) > 1e-9
+        || driftStats.currentPhaseErrorMs <= 0.0
+        || driftStats.meanDriftMs > 1e-9)
+    {
+        std::cerr << "Sustained timing drift statistics failed\n";
+        return 46;
+    }
+
+    ct::ContinuousTimingTracker discontinuityTracker;
+    discontinuityTracker.reset(12.0, 1, 4);
+    discontinuityTracker.observeRaw(1, 1);
+    if (discontinuityTracker.observeRaw(1, 1) != ct::ContinuousTimingObservation::Duplicate
+        || discontinuityTracker.observeRaw(3, 24000001LL) != ct::ContinuousTimingObservation::DeviceFrameLoss)
+    {
+        std::cerr << "Continuous timing discontinuity detection failed\n";
+        return 47;
+    }
+    const ct::ContinuousTimingStats discontinuityStats = discontinuityTracker.snapshot(true);
+    if (!discontinuityStats.frameLossDetected || discontinuityStats.missingDeviceFrames != 1
+        || discontinuityStats.deviceDroppedFrames != 1 || discontinuityStats.duplicateNotifications != 1)
+    {
+        std::cerr << "Continuous timing discontinuity details failed\n";
+        return 48;
+    }
+
+    ct::ContinuousTimingTracker reverseTracker;
+    reverseTracker.reset(12.0, 1, 4);
+    reverseTracker.observeRaw(5, 1);
+    if (reverseTracker.observeRaw(4, 12000001LL) != ct::ContinuousTimingObservation::DeviceFrameLoss)
+    {
+        std::cerr << "Reverse device frame detection failed\n";
+        return 49;
     }
 
     const ct::FlyTimingPlan flyTiming = ct::makeFlyTimingPlan(180.0, 1080, 1.0, 1600.0, 5.0, 12.0);

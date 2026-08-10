@@ -153,6 +153,7 @@ private:
     PvcamTimingCalibrationSettings timingCalibrationSettingsFromUi() const;
     void updateCtFlyDerivedParams();
     void updateCtTimeSeriesDerivedParams();
+    void updateContinuousTimingUi();
     void updateCtProgressUi();
     int estimateCtTotalFrames() const;
     double estimateAxisMoveSeconds(const QString& axisName, double distanceUnits) const;
@@ -276,6 +277,8 @@ private:
     qint64 ctContinuousDeviceDroppedFrames_ = 0;
     int ctFramePoolInUse_ = 0;
     int ctFramePoolPeak_ = 0;
+    ContinuousTimingStats ctContinuousTimingStats_;
+    int ctContinuousTimingDriftLevel_ = 0;
     int ctEstimatedTotalFrames_ = 0;
     double ctEstimatedTotalSeconds_ = 0.0;
     double ctFlyDerivedSpeedDegPerSec_ = 1.0;
@@ -378,8 +381,11 @@ private:
     QLabel* ctTimingSamplesValueLabel_ = nullptr;
     QLabel* ctTimingPeriodValueLabel_ = nullptr;
     QLabel* ctTimingRateValueLabel_ = nullptr;
-    QLabel* ctTimingJitterValueLabel_ = nullptr;
+    QLabel* ctTimingMaxDeviationValueLabel_ = nullptr;
     QLabel* ctTimingRangeValueLabel_ = nullptr;
+    QLabel* ctTimingDriftValueLabel_ = nullptr;
+    QLabel* ctTimingFitResidualValueLabel_ = nullptr;
+    QLabel* ctTimingExposureRangeValueLabel_ = nullptr;
     QLabel* ctTimingFramesValueLabel_ = nullptr;
     QLabel* ctTimingDroppedValueLabel_ = nullptr;
     QPushButton* ctTimingCalibrateButton_ = nullptr;
@@ -403,6 +409,7 @@ private:
     QProgressBar* ctProgressBar_ = nullptr;
     QLabel* ctWriterLabel_ = nullptr;
     QLabel* ctBufferLabel_ = nullptr;
+    QLabel* ctFrameTimingLabel_ = nullptr;
     QPushButton* ctStartButton_ = nullptr;
     QPushButton* ctStopButton_ = nullptr;
 

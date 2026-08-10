@@ -48,6 +48,7 @@ struct PvcamCaptureSettings
     double firstKeepDelayMs = 0.0;
     bool allowFrameIntervalDecimation = false;
     int rawFrameStride = 1;
+    double baselineRawFramePeriodMs = 0.0;
     int framePoolCapacity = 1024;
     int ringFrameCount = 192;
     bool waitForFrameGate = false;
@@ -61,8 +62,8 @@ struct PvcamTimingCalibrationSettings
     int roiY = 0;
     int roiWidth = 3200;
     int roiHeight = 3200;
-    int warmupFrames = 20;
-    int sampleFrames = 200;
+    int warmupFrames = 3;
+    int sampleFrames = 10;
     int ringFrameCount = 64;
 };
 
@@ -114,6 +115,7 @@ signals:
     void timingCalibrationFinished(const ct::PvcamTimingCalibrationResult& result);
     void continuousStatsChanged(qint64 rawFrames, qint64 keptFrames, qint64 discardedFrames,
         qint64 deviceDroppedFrames, int poolInUse, int poolPeak);
+    void continuousTimingStatsChanged(const ct::ContinuousTimingStats& stats);
 
 private:
     void openCameraIfNeeded();
@@ -161,3 +163,4 @@ Q_DECLARE_METATYPE(ct::CameraFrame)
 Q_DECLARE_METATYPE(ct::PvcamCaptureSettings)
 Q_DECLARE_METATYPE(ct::PvcamTimingCalibrationSettings)
 Q_DECLARE_METATYPE(ct::PvcamTimingCalibrationResult)
+Q_DECLARE_METATYPE(ct::ContinuousTimingStats)

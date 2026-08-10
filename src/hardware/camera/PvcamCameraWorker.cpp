@@ -775,6 +775,7 @@ PvcamCameraWorker::PvcamCameraWorker(QObject* parent)
     qRegisterMetaType<ct::PvcamCaptureSettings>("ct::PvcamCaptureSettings");
     qRegisterMetaType<ct::PvcamTimingCalibrationSettings>("ct::PvcamTimingCalibrationSettings");
     qRegisterMetaType<ct::PvcamTimingCalibrationResult>("ct::PvcamTimingCalibrationResult");
+    qRegisterMetaType<ct::ContinuousTimingStats>("ct::ContinuousTimingStats");
 }
 
 bool PvcamCameraWorker::ensureFramePool(qsizetype frameBytes, int capacity, QString* errorMessage)
@@ -1611,6 +1612,7 @@ void PvcamCameraWorker::calibrateContinuousTiming(const PvcamTimingCalibrationSe
 
                 qint64 frameNumber = frameInfo->FrameNr;
                 qint64 timestampNs = 0;
+                qint64 exposureTimeNs = 0;
                 bool fallbackToDriverTiming = false;
                 if (metadataTimingUsable)
                 {
@@ -1632,6 +1634,7 @@ void PvcamCameraWorker::calibrateContinuousTiming(const PvcamTimingCalibrationSe
                                 ? headerV3->timestampBOF
                                 : headerV3->timestampEOF;
                             timestampNs = static_cast<qint64>(timestampPs / 1000ULL);
+                            exposureTimeNs = static_cast<qint64>(headerV3->exposureTime / 1000ULL);
                         }
                         else
                         {
@@ -1640,6 +1643,9 @@ void PvcamCameraWorker::calibrateContinuousTiming(const PvcamTimingCalibrationSe
                                 ? header->timestampBOF
                                 : header->timestampEOF;
                             timestampNs = static_cast<qint64>(timestampTicks * static_cast<quint64>(header->timestampResNs));
+                            exposureTimeNs = static_cast<qint64>(
+                                static_cast<quint64>(header->exposureTime)
+                                * static_cast<quint64>(header->exposureTimeResNs));
                         }
                         if (frameNumber <= previousMetadataFrameNumber)
                         {
@@ -1668,6 +1674,7 @@ void PvcamCameraWorker::calibrateContinuousTiming(const PvcamTimingCalibrationSe
                     driverTimestampOffsetNs = 0;
                     previousAcceptedFrameNumber = 0;
                     frameNumber = frameInfo->FrameNr;
+                    exposureTimeNs = 0;
                     emit logMessage(QStringLiteral("Kinetix embedded metadata timing rejected; restarting calibration with FRAME_INFO: %1")
                         .arg(metadataFallbackReason));
                 }
@@ -1709,7 +1716,7 @@ void PvcamCameraWorker::calibrateContinuousTiming(const PvcamTimingCalibrationSe
                 }
                 if (receivedFrames >= settings.warmupFrames)
                 {
-                    samples.append({ frameNumber, timestampNs });
+                    samples.append({ frameNumber, timestampNs, exposureTimeNs });
                 }
                 previousAcceptedFrameNumber = frameNumber;
                 ++receivedFrames;
@@ -1733,12 +1740,18 @@ void PvcamCameraWorker::calibrateContinuousTiming(const PvcamTimingCalibrationSe
         result.timingSource = usedHardwareMetadata
             ? QStringLiteral("embedded_hardware_metadata")
             : QStringLiteral("qualified_driver_timing");
-        result.ok = result.analysis.valid && result.analysis.stable;
+        result.ok = result.analysis.valid;
         result.message = result.ok
-            ? QStringLiteral("Kinetix timing ready: %1 ms, %2 fps, p95 jitter %3 ms, dropped %4.")
-                .arg(result.analysis.medianPeriodMs, 0, 'f', 6)
+            ? QStringLiteral("Kinetix timing ready%1: fitted=%2 ms, %3 fps, max deviation=%4 ms, drift=%5%, "
+                "fit residual=%6 ms, exposure=%7..%8 ms, dropped=%9.")
+                .arg(result.analysis.stable ? QString() : QStringLiteral(" with warning"))
+                .arg(result.analysis.fittedPeriodMs, 0, 'f', 6)
                 .arg(result.analysis.rawFrameRateFps, 0, 'f', 3)
-                .arg(result.analysis.p95DeviationMs, 0, 'f', 6)
+                .arg(result.analysis.maxPeriodDeviationMs, 0, 'f', 6)
+                .arg(result.analysis.meanDriftPercent, 0, 'f', 4)
+                .arg(result.analysis.maxFitResidualMs, 0, 'f', 6)
+                .arg(result.analysis.exposureTimingAvailable ? result.analysis.minExposureMs : 0.0, 0, 'f', 6)
+                .arg(result.analysis.exposureTimingAvailable ? result.analysis.maxExposureMs : 0.0, 0, 'f', 6)
                 .arg(result.analysis.droppedFrames)
             : QStringLiteral("Kinetix timing calibration failed: %1").arg(result.analysis.error);
         capturing_.store(false);
@@ -1787,6 +1800,7 @@ void PvcamCameraWorker::startContinuousCapture(const PvcamCaptureSettings& rawSe
     settings.frameIntervalMs = std::max(0.0, settings.frameIntervalMs);
     settings.firstKeepDelayMs = std::max(0.0, settings.firstKeepDelayMs);
     settings.rawFrameStride = std::clamp(settings.rawFrameStride, 1, 1000000);
+    settings.baselineRawFramePeriodMs = std::max(0.0, settings.baselineRawFramePeriodMs);
     settings.framePoolCapacity = std::clamp(settings.framePoolCapacity, 1, 4096);
     settings.ringFrameCount = std::clamp(settings.ringFrameCount, 4, 256);
 
@@ -1807,7 +1821,11 @@ void PvcamCameraWorker::startContinuousCapture(const PvcamCaptureSettings& rawSe
     return;
 #else
     bool continuousStarted = false;
+    bool metadataEnabled = false;
     FRAME_INFO* frameInfo = nullptr;
+    md_frame* metadataFrame = nullptr;
+    ContinuousTimingTracker timingTracker;
+    timingTracker.reset(settings.baselineRawFramePeriodMs, settings.rawFrameStride, 16);
     try
     {
         QElapsedTimer timer;
@@ -1830,12 +1848,13 @@ void PvcamCameraWorker::startContinuousCapture(const PvcamCaptureSettings& rawSe
             static_cast<uns32>(std::llround(exposureMs * expResolution.unitsPerMillisecond)));
         const int16 expMode = selectInternalExposureMode(hcam_);
 
+        QString metadataError;
         rs_bool metadataAvailable = FALSE;
         if (PV_OK == pl_get_param(hcam_, PARAM_METADATA_ENABLED, ATTR_AVAIL, &metadataAvailable)
             && metadataAvailable == TRUE)
         {
-            rs_bool disabled = FALSE;
-            pl_set_param(hcam_, PARAM_METADATA_ENABLED, &disabled);
+            rs_bool enabled = TRUE;
+            metadataEnabled = setParamIfAvailable(hcam_, PARAM_METADATA_ENABLED, enabled, &metadataError);
         }
 
         uns32 frameBytes = 0;
@@ -1889,6 +1908,11 @@ void PvcamCameraWorker::startContinuousCapture(const PvcamCaptureSettings& rawSe
         {
             throw std::runtime_error(("Failed to allocate PVCAM FRAME_INFO: " + pvcamError()).toStdString());
         }
+        if (metadataEnabled
+            && (PV_OK != pl_md_create_frame_struct_cont(&metadataFrame, 1) || metadataFrame == nullptr))
+        {
+            throw std::runtime_error(("Failed to allocate PVCAM metadata decoder: " + pvcamError()).toStdString());
+        }
 
         emit cameraStateChanged(QStringLiteral("CT Continuous"));
         emit logMessage(QStringLiteral("Kinetix CT continuous ROI x=%1 y=%2 w=%3 h=%4, bitDepth=%5, frameBytes=%6, ring=%7 frames.")
@@ -1908,6 +1932,10 @@ void PvcamCameraWorker::startContinuousCapture(const PvcamCaptureSettings& rawSe
         emit logMessage(QStringLiteral("Kinetix continuous interval strategy: camera internal free-run plus fixed device-frame stride %1; readout estimate=%2 ms.")
             .arg(settings.rawFrameStride)
             .arg(static_cast<double>(readoutTimeUs) / 1000.0, 0, 'f', 4));
+        emit logMessage(metadataEnabled
+            ? QStringLiteral("Kinetix continuous timing source: embedded hardware metadata (FrameNr/BOF).")
+            : QStringLiteral("Kinetix continuous hardware metadata unavailable; using FRAME_INFO driver timing: %1")
+                .arg(metadataError.isEmpty() ? QStringLiteral("PARAM_METADATA_ENABLED unavailable") : metadataError));
         emit continuousIntervalStrategyResolved(QStringLiteral("device_frame_stride"), QString());
 
         if (PV_OK != pl_exp_start_cont(hcam_, ringBuffer.data(), static_cast<uns32>(ringBytes64)))
@@ -1921,12 +1949,11 @@ void PvcamCameraWorker::startContinuousCapture(const PvcamCaptureSettings& rawSe
         qint64 rawCaptured = 0;
         qint64 emitted = 0;
         qint64 discarded = 0;
-        qint64 deviceDropped = 0;
-        qint64 duplicateFramesIgnored = 0;
-        qint64 previousDeviceFrame = 0;
         qint64 firstKeepDeviceFrame = 0;
         qint64 firstKeepTimestampNs = 0;
         qint64 lastRawFrameReceivedNs = timer.nsecsElapsed();
+        qint64 lastTimingStatsEmitMs = -100;
+        qint64 lastRetrievedDeviceFrame = 0;
         const qint64 noFrameTimeoutNs = static_cast<qint64>(
             std::max(10000.0, exposureMs * 3.0 + 5000.0) * 1000000.0);
         while (emitted < settings.frameCount && !stopRequested_.load())
@@ -1953,6 +1980,15 @@ void PvcamCameraWorker::startContinuousCapture(const PvcamCaptureSettings& rawSe
 
             if (status == FRAME_AVAILABLE || status == READOUT_COMPLETE)
             {
+                // FRAME_AVAILABLE remains set after all unread frames are drained. Use the
+                // latest driver frame number as a waterline so get_oldest never revisits a
+                // stale slot after the circular buffer wraps.
+                if (lastRetrievedDeviceFrame > 0
+                    && static_cast<qint64>(frameInfo->FrameNr) <= lastRetrievedDeviceFrame)
+                {
+                    QThread::msleep(1);
+                    continue;
+                }
                 void* framePtr = nullptr;
                 if (PV_OK != pl_exp_get_oldest_frame_ex(hcam_, &framePtr, frameInfo) || framePtr == nullptr)
                 {
@@ -1960,37 +1996,85 @@ void PvcamCameraWorker::startContinuousCapture(const PvcamCaptureSettings& rawSe
                     continue;
                 }
                 lastRawFrameReceivedNs = timer.nsecsElapsed();
-                const qint64 deviceFrame = frameInfo->FrameNr;
-                if (previousDeviceFrame > 0 && deviceFrame == previousDeviceFrame)
+                qint64 deviceFrame = frameInfo->FrameNr;
+                qint64 bofTicks = frameInfo->TimeStampBOF > 0 ? frameInfo->TimeStampBOF : frameInfo->TimeStamp;
+                qint64 bofTimestampNs = bofTicks > 0 ? bofTicks * 100000LL : 0;
+                qint64 eofTimestampNs = frameInfo->TimeStamp > 0 ? frameInfo->TimeStamp * 100000LL : bofTimestampNs;
+                const void* imageData = framePtr;
+                QString frameTimingSource = QStringLiteral("qualified_driver_timing_device_frame_stride");
+                if (metadataEnabled)
                 {
-                    ++duplicateFramesIgnored;
+                    if (PV_OK != pl_md_frame_decode(metadataFrame, framePtr, frameBytes)
+                        || metadataFrame->header == nullptr
+                        || metadataFrame->roiCount != 1
+                        || metadataFrame->roiArray == nullptr
+                        || metadataFrame->roiArray[0].data == nullptr
+                        || metadataFrame->roiArray[0].dataSize < expectedBytes)
+                    {
+                        pl_exp_unlock_oldest_frame(hcam_);
+                        throw std::runtime_error(("EmbeddedMetadataDecodeFailed: " + pvcamError()).toStdString());
+                    }
+                    const md_frame_header* header = metadataFrame->header;
+                    if (header->version >= 3)
+                    {
+                        const auto* headerV3 = reinterpret_cast<const md_frame_header_v3*>(header);
+                        deviceFrame = headerV3->frameNr;
+                        bofTimestampNs = static_cast<qint64>(headerV3->timestampBOF / 1000ULL);
+                        eofTimestampNs = static_cast<qint64>(headerV3->timestampEOF / 1000ULL);
+                    }
+                    else
+                    {
+                        deviceFrame = header->frameNr;
+                        bofTimestampNs = static_cast<qint64>(
+                            static_cast<quint64>(header->timestampBOF) * static_cast<quint64>(header->timestampResNs));
+                        eofTimestampNs = static_cast<qint64>(
+                            static_cast<quint64>(header->timestampEOF) * static_cast<quint64>(header->timestampResNs));
+                    }
+                    imageData = metadataFrame->roiArray[0].data;
+                    frameTimingSource = QStringLiteral("embedded_hardware_metadata_device_frame_stride");
+                }
+                const ContinuousTimingObservation observation = timingTracker.observeRaw(deviceFrame, bofTimestampNs);
+                if (observation == ContinuousTimingObservation::Duplicate)
+                {
+                    const ContinuousTimingStats duplicateStats = timingTracker.snapshot();
+                    lastRetrievedDeviceFrame = deviceFrame;
                     if (PV_OK != pl_exp_unlock_oldest_frame(hcam_))
                     {
                         throw std::runtime_error(pvcamError().toStdString());
                     }
-                    if (duplicateFramesIgnored == 1 || duplicateFramesIgnored % 64 == 0)
+                    if (duplicateStats.duplicateNotifications == 1
+                        || duplicateStats.duplicateNotifications % 64 == 0)
                     {
                         emit logMessage(QStringLiteral("Kinetix repeated FrameNr %1 notification ignored (%2 total).")
                             .arg(deviceFrame)
-                            .arg(duplicateFramesIgnored));
+                            .arg(duplicateStats.duplicateNotifications));
                     }
                     continue;
                 }
-                if (previousDeviceFrame > 0 && deviceFrame != previousDeviceFrame + 1)
+                if (observation == ContinuousTimingObservation::DeviceFrameLoss)
                 {
-                    deviceDropped += std::max<qint64>(0, deviceFrame - previousDeviceFrame - 1);
+                    const ContinuousTimingStats lossStats = timingTracker.snapshot(true);
+                    const FrameBufferPoolStats poolStats = framePool_.stats();
+                    emit continuousTimingStatsChanged(lossStats);
+                    emit continuousStatsChanged(rawCaptured, emitted, discarded, lossStats.deviceDroppedFrames,
+                        poolStats.inUse, poolStats.peakInUse);
+                    emit captureStatsChanged(emitted, poolStats.inUse, rawCaptured, lossStats.deviceDroppedFrames);
                     pl_exp_unlock_oldest_frame(hcam_);
-                    throw std::runtime_error(QStringLiteral("Kinetix device frame discontinuity: previous=%1 current=%2 missing=%3.")
-                        .arg(previousDeviceFrame)
-                        .arg(deviceFrame)
-                        .arg(deviceDropped)
+                    throw std::runtime_error(QStringLiteral("DeviceFrameLoss: previous=%1 current=%2 missing=%3.")
+                        .arg(lossStats.previousDeviceFrame)
+                        .arg(lossStats.currentDeviceFrame)
+                        .arg(lossStats.missingDeviceFrames)
                         .toStdString());
                 }
-                previousDeviceFrame = deviceFrame;
-
-                const qint64 bofTicks = frameInfo->TimeStampBOF > 0 ? frameInfo->TimeStampBOF : frameInfo->TimeStamp;
-                const qint64 bofTimestampNs = bofTicks > 0 ? bofTicks * 100000LL : 0;
-                const qint64 eofTimestampNs = frameInfo->TimeStamp > 0 ? frameInfo->TimeStamp * 100000LL : bofTimestampNs;
+                if (observation == ContinuousTimingObservation::InvalidTimestamp)
+                {
+                    const ContinuousTimingStats invalidStats = timingTracker.snapshot(true);
+                    emit continuousTimingStatsChanged(invalidStats);
+                    pl_exp_unlock_oldest_frame(hcam_);
+                    throw std::runtime_error(QStringLiteral("InvalidFrameTimestamp: device frame %1 has a non-increasing BOF timestamp.")
+                        .arg(deviceFrame)
+                        .toStdString());
+                }
                 bool keepFrame = false;
                 const bool gateArmed = continuousGateArmed_.load(std::memory_order_acquire);
                 if (gateArmed)
@@ -2021,7 +2105,7 @@ void PvcamCameraWorker::startContinuousCapture(const PvcamCaptureSettings& rawSe
                         pl_exp_unlock_oldest_frame(hcam_);
                         throw std::runtime_error("FramePoolExhausted during continuous acquisition.");
                     }
-                    std::memcpy(lease->data(), framePtr, static_cast<size_t>(expectedBytes));
+                    std::memcpy(lease->data(), imageData, static_cast<size_t>(expectedBytes));
                     frame.frameIndex = rawCaptured;
                     frame.logicalIndex = emitted;
                     frame.deviceFrameNumber = deviceFrame;
@@ -2037,13 +2121,29 @@ void PvcamCameraWorker::startContinuousCapture(const PvcamCaptureSettings& rawSe
                     frame.bytesPerPixel = bytesPerPixel;
                     frame.strideBytes = strideBytes;
                     frame.cvType = cvType;
-                    frame.timingSource = QStringLiteral("device_frame_stride");
+                    frame.timingSource = frameTimingSource;
                     frame.bufferLease = lease;
                 }
 
                 if (PV_OK != pl_exp_unlock_oldest_frame(hcam_))
                 {
                     throw std::runtime_error(pvcamError().toStdString());
+                }
+                lastRetrievedDeviceFrame = deviceFrame;
+
+                if (keepFrame)
+                {
+                    const ContinuousTimingObservation keptObservation = timingTracker.markKept(deviceFrame, bofTimestampNs);
+                    if (keptObservation == ContinuousTimingObservation::KeptFrameStrideViolation)
+                    {
+                        const ContinuousTimingStats strideStats = timingTracker.snapshot(true);
+                        emit continuousTimingStatsChanged(strideStats);
+                        throw std::runtime_error(QStringLiteral("KeptFrameStrideViolation: previous=%1 current=%2 expected stride=%3.")
+                            .arg(strideStats.previousDeviceFrame)
+                            .arg(strideStats.currentDeviceFrame)
+                            .arg(settings.rawFrameStride)
+                            .toStdString());
+                    }
                 }
 
                 ++rawCaptured;
@@ -2057,12 +2157,18 @@ void PvcamCameraWorker::startContinuousCapture(const PvcamCaptureSettings& rawSe
                     ++discarded;
                 }
                 const FrameBufferPoolStats poolStats = framePool_.stats();
+                const ContinuousTimingStats liveTimingStats = timingTracker.snapshot();
+                if (timer.elapsed() - lastTimingStatsEmitMs >= 100)
+                {
+                    lastTimingStatsEmitMs = timer.elapsed();
+                    emit continuousTimingStatsChanged(liveTimingStats);
+                }
                 if (keepFrame || rawCaptured % 32 == 0)
                 {
-                    emit continuousStatsChanged(rawCaptured, emitted, discarded, deviceDropped,
+                    emit continuousStatsChanged(rawCaptured, emitted, discarded, liveTimingStats.deviceDroppedFrames,
                         poolStats.inUse, poolStats.peakInUse);
                 }
-                emit captureStatsChanged(emitted, poolStats.inUse, rawCaptured, deviceDropped);
+                emit captureStatsChanged(emitted, poolStats.inUse, rawCaptured, liveTimingStats.deviceDroppedFrames);
                 continue;
             }
 
@@ -2077,6 +2183,17 @@ void PvcamCameraWorker::startContinuousCapture(const PvcamCaptureSettings& rawSe
         {
             pl_exp_stop_cont(hcam_, CCS_HALT);
             continuousStarted = false;
+        }
+        if (metadataFrame != nullptr)
+        {
+            pl_md_release_frame_struct(metadataFrame);
+            metadataFrame = nullptr;
+        }
+        if (metadataEnabled)
+        {
+            rs_bool disabled = FALSE;
+            pl_set_param(hcam_, PARAM_METADATA_ENABLED, &disabled);
+            metadataEnabled = false;
         }
         if (frameInfo != nullptr)
         {
@@ -2093,21 +2210,54 @@ void PvcamCameraWorker::startContinuousCapture(const PvcamCaptureSettings& rawSe
         }
         capturing_.store(false);
         const FrameBufferPoolStats finalPoolStats = framePool_.stats();
-        emit continuousStatsChanged(rawCaptured, emitted, discarded, deviceDropped,
+        const ContinuousTimingStats finalTimingStats = timingTracker.snapshot(true);
+        emit logMessage(QStringLiteral("Kinetix continuous timing final: raw=%1, kept=%2, baseline=%3 ms, fitted=%4 ms, "
+            "rolling drift=%5%, max interval deviation=%6 ms, phase=%7 ms, max phase=%8 ms, duplicates=%9, dropped=%10.")
+            .arg(finalTimingStats.rawFrames)
+            .arg(finalTimingStats.keptFrames)
+            .arg(finalTimingStats.baselinePeriodMs, 0, 'f', 6)
+            .arg(finalTimingStats.fittedPeriodMs, 0, 'f', 6)
+            .arg(finalTimingStats.rollingDriftPercent, 0, 'f', 4)
+            .arg(finalTimingStats.maxIntervalDeviationMs, 0, 'f', 6)
+            .arg(finalTimingStats.currentPhaseErrorMs, 0, 'f', 6)
+            .arg(finalTimingStats.maxAbsPhaseErrorMs, 0, 'f', 6)
+            .arg(finalTimingStats.duplicateNotifications)
+            .arg(finalTimingStats.deviceDroppedFrames));
+        emit continuousTimingStatsChanged(finalTimingStats);
+        emit continuousStatsChanged(rawCaptured, emitted, discarded, finalTimingStats.deviceDroppedFrames,
             finalPoolStats.inUse, finalPoolStats.peakInUse);
-        emit captureStatsChanged(emitted, finalPoolStats.inUse, rawCaptured, deviceDropped);
+        emit captureStatsChanged(emitted, finalPoolStats.inUse, rawCaptured, finalTimingStats.deviceDroppedFrames);
         emit cameraStateChanged(QStringLiteral("Ready"));
         emit captureFinished(!stopRequested_.load(),
             stopRequested_.load()
                 ? QStringLiteral("Kinetix continuous stopped after raw=%1 kept=%2 frame(s).").arg(rawCaptured).arg(emitted)
                 : QStringLiteral("Kinetix continuous captured raw=%1 kept=%2 discarded=%3 frame(s) in %4 ms, stride=%5, duplicate notifications ignored=%6.")
-                    .arg(rawCaptured).arg(emitted).arg(discarded).arg(timer.elapsed()).arg(settings.rawFrameStride).arg(duplicateFramesIgnored));
+                    .arg(rawCaptured).arg(emitted).arg(discarded).arg(timer.elapsed()).arg(settings.rawFrameStride).arg(finalTimingStats.duplicateNotifications));
     }
     catch (const std::exception& ex)
     {
+        const ContinuousTimingStats failureTimingStats = timingTracker.snapshot(true);
+        emit logMessage(QStringLiteral("Kinetix continuous timing at failure: raw=%1, kept=%2, baseline=%3 ms, fitted=%4 ms, "
+            "rolling drift=%5%, max interval deviation=%6 ms, phase=%7 ms, max phase=%8 ms, duplicates=%9, dropped=%10.")
+            .arg(failureTimingStats.rawFrames)
+            .arg(failureTimingStats.keptFrames)
+            .arg(failureTimingStats.baselinePeriodMs, 0, 'f', 6)
+            .arg(failureTimingStats.fittedPeriodMs, 0, 'f', 6)
+            .arg(failureTimingStats.rollingDriftPercent, 0, 'f', 4)
+            .arg(failureTimingStats.maxIntervalDeviationMs, 0, 'f', 6)
+            .arg(failureTimingStats.currentPhaseErrorMs, 0, 'f', 6)
+            .arg(failureTimingStats.maxAbsPhaseErrorMs, 0, 'f', 6)
+            .arg(failureTimingStats.duplicateNotifications)
+            .arg(failureTimingStats.deviceDroppedFrames));
+        emit continuousTimingStatsChanged(failureTimingStats);
         if (continuousStarted)
         {
             pl_exp_stop_cont(hcam_, CCS_HALT);
+        }
+        if (metadataFrame != nullptr)
+        {
+            pl_md_release_frame_struct(metadataFrame);
+            metadataFrame = nullptr;
         }
         if (frameInfo != nullptr)
         {
