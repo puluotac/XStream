@@ -60,10 +60,12 @@ captures/
 
 # Logs and temporary files
 *.log
+*.dmp
 *.tmp
 *.bak
 *.cache
 cmake_configure.log
+debug_dumps/
 
 # OS files
 Thumbs.db

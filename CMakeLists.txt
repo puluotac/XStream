@@ -73,6 +73,10 @@ add_library(ct_workstation_core STATIC
     src/app/ReconstructionController.h
     src/app/ReconstructionController.cpp
     src/core/acq/CtAcquisitionTypes.h
+    src/core/acq/ContinuousTiming.h
+    src/core/acq/ContinuousTiming.cpp
+    src/core/acq/FrameBufferPool.h
+    src/core/acq/FrameBufferPool.cpp
     src/core/acq/CtReplayAcquisitionWorker.h
     src/core/acq/CtReplayAcquisitionWorker.cpp
     src/core/acq/CtTiffWriter.h

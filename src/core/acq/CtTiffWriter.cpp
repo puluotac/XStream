@@ -145,8 +145,23 @@ void CtTiffWriter::workerLoop(int workerIndex)
 
         try
         {
+            cv::Mat image;
+            if (item.bufferLease && item.bufferLease->data() != nullptr
+                && item.width > 0 && item.height > 0 && item.strideBytes > 0)
+            {
+                image = cv::Mat(item.height, item.width, item.cvType,
+                    item.bufferLease->data(), static_cast<size_t>(item.strideBytes));
+            }
+            else if (item.ownedImage)
+            {
+                image = *item.ownedImage;
+            }
+            if (image.empty())
+            {
+                throw std::runtime_error("CT writer item has no image buffer.");
+            }
             QString error;
-            if (!writeImageFile(item.filePath, item.image, &error))
+            if (!writeImageFile(item.filePath, image, &error))
             {
                 throw std::runtime_error(error.toLocal8Bit().constData());
             }

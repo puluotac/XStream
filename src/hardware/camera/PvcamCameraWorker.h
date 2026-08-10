@@ -1,5 +1,7 @@
 #pragma once
 
+#include "core/acq/ContinuousTiming.h"
+#include "core/acq/FrameBufferPool.h"
 #include "hardware/camera/BoundedFrameQueue.h"
 #include "hardware/camera/CameraFrame.h"
 
@@ -45,6 +47,39 @@ struct PvcamCaptureSettings
     double frameIntervalMs = 0.0;
     double firstKeepDelayMs = 0.0;
     bool allowFrameIntervalDecimation = false;
+    int rawFrameStride = 1;
+    double baselineRawFramePeriodMs = 0.0;
+    int framePoolCapacity = 1024;
+    int ringFrameCount = 192;
+    bool waitForFrameGate = false;
+};
+
+struct PvcamTimingCalibrationSettings
+{
+    double exposureValue = 10.0;
+    PvcamExposureUnit exposureUnit = PvcamExposureUnit::Milliseconds;
+    int roiX = 0;
+    int roiY = 0;
+    int roiWidth = 3200;
+    int roiHeight = 3200;
+    int warmupFrames = 3;
+    int sampleFrames = 10;
+    int ringFrameCount = 64;
+};
+
+struct PvcamTimingCalibrationResult
+{
+    bool ok = false;
+    QString message;
+    QString timingSource;
+    double exposureMs = 0.0;
+    int roiX = 0;
+    int roiY = 0;
+    int roiWidth = 0;
+    int roiHeight = 0;
+    int bitDepth = 0;
+    int metadataVersion = 0;
+    TimingAnalysis analysis;
 };
 
 class PvcamCameraWorker : public QObject
@@ -61,6 +96,8 @@ public slots:
     void beginPreparedCapture(const ct::PvcamCaptureSettings& settings);
     void capturePreparedFrame(int frameCount = 1);
     void endPreparedCapture();
+    void calibrateContinuousTiming(const ct::PvcamTimingCalibrationSettings& settings);
+    void armContinuousFrameGate();
     void startContinuousCapture(const ct::PvcamCaptureSettings& settings);
     void stopCapture();
     void shutdown();
@@ -74,10 +111,16 @@ signals:
     void preparedCaptureReady(bool ok, const QString& message);
     void preparedFrameBatchFinished(bool ok, const QString& message);
     void continuousCaptureStarted(bool ok, const QString& message);
+    void continuousIntervalStrategyResolved(const QString& strategy, const QString& reason);
+    void timingCalibrationFinished(const ct::PvcamTimingCalibrationResult& result);
+    void continuousStatsChanged(qint64 rawFrames, qint64 keptFrames, qint64 discardedFrames,
+        qint64 deviceDroppedFrames, int poolInUse, int poolPeak);
+    void continuousTimingStatsChanged(const ct::ContinuousTimingStats& stats);
 
 private:
     void openCameraIfNeeded();
     void closeCamera();
+    bool ensureFramePool(qsizetype frameBytes, int capacity, QString* errorMessage);
 
     std::shared_ptr<BoundedFrameQueue> queue_;
     std::atomic_bool stopRequested_ { false };
@@ -87,6 +130,9 @@ private:
     PvcamCaptureSettings preparedSettings_;
     qint64 preparedFrameIndex_ = 0;
     qint64 droppedCount_ = 0;
+    FrameBufferPool framePool_;
+    std::atomic_bool continuousGateArmed_ { false };
+    std::atomic<qint64> continuousGateArmSteadyNs_ { 0 };
 
 #ifdef CT_HAS_PVCAM
     void cleanupPreparedSequence(bool abortExposure);
@@ -115,3 +161,6 @@ private:
 
 Q_DECLARE_METATYPE(ct::CameraFrame)
 Q_DECLARE_METATYPE(ct::PvcamCaptureSettings)
+Q_DECLARE_METATYPE(ct::PvcamTimingCalibrationSettings)
+Q_DECLARE_METATYPE(ct::PvcamTimingCalibrationResult)
+Q_DECLARE_METATYPE(ct::ContinuousTimingStats)

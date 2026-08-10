@@ -10,13 +10,16 @@
 
 #include <opencv2/core.hpp>
 
+#include <memory>
+
 namespace ct
 {
 
 enum class CtAcquisitionMode
 {
     StepAndShoot,
-    FlyScan
+    FlyScan,
+    TimeSeries2D
 };
 
 struct CtAcquisitionSettings
@@ -32,10 +35,17 @@ struct CtAcquisitionSettings
     double flyLeadAngleDeg = 2.0;
     double flyFrameIntervalMs = 0.0;
     double flyScanTimeS = 0.0;
+    double timeSeriesFrameIntervalMs = 50.0;
+    double timeSeriesRequestedFrameIntervalMs = 50.0;
+    double rawFramePeriodMs = 0.0;
+    double rawFrameRateFps = 0.0;
+    int rawFrameStride = 1;
+    QString timingSource;
     bool autoCor = true;
     int padding = 4;
     QString tomoPrefix = QStringLiteral("Tomo_");
     QString flatPrefix = QStringLiteral("Flat_");
+    QString timeSeriesPrefix = QStringLiteral("Frame_");
     QString extension = QStringLiteral("tiff");
     int tiffThreads = 16;
     PvcamCaptureSettings camera;
@@ -49,7 +59,12 @@ struct CtAcquisitionSettings
 struct CtFrameSaveItem
 {
     QString filePath;
-    cv::Mat image;
+    FrameBufferPool::LeasePtr bufferLease;
+    std::shared_ptr<cv::Mat> ownedImage;
+    int width = 0;
+    int height = 0;
+    int cvType = 0;
+    int strideBytes = 0;
 };
 
 struct CtFlatGroup

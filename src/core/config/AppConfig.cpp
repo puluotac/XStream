@@ -157,13 +157,14 @@ AppConfig AppConfig::fromJsonObject(const QJsonObject& object)
         readValue(ctAcqObj, "BEGINNING_ANGLE_DEG", cfg.ctAcquisitionUi.beginningAngleDeg),
         -360.0,
         360.0);
-    cfg.ctAcquisitionUi.modeIndex = std::clamp(readValue(ctAcqObj, "MODE_INDEX", cfg.ctAcquisitionUi.modeIndex), 0, 1);
+    cfg.ctAcquisitionUi.modeIndex = std::clamp(readValue(ctAcqObj, "MODE_INDEX", cfg.ctAcquisitionUi.modeIndex), 0, 2);
     cfg.ctAcquisitionUi.savePath = readValue(ctAcqObj, "SAVE_PATH", cfg.ctAcquisitionUi.savePath);
     cfg.ctAcquisitionUi.projectionNum = std::clamp(readValue(ctAcqObj, "PROJECTION_NUM", cfg.ctAcquisitionUi.projectionNum), 1, 20000);
     cfg.ctAcquisitionUi.flatGap = std::clamp(readValue(ctAcqObj, "FLAT_GAP", cfg.ctAcquisitionUi.flatGap), 0, 20000);
     cfg.ctAcquisitionUi.flatMoveUm = std::clamp(readValue(ctAcqObj, "FLAT_MOVE_UM", cfg.ctAcquisitionUi.flatMoveUm), -500000.0, 500000.0);
     cfg.ctAcquisitionUi.flatNum = std::clamp(readValue(ctAcqObj, "FLAT_NUM", cfg.ctAcquisitionUi.flatNum), 0, 10000);
     cfg.ctAcquisitionUi.flyLeadAngleDeg = std::clamp(readValue(ctAcqObj, "FLY_LEAD_ANGLE_DEG", cfg.ctAcquisitionUi.flyLeadAngleDeg), 0.0, 90.0);
+    cfg.ctAcquisitionUi.frameIntervalMs = std::clamp(readValue(ctAcqObj, "FRAME_INTERVAL_MS", cfg.ctAcquisitionUi.frameIntervalMs), 0.001, 600000.0);
     cfg.ctAcquisitionUi.tiffThreads = std::clamp(readValue(ctAcqObj, "TIFF_THREADS", cfg.ctAcquisitionUi.tiffThreads), 1, 64);
 
     const auto kohzuObj = object.value("KOHZU").toObject();
@@ -373,6 +374,7 @@ QJsonObject AppConfig::toJsonObject() const
     ctAcqObj["FLAT_MOVE_UM"] = ctAcquisitionUi.flatMoveUm;
     ctAcqObj["FLAT_NUM"] = ctAcquisitionUi.flatNum;
     ctAcqObj["FLY_LEAD_ANGLE_DEG"] = ctAcquisitionUi.flyLeadAngleDeg;
+    ctAcqObj["FRAME_INTERVAL_MS"] = ctAcquisitionUi.frameIntervalMs;
     ctAcqObj["TIFF_THREADS"] = ctAcquisitionUi.tiffThreads;
     root["CT_ACQUISITION"] = ctAcqObj;
 

@@ -1,5 +1,7 @@
 #include "core/common/ProjectionTypes.h"
 #include "core/common/GeometryVectorGenerator.h"
+#include "core/acq/ContinuousTiming.h"
+#include "core/acq/FrameBufferPool.h"
 #include "core/config/AppConfig.h"
 #include "core/cor/CorEstimatorFft.h"
 #include "core/preprocess/ImageNormalizer.h"
@@ -23,6 +25,212 @@
 
 int main()
 {
+    QVector<ct::TimingSample> timingSamples;
+    for (int i = 0; i < 100; ++i)
+    {
+        timingSamples.append({ 1000 + i, static_cast<qint64>(i) * 12000000LL });
+    }
+    const ct::TimingAnalysis timing = ct::analyzeTimingSamples(timingSamples);
+    if (!timing.valid || !timing.stable || timing.droppedFrames != 0
+        || std::abs(timing.medianPeriodMs - 12.0) > 1e-9
+        || std::abs(timing.fittedPeriodMs - 12.0) > 1e-9
+        || timing.maxPeriodDeviationMs > 1e-9
+        || timing.maxFitResidualMs > 1e-9
+        || std::abs(timing.rawFrameRateFps - (1000.0 / 12.0)) > 1e-9)
+    {
+        std::cerr << "Continuous timing analysis failed\n";
+        return 30;
+    }
+
+    QVector<ct::TimingSample> timingWithGap = timingSamples;
+    for (int i = 50; i < timingWithGap.size(); ++i)
+    {
+        ++timingWithGap[i].frameNumber;
+    }
+    const ct::TimingAnalysis gapTiming = ct::analyzeTimingSamples(timingWithGap);
+    if (!gapTiming.valid || gapTiming.stable || gapTiming.droppedFrames != 1)
+    {
+        std::cerr << "Timing frame-gap detection failed\n";
+        return 31;
+    }
+
+    QVector<ct::TimingSample> exposureTimingSamples;
+    for (int i = 0; i < 10; ++i)
+    {
+        exposureTimingSamples.append({ 2000 + i, static_cast<qint64>(i) * 12000000LL, 10000000LL });
+    }
+    const ct::TimingAnalysis exposureTiming = ct::analyzeTimingSamples(exposureTimingSamples);
+    if (!exposureTiming.valid || !exposureTiming.exposureTimingAvailable
+        || std::abs(exposureTiming.meanExposureMs - 10.0) > 1e-9
+        || exposureTiming.maxExposureDeviationMs > 1e-9)
+    {
+        std::cerr << "Exposure timing analysis failed\n";
+        return 40;
+    }
+
+    ct::ContinuousTimingTracker fixedTracker;
+    fixedTracker.reset(12.0, 2, 4);
+    for (int i = 0; i < 10; ++i)
+    {
+        const qint64 frameNumber = i + 1;
+        if (fixedTracker.observeRaw(frameNumber, static_cast<qint64>(i) * 12000000LL + 1)
+            != ct::ContinuousTimingObservation::Accepted)
+        {
+            std::cerr << "Fixed timing tracker rejected a valid raw frame\n";
+            return 41;
+        }
+        if (i % 2 == 0
+            && fixedTracker.markKept(frameNumber, static_cast<qint64>(i) * 12000000LL + 1)
+                != ct::ContinuousTimingObservation::Accepted)
+        {
+            std::cerr << "Fixed timing tracker rejected a valid kept frame\n";
+            return 42;
+        }
+    }
+    const ct::ContinuousTimingStats fixedStats = fixedTracker.snapshot(true);
+    if (!fixedStats.valid || fixedStats.rawFrames != 10 || fixedStats.keptFrames != 5
+        || std::abs(fixedStats.rollingPeriodMs - 12.0) > 1e-9
+        || fixedStats.maxIntervalDeviationMs > 1e-9
+        || fixedStats.maxAbsPhaseErrorMs > 1e-9)
+    {
+        std::cerr << "Fixed continuous timing statistics failed\n";
+        return 43;
+    }
+
+    ct::ContinuousTimingTracker recoveredTracker;
+    recoveredTracker.reset(12.0, 1, 16);
+    const QVector<qint64> recoveredTimestampsNs {
+        1LL, 12000001LL, 25000001LL, 36000001LL, 48000001LL, 60000001LL
+    };
+    for (int i = 0; i < recoveredTimestampsNs.size(); ++i)
+    {
+        const qint64 frameNumber = i + 1;
+        if (recoveredTracker.observeRaw(frameNumber, recoveredTimestampsNs[i])
+                != ct::ContinuousTimingObservation::Accepted
+            || recoveredTracker.markKept(frameNumber, recoveredTimestampsNs[i])
+                != ct::ContinuousTimingObservation::Accepted)
+        {
+            std::cerr << "Recovered timing tracker rejected a valid frame\n";
+            return 44;
+        }
+    }
+    const ct::ContinuousTimingStats recoveredStats = recoveredTracker.snapshot(true);
+    if (std::abs(recoveredStats.currentPhaseErrorMs) > 1e-9
+        || std::abs(recoveredStats.maxAbsPhaseErrorMs - 1.0) > 1e-9
+        || std::abs(recoveredStats.maxIntervalDeviationMs - 1.0) > 1e-9)
+    {
+        std::cerr << "Local timing recovery statistics failed\n";
+        return 45;
+    }
+
+    ct::ContinuousTimingTracker driftTracker;
+    driftTracker.reset(12.0, 1, 4);
+    for (int i = 0; i < 8; ++i)
+    {
+        const qint64 timestampNs = static_cast<qint64>(i) * 12120000LL + 1;
+        driftTracker.observeRaw(i + 1, timestampNs);
+        driftTracker.markKept(i + 1, timestampNs);
+    }
+    const ct::ContinuousTimingStats driftStats = driftTracker.snapshot(true);
+    if (std::abs(driftStats.rollingDriftPercent - 1.0) > 1e-9
+        || driftStats.currentPhaseErrorMs <= 0.0
+        || driftStats.meanDriftMs > 1e-9)
+    {
+        std::cerr << "Sustained timing drift statistics failed\n";
+        return 46;
+    }
+
+    ct::ContinuousTimingTracker discontinuityTracker;
+    discontinuityTracker.reset(12.0, 1, 4);
+    discontinuityTracker.observeRaw(1, 1);
+    if (discontinuityTracker.observeRaw(1, 1) != ct::ContinuousTimingObservation::Duplicate
+        || discontinuityTracker.observeRaw(3, 24000001LL) != ct::ContinuousTimingObservation::DeviceFrameLoss)
+    {
+        std::cerr << "Continuous timing discontinuity detection failed\n";
+        return 47;
+    }
+    const ct::ContinuousTimingStats discontinuityStats = discontinuityTracker.snapshot(true);
+    if (!discontinuityStats.frameLossDetected || discontinuityStats.missingDeviceFrames != 1
+        || discontinuityStats.deviceDroppedFrames != 1 || discontinuityStats.duplicateNotifications != 1)
+    {
+        std::cerr << "Continuous timing discontinuity details failed\n";
+        return 48;
+    }
+
+    ct::ContinuousTimingTracker reverseTracker;
+    reverseTracker.reset(12.0, 1, 4);
+    reverseTracker.observeRaw(5, 1);
+    if (reverseTracker.observeRaw(4, 12000001LL) != ct::ContinuousTimingObservation::DeviceFrameLoss)
+    {
+        std::cerr << "Reverse device frame detection failed\n";
+        return 49;
+    }
+
+    const ct::FlyTimingPlan flyTiming = ct::makeFlyTimingPlan(180.0, 1080, 1.0, 1600.0, 5.0, 12.0);
+    if (!flyTiming.valid || flyTiming.rawFrameStride != 2
+        || std::abs(flyTiming.projectionIntervalMs - 24.0) > 1e-9
+        || flyTiming.flySpeedDegPerSec > flyTiming.maxFlySpeedDegPerSec)
+    {
+        std::cerr << "Fly integer-stride timing plan failed\n";
+        return 32;
+    }
+
+    const ct::FlyTimingPlan flyTiming3ms = ct::makeFlyTimingPlan(180.0, 1080, 1.0, 1600.0, 3.0, 12.00375);
+    const ct::FlyTimingPlan flyTiming8ms = ct::makeFlyTimingPlan(180.0, 1080, 1.0, 1600.0, 8.0, 12.00375);
+    if (!flyTiming3ms.valid || flyTiming3ms.rawFrameStride != 2
+        || !flyTiming8ms.valid || flyTiming8ms.rawFrameStride != 4)
+    {
+        std::cerr << "Fly exposure-dependent stride planning failed\n";
+        return 38;
+    }
+
+    const ct::TimeSeriesTimingPlan seriesTiming = ct::makeTimeSeriesTimingPlan(50.0, 12.0);
+    if (!seriesTiming.valid || seriesTiming.rawFrameStride != 5
+        || std::abs(seriesTiming.actualIntervalMs - 60.0) > 1e-9)
+    {
+        std::cerr << "2D integer-stride timing plan failed\n";
+        return 33;
+    }
+
+    const ct::TimeSeriesTimingPlan fullRateSeriesTiming = ct::makeTimeSeriesTimingPlan(5.0, 12.0);
+    if (!fullRateSeriesTiming.valid || fullRateSeriesTiming.rawFrameStride != 1
+        || std::abs(fullRateSeriesTiming.actualIntervalMs - 12.0) > 1e-9)
+    {
+        std::cerr << "2D full-rate timing plan failed\n";
+        return 39;
+    }
+
+    ct::FrameBufferPool framePool;
+    QString poolError;
+    if (!framePool.configure(64, 4, true, &poolError))
+    {
+        std::cerr << "Frame pool configuration failed: " << poolError.toStdString() << "\n";
+        return 34;
+    }
+    std::vector<ct::FrameBufferPool::LeasePtr> leases;
+    for (int i = 0; i < 4; ++i)
+    {
+        auto lease = framePool.tryAcquire();
+        if (!lease || lease->data() == nullptr || lease->size() != 64)
+        {
+            std::cerr << "Frame pool acquisition failed\n";
+            return 35;
+        }
+        lease->data()[0] = static_cast<unsigned char>(i);
+        leases.push_back(std::move(lease));
+    }
+    if (framePool.tryAcquire() || framePool.stats().peakInUse != 4)
+    {
+        std::cerr << "Frame pool exhaustion tracking failed\n";
+        return 36;
+    }
+    leases.pop_back();
+    if (!framePool.tryAcquire())
+    {
+        std::cerr << "Frame pool lease return failed\n";
+        return 37;
+    }
+
     const ct::AppConfig defaults = ct::AppConfig::defaults();
     const ct::AppConfig roundTrip = ct::AppConfig::fromJsonObject(defaults.toJsonObject());
     if (roundTrip.compute.batchSize != defaults.compute.batchSize
@@ -67,13 +275,14 @@ int main()
     sessionConfig.cameraUi.snapIndex = 42;
     sessionConfig.cameraUi.saveDir = "E:/demo/camera";
     sessionConfig.ctAcquisitionUi.beginningAngleDeg = -12.5;
-    sessionConfig.ctAcquisitionUi.modeIndex = 1;
+    sessionConfig.ctAcquisitionUi.modeIndex = 2;
     sessionConfig.ctAcquisitionUi.savePath = "E:/demo/ct";
     sessionConfig.ctAcquisitionUi.projectionNum = 1440;
     sessionConfig.ctAcquisitionUi.flatGap = 180;
     sessionConfig.ctAcquisitionUi.flatMoveUm = 10000.0;
     sessionConfig.ctAcquisitionUi.flatNum = 2;
     sessionConfig.ctAcquisitionUi.flyLeadAngleDeg = 3.0;
+    sessionConfig.ctAcquisitionUi.frameIntervalMs = 50.0;
     sessionConfig.ctAcquisitionUi.tiffThreads = 24;
     sessionConfig.ctFly.allowedBlurPx = 1.25;
     sessionConfig.kohzuUi.host = "10.30.92.202";
@@ -146,6 +355,7 @@ int main()
         || std::abs(loadedConfig.ctAcquisitionUi.flatMoveUm - sessionConfig.ctAcquisitionUi.flatMoveUm) > 1e-9
         || loadedConfig.ctAcquisitionUi.flatNum != sessionConfig.ctAcquisitionUi.flatNum
         || std::abs(loadedConfig.ctAcquisitionUi.flyLeadAngleDeg - sessionConfig.ctAcquisitionUi.flyLeadAngleDeg) > 1e-9
+        || std::abs(loadedConfig.ctAcquisitionUi.frameIntervalMs - sessionConfig.ctAcquisitionUi.frameIntervalMs) > 1e-9
         || loadedConfig.ctAcquisitionUi.tiffThreads != sessionConfig.ctAcquisitionUi.tiffThreads
         || std::abs(loadedConfig.ctFly.allowedBlurPx - sessionConfig.ctFly.allowedBlurPx) > 1e-9
         || loadedConfig.kohzuUi.host != sessionConfig.kohzuUi.host
