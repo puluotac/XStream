@@ -4,6 +4,7 @@
 #include "core/acq/FrameBufferPool.h"
 #include "core/config/AppConfig.h"
 #include "core/cor/CorEstimatorFft.h"
+#include "core/io/ImageFileIo.h"
 #include "core/preprocess/ImageNormalizer.h"
 #include "core/recon/GpuProjectionBatch.h"
 #include "cuda/stripe_removal_kernels.h"
@@ -169,10 +170,43 @@ int main()
     const ct::FlyTimingPlan flyTiming = ct::makeFlyTimingPlan(180.0, 1080, 1.0, 1600.0, 5.0, 12.0);
     if (!flyTiming.valid || flyTiming.rawFrameStride != 2
         || std::abs(flyTiming.projectionIntervalMs - 24.0) > 1e-9
-        || flyTiming.flySpeedDegPerSec > flyTiming.maxFlySpeedDegPerSec)
+        || flyTiming.flySpeedDegPerSec > flyTiming.maxFlySpeedDegPerSec
+        || flyTiming.endpointReferenceLogicalIndex != 1080
+        || flyTiming.endpointReferenceRawFrameOffset != 2160
+        || std::abs(flyTiming.endpointReferenceTimeMs - 25920.0) > 1e-9)
     {
         std::cerr << "Fly integer-stride timing plan failed\n";
         return 32;
+    }
+
+    ct::ContinuousTimingTracker flyEndpointTracker;
+    flyEndpointTracker.reset(12.0, flyTiming.rawFrameStride, 16);
+    constexpr qint64 firstFlyDeviceFrame = 5000;
+    constexpr qint64 firstFlyBofNs = 1000000;
+    for (qint64 rawOffset = 0; rawOffset <= flyTiming.endpointReferenceRawFrameOffset; ++rawOffset)
+    {
+        const qint64 deviceFrame = firstFlyDeviceFrame + rawOffset;
+        const qint64 bofNs = firstFlyBofNs + rawOffset * 12000000LL;
+        if (flyEndpointTracker.observeRaw(deviceFrame, bofNs) != ct::ContinuousTimingObservation::Accepted)
+        {
+            std::cerr << "Fly endpoint sequence rejected a valid raw frame\n";
+            return 50;
+        }
+        if (rawOffset % flyTiming.rawFrameStride == 0
+            && flyEndpointTracker.markKept(deviceFrame, bofNs) != ct::ContinuousTimingObservation::Accepted)
+        {
+            std::cerr << "Fly endpoint sequence rejected a valid kept frame\n";
+            return 51;
+        }
+    }
+    const ct::ContinuousTimingStats flyEndpointStats = flyEndpointTracker.snapshot(true);
+    if (flyEndpointStats.keptFrames != 1081
+        || flyEndpointStats.rawFrames != flyTiming.endpointReferenceRawFrameOffset + 1
+        || std::abs(flyEndpointStats.currentPhaseErrorMs) > 1e-9
+        || flyEndpointStats.keptStrideViolationDetected)
+    {
+        std::cerr << "Fly endpoint reference sequence validation failed\n";
+        return 52;
     }
 
     const ct::FlyTimingPlan flyTiming3ms = ct::makeFlyTimingPlan(180.0, 1080, 1.0, 1600.0, 3.0, 12.00375);
@@ -184,7 +218,7 @@ int main()
         return 38;
     }
 
-    const ct::TimeSeriesTimingPlan seriesTiming = ct::makeTimeSeriesTimingPlan(50.0, 12.0);
+    const ct::TimeSeriesTimingPlan seriesTiming = ct::makeTimeSeriesTimingPlan(5, 12.0);
     if (!seriesTiming.valid || seriesTiming.rawFrameStride != 5
         || std::abs(seriesTiming.actualIntervalMs - 60.0) > 1e-9)
     {
@@ -192,7 +226,7 @@ int main()
         return 33;
     }
 
-    const ct::TimeSeriesTimingPlan fullRateSeriesTiming = ct::makeTimeSeriesTimingPlan(5.0, 12.0);
+    const ct::TimeSeriesTimingPlan fullRateSeriesTiming = ct::makeTimeSeriesTimingPlan(1, 12.0);
     if (!fullRateSeriesTiming.valid || fullRateSeriesTiming.rawFrameStride != 1
         || std::abs(fullRateSeriesTiming.actualIntervalMs - 12.0) > 1e-9)
     {
@@ -255,6 +289,29 @@ int main()
         return 4;
     }
 
+    cv::Mat tiffSource(3, 4, CV_16UC1);
+    for (int y = 0; y < tiffSource.rows; ++y)
+    {
+        for (int x = 0; x < tiffSource.cols; ++x)
+        {
+            tiffSource.at<quint16>(y, x) = static_cast<quint16>(1000 + y * tiffSource.cols + x);
+        }
+    }
+    const QString tiffPath = tempDir.filePath("direct_gray16.tiff");
+    QString tiffError;
+    if (!ct::writeImageFile(tiffPath, tiffSource, &tiffError))
+    {
+        std::cerr << "Direct TIFF write failed: " << tiffError.toStdString() << "\n";
+        return 53;
+    }
+    const cv::Mat tiffReadBack = ct::readImageFile(tiffPath);
+    if (tiffReadBack.type() != CV_16UC1 || tiffReadBack.size() != tiffSource.size()
+        || cv::norm(tiffReadBack, tiffSource, cv::NORM_INF) != 0.0)
+    {
+        std::cerr << "Direct TIFF round-trip mismatch\n";
+        return 54;
+    }
+
     ct::AppConfig sessionConfig = defaults;
     sessionConfig.geometry.corShift = 12.5f;
     sessionConfig.phase.enable = true;
@@ -282,7 +339,7 @@ int main()
     sessionConfig.ctAcquisitionUi.flatMoveUm = 10000.0;
     sessionConfig.ctAcquisitionUi.flatNum = 2;
     sessionConfig.ctAcquisitionUi.flyLeadAngleDeg = 3.0;
-    sessionConfig.ctAcquisitionUi.frameIntervalMs = 50.0;
+    sessionConfig.ctAcquisitionUi.rawFrameStride = 5;
     sessionConfig.ctAcquisitionUi.tiffThreads = 24;
     sessionConfig.ctFly.allowedBlurPx = 1.25;
     sessionConfig.kohzuUi.host = "10.30.92.202";
@@ -355,7 +412,7 @@ int main()
         || std::abs(loadedConfig.ctAcquisitionUi.flatMoveUm - sessionConfig.ctAcquisitionUi.flatMoveUm) > 1e-9
         || loadedConfig.ctAcquisitionUi.flatNum != sessionConfig.ctAcquisitionUi.flatNum
         || std::abs(loadedConfig.ctAcquisitionUi.flyLeadAngleDeg - sessionConfig.ctAcquisitionUi.flyLeadAngleDeg) > 1e-9
-        || std::abs(loadedConfig.ctAcquisitionUi.frameIntervalMs - sessionConfig.ctAcquisitionUi.frameIntervalMs) > 1e-9
+        || loadedConfig.ctAcquisitionUi.rawFrameStride != sessionConfig.ctAcquisitionUi.rawFrameStride
         || loadedConfig.ctAcquisitionUi.tiffThreads != sessionConfig.ctAcquisitionUi.tiffThreads
         || std::abs(loadedConfig.ctFly.allowedBlurPx - sessionConfig.ctFly.allowedBlurPx) > 1e-9
         || loadedConfig.kohzuUi.host != sessionConfig.kohzuUi.host

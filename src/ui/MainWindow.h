@@ -2,6 +2,7 @@
 
 #include "app/ReconstructionController.h"
 #include "core/acq/CtAcquisitionTypes.h"
+#include "core/acq/ContinuousFrameRouter.h"
 #include "core/acq/CtReplayAcquisitionWorker.h"
 #include "core/acq/CtTiffWriter.h"
 #include "core/common/PreviewSliceRenderer.h"
@@ -103,6 +104,7 @@ private:
     void advanceCtAcquisition();
     void requestCtFrame(CtFrameKind kind);
     void enqueueCtFrame(const CameraFrame& frame);
+    void handleContinuousFrameBatch(const QVector<ContinuousFrameMetadata>& frames, bool ok, const QString& message);
     void finishCtAcquisition(bool ok, const QString& message);
     void writeCtManifest(bool completed, const QString& errorMessage);
     void enqueueCtReconJob();
@@ -164,6 +166,7 @@ private:
     PvcamCameraWorker* cameraWorker_ = nullptr;
     QThread ctWriterThread_;
     CtTiffWriter* ctWriter_ = nullptr;
+    ContinuousFrameRouter* ctContinuousRouter_ = nullptr;
     QThread ctReplayThread_;
     CtReplayAcquisitionWorker* ctReplayWorker_ = nullptr;
     QThread kohzuThread_;
@@ -229,6 +232,7 @@ private:
     CtAcquisitionSettings ctSettings_;
     QVector<CtFlatGroup> ctFlatGroups_;
     QVector<QJsonObject> ctFlyFrames_;
+    QJsonObject ctCor180Frame_;
     QVector<QJsonObject> ctTimeSeriesFrames_;
     bool ctFlyScanRequested_ = false;
     bool ctFlyScanCapturing_ = false;
@@ -268,6 +272,7 @@ private:
     int ctYMoveCount_ = 0;
     int ctFrameBatchCount_ = 0;
     int ctFrameSavedCount_ = 0;
+    int ctContinuousFrameBaseCount_ = 0;
     qint64 ctWriterStartedMs_ = 0;
     qint64 ctWriterFrameBytes_ = 0;
     int ctWriterThreads_ = 0;
@@ -396,8 +401,7 @@ private:
     QLabel* ctFlyFrameIntervalLabel_ = nullptr;
     QLabel* ctFlyRawStrideLabel_ = nullptr;
     QLabel* ctFlyValidationLabel_ = nullptr;
-    QDoubleSpinBox* ctTimeSeriesFrameIntervalSpin_ = nullptr;
-    QLabel* ctTimeSeriesRawStrideLabel_ = nullptr;
+    QSpinBox* ctTimeSeriesRawFrameStrideSpin_ = nullptr;
     QLabel* ctTimeSeriesActualIntervalLabel_ = nullptr;
     QLabel* ctTimeSeriesActualRateLabel_ = nullptr;
     QLabel* ctTimeSeriesDurationLabel_ = nullptr;

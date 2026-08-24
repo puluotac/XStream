@@ -132,6 +132,9 @@ struct FlyTimingPlan
     double projectionIntervalMs = 0.0;
     double flySpeedDegPerSec = 0.0;
     double scanTimeS = 0.0;
+    int endpointReferenceLogicalIndex = 0;
+    qint64 endpointReferenceRawFrameOffset = 0;
+    double endpointReferenceTimeMs = 0.0;
 };
 
 struct TimeSeriesTimingPlan
@@ -139,7 +142,6 @@ struct TimeSeriesTimingPlan
     bool valid = false;
     QString error;
     int rawFrameStride = 1;
-    double requestedIntervalMs = 0.0;
     double actualIntervalMs = 0.0;
     double actualFrameRateFps = 0.0;
 };
@@ -149,6 +151,6 @@ TimingAnalysis analyzeTimingSamples(const QVector<TimingSample>& samples);
 FlyTimingPlan makeFlyTimingPlan(double totalAngleDeg, int projectionCount, double allowedBlurPx,
     double roiRadiusPx, double exposureMs, double rawFramePeriodMs);
 
-TimeSeriesTimingPlan makeTimeSeriesTimingPlan(double requestedIntervalMs, double rawFramePeriodMs);
+TimeSeriesTimingPlan makeTimeSeriesTimingPlan(int rawFrameStride, double rawFramePeriodMs);
 
 } // namespace ct

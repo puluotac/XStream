@@ -380,6 +380,10 @@ FlyTimingPlan makeFlyTimingPlan(double totalAngleDeg, int projectionCount, doubl
     plan.projectionIntervalMs = rawFramePeriodMs * static_cast<double>(plan.rawFrameStride);
     plan.flySpeedDegPerSec = plan.angleStepDeg / (plan.projectionIntervalMs / 1000.0);
     plan.scanTimeS = static_cast<double>(projectionCount) * plan.projectionIntervalMs / 1000.0;
+    plan.endpointReferenceLogicalIndex = projectionCount;
+    plan.endpointReferenceRawFrameOffset = static_cast<qint64>(projectionCount)
+        * static_cast<qint64>(plan.rawFrameStride);
+    plan.endpointReferenceTimeMs = static_cast<double>(projectionCount) * plan.projectionIntervalMs;
     plan.valid = std::isfinite(plan.flySpeedDegPerSec) && plan.flySpeedDegPerSec > 0.0
         && plan.flySpeedDegPerSec <= plan.maxFlySpeedDegPerSec * (1.0 + 1e-9);
     if (!plan.valid)
@@ -389,18 +393,16 @@ FlyTimingPlan makeFlyTimingPlan(double totalAngleDeg, int projectionCount, doubl
     return plan;
 }
 
-TimeSeriesTimingPlan makeTimeSeriesTimingPlan(double requestedIntervalMs, double rawFramePeriodMs)
+TimeSeriesTimingPlan makeTimeSeriesTimingPlan(int rawFrameStride, double rawFramePeriodMs)
 {
     TimeSeriesTimingPlan plan;
-    plan.requestedIntervalMs = requestedIntervalMs;
-    if (!(requestedIntervalMs > 0.0) || !(rawFramePeriodMs > 0.0))
+    if (rawFrameStride <= 0 || !(rawFramePeriodMs > 0.0))
     {
         plan.error = QStringLiteral("2D timing inputs must be positive.");
         return plan;
     }
 
-    plan.rawFrameStride = std::max(1,
-        static_cast<int>(std::ceil(requestedIntervalMs / rawFramePeriodMs - 1e-12)));
+    plan.rawFrameStride = rawFrameStride;
     plan.actualIntervalMs = rawFramePeriodMs * static_cast<double>(plan.rawFrameStride);
     plan.actualFrameRateFps = 1000.0 / plan.actualIntervalMs;
     plan.valid = std::isfinite(plan.actualFrameRateFps) && plan.actualFrameRateFps > 0.0;

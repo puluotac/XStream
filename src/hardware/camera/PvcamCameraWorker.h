@@ -1,6 +1,7 @@
 #pragma once
 
 #include "core/acq/ContinuousTiming.h"
+#include "core/acq/ContinuousFrameSink.h"
 #include "core/acq/FrameBufferPool.h"
 #include "hardware/camera/BoundedFrameQueue.h"
 #include "hardware/camera/CameraFrame.h"
@@ -102,6 +103,8 @@ public slots:
     void stopCapture();
     void shutdown();
 
+    void setContinuousFrameSink(ContinuousFrameSink* sink);
+
 signals:
     void cameraStateChanged(const QString& state);
     void frameReady(const ct::CameraFrame& frame);
@@ -133,6 +136,7 @@ private:
     FrameBufferPool framePool_;
     std::atomic_bool continuousGateArmed_ { false };
     std::atomic<qint64> continuousGateArmSteadyNs_ { 0 };
+    ContinuousFrameSink* continuousFrameSink_ = nullptr;
 
 #ifdef CT_HAS_PVCAM
     void cleanupPreparedSequence(bool abortExposure);

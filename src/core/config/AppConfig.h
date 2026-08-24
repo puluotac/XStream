@@ -136,7 +136,7 @@ struct CtAcquisitionUiConfig
     double flatMoveUm = 0.0;
     int flatNum = 10;
     double flyLeadAngleDeg = 2.0;
-    double frameIntervalMs = 50.0;
+    int rawFrameStride = 1;
     int tiffThreads = 24;
 };
 
