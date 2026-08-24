@@ -778,6 +778,11 @@ PvcamCameraWorker::PvcamCameraWorker(QObject* parent)
     qRegisterMetaType<ct::ContinuousTimingStats>("ct::ContinuousTimingStats");
 }
 
+void PvcamCameraWorker::setContinuousFrameSink(ContinuousFrameSink* sink)
+{
+    continuousFrameSink_ = sink;
+}
+
 bool PvcamCameraWorker::ensureFramePool(qsizetype frameBytes, int capacity, QString* errorMessage)
 {
     const FrameBufferPoolStats current = framePool_.stats();
@@ -1590,6 +1595,7 @@ void PvcamCameraWorker::calibrateContinuousTiming(const PvcamTimingCalibrationSe
         qint64 driverTimestampOffsetNs = 0;
         qint64 previousMetadataFrameNumber = 0;
         qint64 previousAcceptedFrameNumber = 0;
+        qint64 lastRetrievedDriverFrame = 0;
         bool metadataTimingUsable = metadataEnabled;
         QString metadataFallbackReason;
         while (receivedFrames < totalFrames && !stopRequested_.load())
@@ -1601,8 +1607,19 @@ void PvcamCameraWorker::calibrateContinuousTiming(const PvcamTimingCalibrationSe
             {
                 throw std::runtime_error(pvcamError().toStdString());
             }
+
             if (status == FRAME_AVAILABLE || status == READOUT_COMPLETE)
             {
+                // FRAME_AVAILABLE is level-triggered. Once the oldest slot is
+                // unlocked, the status can remain available until a later driver
+                // notification refreshes FRAME_INFO. Do not ask PVCAM for an
+                // oldest slot unless the driver delivery waterline advanced.
+                const qint64 driverWaterline = frameInfo->FrameNr;
+                if (lastRetrievedDriverFrame > 0 && driverWaterline <= lastRetrievedDriverFrame)
+                {
+                    QThread::msleep(1);
+                    continue;
+                }
                 void* framePtr = nullptr;
                 if (PV_OK != pl_exp_get_oldest_frame_ex(hcam_, &framePtr, frameInfo) || framePtr == nullptr)
                 {
@@ -1610,6 +1627,19 @@ void PvcamCameraWorker::calibrateContinuousTiming(const PvcamTimingCalibrationSe
                     continue;
                 }
 
+                const qint64 driverRetrievedFrame = frameInfo->FrameNr;
+                if (lastRetrievedDriverFrame > 0 && driverRetrievedFrame <= lastRetrievedDriverFrame)
+                {
+                    if (PV_OK != pl_exp_unlock_oldest_frame(hcam_))
+                    {
+                        throw std::runtime_error(pvcamError().toStdString());
+                    }
+                    emit logMessage(QStringLiteral("Kinetix timing ignored stale PVCAM ring slot: driver FrameNr %1 after %2.")
+                        .arg(driverRetrievedFrame)
+                        .arg(lastRetrievedDriverFrame));
+                    QThread::msleep(1);
+                    continue;
+                }
                 qint64 frameNumber = frameInfo->FrameNr;
                 qint64 timestampNs = 0;
                 qint64 exposureTimeNs = 0;
@@ -1714,6 +1744,7 @@ void PvcamCameraWorker::calibrateContinuousTiming(const PvcamTimingCalibrationSe
                 {
                     throw std::runtime_error(pvcamError().toStdString());
                 }
+                lastRetrievedDriverFrame = driverRetrievedFrame;
                 if (receivedFrames >= settings.warmupFrames)
                 {
                     samples.append({ frameNumber, timestampNs, exposureTimeNs });
@@ -1821,11 +1852,13 @@ void PvcamCameraWorker::startContinuousCapture(const PvcamCaptureSettings& rawSe
     return;
 #else
     bool continuousStarted = false;
+    bool continuousStartNotified = false;
     bool metadataEnabled = false;
     FRAME_INFO* frameInfo = nullptr;
     md_frame* metadataFrame = nullptr;
     ContinuousTimingTracker timingTracker;
     timingTracker.reset(settings.baselineRawFramePeriodMs, settings.rawFrameStride, 16);
+    ContinuousFrameSink* frameSink = continuousFrameSink_;
     try
     {
         QElapsedTimer timer;
@@ -1945,6 +1978,7 @@ void PvcamCameraWorker::startContinuousCapture(const PvcamCaptureSettings& rawSe
         continuousStarted = true;
         emit logMessage(QStringLiteral("Kinetix CT continuous started in %1 ms.").arg(timer.elapsed()));
         emit continuousCaptureStarted(true, QStringLiteral("Kinetix CT continuous started."));
+        continuousStartNotified = true;
 
         qint64 rawCaptured = 0;
         qint64 emitted = 0;
@@ -1953,7 +1987,7 @@ void PvcamCameraWorker::startContinuousCapture(const PvcamCaptureSettings& rawSe
         qint64 firstKeepTimestampNs = 0;
         qint64 lastRawFrameReceivedNs = timer.nsecsElapsed();
         qint64 lastTimingStatsEmitMs = -100;
-        qint64 lastRetrievedDeviceFrame = 0;
+        qint64 lastRetrievedDriverFrame = 0;
         const qint64 noFrameTimeoutNs = static_cast<qint64>(
             std::max(10000.0, exposureMs * 3.0 + 5000.0) * 1000000.0);
         while (emitted < settings.frameCount && !stopRequested_.load())
@@ -1980,11 +2014,13 @@ void PvcamCameraWorker::startContinuousCapture(const PvcamCaptureSettings& rawSe
 
             if (status == FRAME_AVAILABLE || status == READOUT_COMPLETE)
             {
-                // FRAME_AVAILABLE remains set after all unread frames are drained. Use the
-                // latest driver frame number as a waterline so get_oldest never revisits a
-                // stale slot after the circular buffer wraps.
-                if (lastRetrievedDeviceFrame > 0
-                    && static_cast<qint64>(frameInfo->FrameNr) <= lastRetrievedDeviceFrame)
+                // FRAME_AVAILABLE stays asserted while the continuous ring has
+                // data. FRAME_INFO from check_cont_status_ex is the driver-side
+                // delivery waterline, independent of the camera metadata used
+                // for hardware BOF timing below. Waiting for it to advance keeps
+                // get_oldest from revisiting a stale slot after a ring wrap.
+                const qint64 driverWaterline = frameInfo->FrameNr;
+                if (lastRetrievedDriverFrame > 0 && driverWaterline <= lastRetrievedDriverFrame)
                 {
                     QThread::msleep(1);
                     continue;
@@ -1995,9 +2031,22 @@ void PvcamCameraWorker::startContinuousCapture(const PvcamCaptureSettings& rawSe
                     QThread::msleep(1);
                     continue;
                 }
+                const qint64 driverRetrievedFrame = frameInfo->FrameNr;
+                if (lastRetrievedDriverFrame > 0 && driverRetrievedFrame <= lastRetrievedDriverFrame)
+                {
+                    if (PV_OK != pl_exp_unlock_oldest_frame(hcam_))
+                    {
+                        throw std::runtime_error(pvcamError().toStdString());
+                    }
+                    emit logMessage(QStringLiteral("Kinetix ignored stale PVCAM ring slot: driver FrameNr %1 after %2.")
+                        .arg(driverRetrievedFrame)
+                        .arg(lastRetrievedDriverFrame));
+                    QThread::msleep(1);
+                    continue;
+                }
                 lastRawFrameReceivedNs = timer.nsecsElapsed();
                 qint64 deviceFrame = frameInfo->FrameNr;
-                qint64 bofTicks = frameInfo->TimeStampBOF > 0 ? frameInfo->TimeStampBOF : frameInfo->TimeStamp;
+                const qint64 bofTicks = frameInfo->TimeStampBOF > 0 ? frameInfo->TimeStampBOF : frameInfo->TimeStamp;
                 qint64 bofTimestampNs = bofTicks > 0 ? bofTicks * 100000LL : 0;
                 qint64 eofTimestampNs = frameInfo->TimeStamp > 0 ? frameInfo->TimeStamp * 100000LL : bofTimestampNs;
                 const void* imageData = framePtr;
@@ -2037,11 +2086,11 @@ void PvcamCameraWorker::startContinuousCapture(const PvcamCaptureSettings& rawSe
                 if (observation == ContinuousTimingObservation::Duplicate)
                 {
                     const ContinuousTimingStats duplicateStats = timingTracker.snapshot();
-                    lastRetrievedDeviceFrame = deviceFrame;
                     if (PV_OK != pl_exp_unlock_oldest_frame(hcam_))
                     {
                         throw std::runtime_error(pvcamError().toStdString());
                     }
+                    lastRetrievedDriverFrame = driverRetrievedFrame;
                     if (duplicateStats.duplicateNotifications == 1
                         || duplicateStats.duplicateNotifications % 64 == 0)
                     {
@@ -2129,7 +2178,7 @@ void PvcamCameraWorker::startContinuousCapture(const PvcamCaptureSettings& rawSe
                 {
                     throw std::runtime_error(pvcamError().toStdString());
                 }
-                lastRetrievedDeviceFrame = deviceFrame;
+                lastRetrievedDriverFrame = driverRetrievedFrame;
 
                 if (keepFrame)
                 {
@@ -2149,7 +2198,21 @@ void PvcamCameraWorker::startContinuousCapture(const PvcamCaptureSettings& rawSe
                 ++rawCaptured;
                 if (keepFrame)
                 {
-                    emit frameReady(frame);
+                    if (frameSink != nullptr)
+                    {
+                        QString sinkError;
+                        if (!frameSink->submitContinuousFrame(frame, &sinkError))
+                        {
+                            throw std::runtime_error(QStringLiteral("Continuous frame sink rejected frame %1: %2")
+                                .arg(deviceFrame)
+                                .arg(sinkError)
+                                .toLocal8Bit().constData());
+                        }
+                    }
+                    else
+                    {
+                        emit frameReady(frame);
+                    }
                     ++emitted;
                 }
                 else
@@ -2228,11 +2291,17 @@ void PvcamCameraWorker::startContinuousCapture(const PvcamCaptureSettings& rawSe
             finalPoolStats.inUse, finalPoolStats.peakInUse);
         emit captureStatsChanged(emitted, finalPoolStats.inUse, rawCaptured, finalTimingStats.deviceDroppedFrames);
         emit cameraStateChanged(QStringLiteral("Ready"));
-        emit captureFinished(!stopRequested_.load(),
-            stopRequested_.load()
-                ? QStringLiteral("Kinetix continuous stopped after raw=%1 kept=%2 frame(s).").arg(rawCaptured).arg(emitted)
-                : QStringLiteral("Kinetix continuous captured raw=%1 kept=%2 discarded=%3 frame(s) in %4 ms, stride=%5, duplicate notifications ignored=%6.")
-                    .arg(rawCaptured).arg(emitted).arg(discarded).arg(timer.elapsed()).arg(settings.rawFrameStride).arg(finalTimingStats.duplicateNotifications));
+        const bool captureOk = !stopRequested_.load();
+        const QString captureMessage = captureOk
+            ? QStringLiteral("Kinetix continuous captured raw=%1 kept=%2 discarded=%3 frame(s) in %4 ms, stride=%5, duplicate notifications ignored=%6.")
+                .arg(rawCaptured).arg(emitted).arg(discarded).arg(timer.elapsed()).arg(settings.rawFrameStride).arg(finalTimingStats.duplicateNotifications)
+            : QStringLiteral("Kinetix continuous stopped after raw=%1 kept=%2 frame(s).")
+                .arg(rawCaptured).arg(emitted);
+        if (frameSink != nullptr)
+        {
+            frameSink->continuousCaptureFinished(captureOk, captureMessage);
+        }
+        emit captureFinished(captureOk, captureMessage);
     }
     catch (const std::exception& ex)
     {
@@ -2259,6 +2328,12 @@ void PvcamCameraWorker::startContinuousCapture(const PvcamCaptureSettings& rawSe
             pl_md_release_frame_struct(metadataFrame);
             metadataFrame = nullptr;
         }
+        if (metadataEnabled && cameraOpened_ && hcam_ >= 0)
+        {
+            rs_bool disabled = FALSE;
+            pl_set_param(hcam_, PARAM_METADATA_ENABLED, &disabled);
+            metadataEnabled = false;
+        }
         if (frameInfo != nullptr)
         {
             pl_release_frame_info_struct(frameInfo);
@@ -2267,7 +2342,14 @@ void PvcamCameraWorker::startContinuousCapture(const PvcamCaptureSettings& rawSe
         closeCamera();
         capturing_.store(false);
         emit cameraStateChanged(QStringLiteral("Error"));
-        emit continuousCaptureStarted(false, QString::fromLocal8Bit(ex.what()));
+        if (frameSink != nullptr)
+        {
+            frameSink->continuousCaptureFinished(false, QString::fromLocal8Bit(ex.what()));
+        }
+        if (!continuousStartNotified)
+        {
+            emit continuousCaptureStarted(false, QString::fromLocal8Bit(ex.what()));
+        }
         emit captureFinished(false, QString::fromLocal8Bit(ex.what()));
     }
 #endif

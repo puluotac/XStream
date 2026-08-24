@@ -75,6 +75,9 @@ add_library(ct_workstation_core STATIC
     src/core/acq/CtAcquisitionTypes.h
     src/core/acq/ContinuousTiming.h
     src/core/acq/ContinuousTiming.cpp
+    src/core/acq/ContinuousFrameSink.h
+    src/core/acq/ContinuousFrameRouter.h
+    src/core/acq/ContinuousFrameRouter.cpp
     src/core/acq/FrameBufferPool.h
     src/core/acq/FrameBufferPool.cpp
     src/core/acq/CtReplayAcquisitionWorker.h

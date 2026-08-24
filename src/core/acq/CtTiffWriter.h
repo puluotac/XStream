@@ -25,6 +25,7 @@ public:
     ~CtTiffWriter() override;
 
     void configure(int threadCount, int maxQueuedFrames);
+    bool tryEnqueue(const ct::CtFrameSaveItem& item, QString* errorMessage = nullptr);
 
 public slots:
     void start();
@@ -38,6 +39,7 @@ signals:
     void finished(bool ok, const QString& message);
 
 private:
+    void emitQueueChangedThrottled(bool force = false);
     void workerLoop(int workerIndex);
 
     QMutex mutex_;
@@ -52,6 +54,7 @@ private:
     bool stopRequested_ = false;
     bool failed_ = false;
     QString errorMessage_;
+    std::atomic<qint64> lastQueueSignalMs_ { 0 };
     std::vector<std::thread> workers_;
 };
 

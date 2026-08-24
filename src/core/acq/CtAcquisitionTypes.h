@@ -35,8 +35,8 @@ struct CtAcquisitionSettings
     double flyLeadAngleDeg = 2.0;
     double flyFrameIntervalMs = 0.0;
     double flyScanTimeS = 0.0;
-    double timeSeriesFrameIntervalMs = 50.0;
-    double timeSeriesRequestedFrameIntervalMs = 50.0;
+    int timeSeriesRawFrameStride = 1;
+    double timeSeriesFrameIntervalMs = 0.0;
     double rawFramePeriodMs = 0.0;
     double rawFrameRateFps = 0.0;
     int rawFrameStride = 1;
