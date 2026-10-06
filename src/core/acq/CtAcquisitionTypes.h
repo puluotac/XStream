@@ -15,6 +15,10 @@
 namespace ct
 {
 
+// Keep acquisition-side TIFF fan-out bounded so the camera readout and frame pool
+// retain enough scheduling capacity across Step, Fly, 2D, and replay paths.
+constexpr int kAcquisitionWriterThreadLimit = 16;
+
 enum class CtAcquisitionMode
 {
     StepAndShoot,

@@ -1,7 +1,10 @@
 #include "core/common/ProjectionTypes.h"
 #include "core/common/GeometryVectorGenerator.h"
 #include "core/acq/ContinuousTiming.h"
+#include "core/acq/TimingProfileCache.h"
+#include "core/acq/PvcamRingDiagnostics.h"
 #include "core/acq/FrameBufferPool.h"
+#include "core/acq/CtTiffWriter.h"
 #include "core/config/AppConfig.h"
 #include "core/cor/CorEstimatorFft.h"
 #include "core/io/ImageFileIo.h"
@@ -22,10 +25,23 @@
 #include <cufft.h>
 #include <cmath>
 #include <iostream>
+#include <algorithm>
+
 #include <vector>
 
 int main()
 {
+    // The Kohzu ARIES WTB protocol requires top speed >= 2*start speed.
+    // This is the boundary that previously turned the business fly plan
+    // (11110/22219 pulses/s) into E WTB17 605 after floating-point rounding.
+    const qint64 startPps = static_cast<qint64>(std::llround(1.110972239549061 * 10000.0));
+    const qint64 roundedTopPps = static_cast<qint64>(std::llround(2.221944479098122 * 10000.0));
+    const qint64 normalizedTopPps = std::max(roundedTopPps, startPps * 2);
+    if (normalizedTopPps != 22220)
+    {
+        std::cerr << "Kohzu WTB boundary regression: top speed must be at least twice start speed\n";
+        return 1;
+    }
     QVector<ct::TimingSample> timingSamples;
     for (int i = 0; i < 100; ++i)
     {
@@ -335,12 +351,14 @@ int main()
     sessionConfig.ctAcquisitionUi.modeIndex = 2;
     sessionConfig.ctAcquisitionUi.savePath = "E:/demo/ct";
     sessionConfig.ctAcquisitionUi.projectionNum = 1440;
-    sessionConfig.ctAcquisitionUi.flatGap = 180;
-    sessionConfig.ctAcquisitionUi.flatMoveUm = 10000.0;
-    sessionConfig.ctAcquisitionUi.flatNum = 2;
+    sessionConfig.ctAcquisitionUi.stepFlatGap = 180;
+    sessionConfig.ctAcquisitionUi.stepFlatMoveUm = 10000.0;
+    sessionConfig.ctAcquisitionUi.stepFlatNum = 2;
+    sessionConfig.ctAcquisitionUi.flyFlatMoveUm = 12000.0;
+    sessionConfig.ctAcquisitionUi.flyFlatNum = 3;
     sessionConfig.ctAcquisitionUi.flyLeadAngleDeg = 3.0;
     sessionConfig.ctAcquisitionUi.rawFrameStride = 5;
-    sessionConfig.ctAcquisitionUi.tiffThreads = 24;
+    sessionConfig.ctAcquisitionUi.tiffThreads = 16;
     sessionConfig.ctFly.allowedBlurPx = 1.25;
     sessionConfig.kohzuUi.host = "10.30.92.202";
     sessionConfig.kohzuUi.port = 12322;
@@ -408,9 +426,11 @@ int main()
         || loadedConfig.ctAcquisitionUi.modeIndex != sessionConfig.ctAcquisitionUi.modeIndex
         || loadedConfig.ctAcquisitionUi.savePath != sessionConfig.ctAcquisitionUi.savePath
         || loadedConfig.ctAcquisitionUi.projectionNum != sessionConfig.ctAcquisitionUi.projectionNum
-        || loadedConfig.ctAcquisitionUi.flatGap != sessionConfig.ctAcquisitionUi.flatGap
-        || std::abs(loadedConfig.ctAcquisitionUi.flatMoveUm - sessionConfig.ctAcquisitionUi.flatMoveUm) > 1e-9
-        || loadedConfig.ctAcquisitionUi.flatNum != sessionConfig.ctAcquisitionUi.flatNum
+        || loadedConfig.ctAcquisitionUi.stepFlatGap != sessionConfig.ctAcquisitionUi.stepFlatGap
+        || std::abs(loadedConfig.ctAcquisitionUi.stepFlatMoveUm - sessionConfig.ctAcquisitionUi.stepFlatMoveUm) > 1e-9
+        || loadedConfig.ctAcquisitionUi.stepFlatNum != sessionConfig.ctAcquisitionUi.stepFlatNum
+        || std::abs(loadedConfig.ctAcquisitionUi.flyFlatMoveUm - sessionConfig.ctAcquisitionUi.flyFlatMoveUm) > 1e-9
+        || loadedConfig.ctAcquisitionUi.flyFlatNum != sessionConfig.ctAcquisitionUi.flyFlatNum
         || std::abs(loadedConfig.ctAcquisitionUi.flyLeadAngleDeg - sessionConfig.ctAcquisitionUi.flyLeadAngleDeg) > 1e-9
         || loadedConfig.ctAcquisitionUi.rawFrameStride != sessionConfig.ctAcquisitionUi.rawFrameStride
         || loadedConfig.ctAcquisitionUi.tiffThreads != sessionConfig.ctAcquisitionUi.tiffThreads
@@ -436,6 +456,138 @@ int main()
     {
         std::cerr << "Session config round-trip mismatch\n";
         return 7;
+    }
+
+    QJsonObject legacyWriterRoot = sessionConfig.toJsonObject();
+    QJsonObject legacyCtAcquisition = legacyWriterRoot.value("CT_ACQUISITION").toObject();
+    legacyCtAcquisition.remove("STEP_FLAT_GAP");
+    legacyCtAcquisition.remove("STEP_FLAT_MOVE_UM");
+    legacyCtAcquisition.remove("STEP_FLAT_NUM");
+    legacyCtAcquisition.remove("FLY_FLAT_MOVE_UM");
+    legacyCtAcquisition.remove("FLY_FLAT_NUM");
+    legacyCtAcquisition["FLAT_GAP"] = 24;
+    legacyCtAcquisition["FLAT_MOVE_UM"] = 3210.0;
+    legacyCtAcquisition["FLAT_NUM"] = 4;
+    legacyCtAcquisition["TIFF_THREADS"] = 24;
+    legacyWriterRoot["CT_ACQUISITION"] = legacyCtAcquisition;
+    const QString legacyWriterPath = tempDir.filePath("legacy_writer_session.json");
+    QFile legacyWriterFile(legacyWriterPath);
+    if (!legacyWriterFile.open(QIODevice::WriteOnly | QIODevice::Truncate))
+    {
+        std::cerr << "Failed to create legacy writer config\n";
+        return 8;
+    }
+    legacyWriterFile.write(QJsonDocument(legacyWriterRoot).toJson(QJsonDocument::Indented));
+    legacyWriterFile.close();
+    ct::AppConfig legacyWriterConfig = ct::AppConfig::defaults();
+    if (!ct::AppConfig::tryLoadFromJsonFile(legacyWriterPath, &legacyWriterConfig, &loadError)
+        || legacyWriterConfig.ctAcquisitionUi.tiffThreads != 16
+        || legacyWriterConfig.ctAcquisitionUi.stepFlatGap != 24
+        || legacyWriterConfig.ctAcquisitionUi.stepFlatNum != 4
+        || std::abs(legacyWriterConfig.ctAcquisitionUi.stepFlatMoveUm - 3210.0) > 1e-9
+        || legacyWriterConfig.ctAcquisitionUi.flyFlatNum != 4
+        || std::abs(legacyWriterConfig.ctAcquisitionUi.flyFlatMoveUm - 3210.0) > 1e-9)
+    {
+        std::cerr << "Legacy acquisition config migration/clamping failed\n";
+        return 9;
+    }
+
+    ct::TimingProfileCache timingCache;
+    ct::TimingProfile profile;
+    profile.key.cameraIdentity = "Kinetix/PVCAM";
+    profile.key.readoutMode = "16-bit Dynamic Range";
+    profile.key.triggerMode = "internal_timed";
+    profile.key.exposureMs = 10.0;
+    profile.key.roiWidth = 3200;
+    profile.key.roiHeight = 3200;
+    profile.cameraName = "PMPCIECam00";
+    profile.cameraPartNumber = "Kinetix";
+    profile.cameraSerial = "A25D723013";
+    profile.bitDepth = 16;
+    profile.metadataVersion = 3;
+    profile.timingSource = "embedded_hardware_metadata";
+    profile.readoutPort = "Dynamic Range";
+    profile.readoutSpeed = "Standard";
+    profile.gain = "Standard";
+    profile.analysis.valid = true;
+    profile.analysis.fittedPeriodMs = 12.00375;
+    profile.analysis.rawFrameRateFps = 1000.0 / profile.analysis.fittedPeriodMs;
+    timingCache.upsert(profile);
+    if (timingCache.size() != 1 || timingCache.find(profile.key) == nullptr)
+    {
+        std::cerr << "Timing profile cache lookup failed\n";
+        return 55;
+    }
+    const QString timingCachePath = tempDir.filePath("timing_profiles.json");
+    QString timingCacheError;
+    if (!timingCache.saveAtomic(timingCachePath, &timingCacheError))
+    {
+        std::cerr << "Timing profile cache save failed: " << timingCacheError.toStdString() << "\n";
+        return 56;
+    }
+    ct::TimingProfileCache loadedTimingCache;
+    if (!loadedTimingCache.load(timingCachePath, &timingCacheError)
+        || loadedTimingCache.find(profile.key) == nullptr)
+    {
+        std::cerr << "Timing profile cache round-trip failed: " << timingCacheError.toStdString() << "\n";
+        return 57;
+    }
+    ct::TimingProfile changedProfile = profile;
+    changedProfile.analysis.fittedPeriodMs = 13.0;
+    timingCache.upsert(changedProfile);
+    if (timingCache.size() != 1 || std::abs(timingCache.find(profile.key)->analysis.fittedPeriodMs - 13.0) > 1e-9)
+    {
+        std::cerr << "Timing profile cache upsert failed\n";
+        return 58;
+    }
+    if (!timingCache.markUsed(profile.key, QStringLiteral("2026-08-25T23:00:00.000"))
+        || timingCache.find(profile.key)->lastUsedAt != QStringLiteral("2026-08-25T23:00:00.000"))
+    {
+        std::cerr << "Timing profile cache last-used update failed\n";
+        return 60;
+    }
+    ct::TimingProfileKey mismatchedTimingKey = profile.key;
+    mismatchedTimingKey.exposureMs = 11.0;
+    if (timingCache.find(mismatchedTimingKey) != nullptr)
+    {
+        std::cerr << "Timing profile cache matched a changed exposure\n";
+        return 61;
+    }
+    const QString corruptTimingCachePath = tempDir.filePath("corrupt_timing_profiles.json");
+    QFile corruptTimingCacheFile(corruptTimingCachePath);
+    if (!corruptTimingCacheFile.open(QIODevice::WriteOnly | QIODevice::Truncate))
+    {
+        std::cerr << "Failed to create corrupt timing cache\n";
+        return 62;
+    }
+    corruptTimingCacheFile.write("{\"FORMAT_VERSION\":1,\"PROFILES\":[{\"BROKEN\":true}]}");
+    corruptTimingCacheFile.close();
+    ct::TimingProfileCache corruptTimingCache;
+    if (corruptTimingCache.load(corruptTimingCachePath, &timingCacheError)
+        || corruptTimingCache.size() != 0)
+    {
+        std::cerr << "Corrupt timing profile cache did not fall back to empty\n";
+        return 63;
+    }
+
+    ct::CtTiffWriter writerLimitTest;
+    writerLimitTest.configure(24, 10);
+    if (writerLimitTest.configuredThreadCount() != ct::kAcquisitionWriterThreadLimit)
+    {
+        std::cerr << "Acquisition writer thread limit was not enforced\n";
+        return 64;
+    }
+
+    ct::PvcamRingWaterlineTracker ringTracker;
+    ringTracker.reset(192);
+    if (ringTracker.update(100, 0).unread != 0
+        || ringTracker.update(1145, 1140).unread != 5
+        || ringTracker.update(1145, 1145).unread != 0
+        || ringTracker.update(1337, 1145).unread != 192
+        || ringTracker.update(1146, 1145).peakUnread != 192)
+    {
+        std::cerr << "PVCAM ring waterline estimate failed\n";
+        return 59;
     }
 
     const QString cleanedPath = tempDir.filePath("cleaned_session.json");

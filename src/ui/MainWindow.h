@@ -3,6 +3,7 @@
 #include "app/ReconstructionController.h"
 #include "core/acq/CtAcquisitionTypes.h"
 #include "core/acq/ContinuousFrameRouter.h"
+#include "core/acq/TimingProfileCache.h"
 #include "core/acq/CtReplayAcquisitionWorker.h"
 #include "core/acq/CtTiffWriter.h"
 #include "core/common/PreviewSliceRenderer.h"
@@ -60,6 +61,10 @@ private:
     void applyDefaults();
     bool saveSessionConfig();
     QString sessionConfigPath() const;
+    QString timingProfileCachePath() const;
+    QString ctRecoveryStatePath() const;
+    void inspectInterruptedCtSession();
+    void writeCtRecoveryState(const QString& state, const QString& detail = QString());
     void setBusy(bool busy);
     void appendLog(const QString& text);
     void closeEvent(QCloseEvent* event) override;
@@ -151,8 +156,11 @@ private:
     void startTimingCalibration();
     void handleTimingCalibrationResult(const PvcamTimingCalibrationResult& result);
     void invalidateTimingCalibration(const QString& reason);
+    bool restoreTimingProfileForCurrentUi(bool logHit);
+    void storeTimingProfile(const PvcamTimingCalibrationResult& result);
     bool timingCalibrationMatchesCurrentUi() const;
     PvcamTimingCalibrationSettings timingCalibrationSettingsFromUi() const;
+    TimingProfileKey timingProfileKeyFromUi() const;
     void updateCtFlyDerivedParams();
     void updateCtTimeSeriesDerivedParams();
     void updateContinuousTimingUi();
@@ -173,6 +181,10 @@ private:
     KohzuController* kohzuController_ = nullptr;
     bool motorConnected_ = false;
     bool shuttingDown_ = false;
+    bool ctRecoveryPending_ = false;
+    bool ctRecoveryConfirmed_ = false;
+    bool ctHardwareStopPending_ = false;
+    bool applyingConfig_ = false;
     AppConfig sessionConfig_ = AppConfig::defaults();
     cv::Mat lastRawCameraFrame_;
     cv::Mat lastCameraSaveFrame_;
@@ -282,6 +294,10 @@ private:
     qint64 ctContinuousDeviceDroppedFrames_ = 0;
     int ctFramePoolInUse_ = 0;
     int ctFramePoolPeak_ = 0;
+    int ctPvcamRingEstimatedUnread_ = 0;
+    int ctPvcamRingCapacity_ = 0;
+    int ctPvcamRingPeakEstimatedUnread_ = 0;
+    qint64 ctPvcamRingLastUiUpdateMs_ = 0;
     ContinuousTimingStats ctContinuousTimingStats_;
     int ctContinuousTimingDriftLevel_ = 0;
     int ctEstimatedTotalFrames_ = 0;
@@ -294,11 +310,13 @@ private:
     bool ctIdlePollingPausedForCt_ = false;
     bool timingCalibrationRunning_ = false;
     bool timingCalibrationValid_ = false;
+    bool timingCalibrationFromCache_ = false;
     bool timingCalibrationPendingAfterLiveStop_ = false;
     bool timingRestoreLiveAfterFinish_ = false;
     QString timingInvalidReason_;
     PvcamTimingCalibrationSettings timingCalibrationSettings_;
     PvcamTimingCalibrationResult timingCalibrationResult_;
+    TimingProfileCache timingProfileCache_;
     int ctFlyRawFrameStride_ = 1;
     int ctTimeSeriesRawFrameStride_ = 1;
     double ctTimeSeriesActualIntervalMs_ = 0.0;
@@ -373,9 +391,11 @@ private:
     QTabWidget* ctModeTabs_ = nullptr;
     QLineEdit* ctSavePathEdit_ = nullptr;
     QSpinBox* ctProjectionNumSpin_ = nullptr;
-    QSpinBox* ctFlatGapSpin_ = nullptr;
-    QDoubleSpinBox* ctFlatMoveSpin_ = nullptr;
-    QSpinBox* ctFlatNumSpin_ = nullptr;
+    QSpinBox* ctStepFlatGapSpin_ = nullptr;
+    QDoubleSpinBox* ctStepFlatMoveSpin_ = nullptr;
+    QSpinBox* ctStepFlatNumSpin_ = nullptr;
+    QDoubleSpinBox* ctFlyFlatMoveSpin_ = nullptr;
+    QSpinBox* ctFlyFlatNumSpin_ = nullptr;
     QDoubleSpinBox* ctFlyAllowedBlurSpin_ = nullptr;
     QDoubleSpinBox* ctFlyTotalAngleSpin_ = nullptr;
     QLabel* ctTimingStatusValueLabel_ = nullptr;
@@ -412,6 +432,7 @@ private:
     QLabel* ctTimingLabel_ = nullptr;
     QProgressBar* ctProgressBar_ = nullptr;
     QLabel* ctWriterLabel_ = nullptr;
+    QLabel* ctPvcamRingLabel_ = nullptr;
     QLabel* ctBufferLabel_ = nullptr;
     QLabel* ctFrameTimingLabel_ = nullptr;
     QPushButton* ctStartButton_ = nullptr;

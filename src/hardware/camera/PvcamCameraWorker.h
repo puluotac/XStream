@@ -50,7 +50,9 @@ struct PvcamCaptureSettings
     bool allowFrameIntervalDecimation = false;
     int rawFrameStride = 1;
     double baselineRawFramePeriodMs = 0.0;
-    int framePoolCapacity = 1024;
+    // Bounded in-flight frame storage.  CT routing persists frames through
+    // the writer; this is deliberately not sized to the projection count.
+    int framePoolCapacity = 128;
     int ringFrameCount = 192;
     bool waitForFrameGate = false;
 };
@@ -80,6 +82,16 @@ struct PvcamTimingCalibrationResult
     int roiHeight = 0;
     int bitDepth = 0;
     int metadataVersion = 0;
+    QString cameraName;
+    QString cameraPartNumber;
+    QString cameraSerial;
+    QString readoutMode;
+    QString readoutPort;
+    QString readoutSpeed;
+    QString gain;
+    QString triggerMode;
+    int binningX = 1;
+    int binningY = 1;
     TimingAnalysis analysis;
 };
 
@@ -118,6 +130,7 @@ signals:
     void timingCalibrationFinished(const ct::PvcamTimingCalibrationResult& result);
     void continuousStatsChanged(qint64 rawFrames, qint64 keptFrames, qint64 discardedFrames,
         qint64 deviceDroppedFrames, int poolInUse, int poolPeak);
+    void continuousRingStatsChanged(int estimatedUnread, int ringCapacity, int peakEstimatedUnread);
     void continuousTimingStatsChanged(const ct::ContinuousTimingStats& stats);
 
 private:

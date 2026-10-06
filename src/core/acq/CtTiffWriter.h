@@ -25,6 +25,7 @@ public:
     ~CtTiffWriter() override;
 
     void configure(int threadCount, int maxQueuedFrames);
+    int configuredThreadCount() const { return threadCount_; }
     bool tryEnqueue(const ct::CtFrameSaveItem& item, QString* errorMessage = nullptr);
 
 public slots:

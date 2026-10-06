@@ -15,6 +15,7 @@
 #include <QDateTime>
 #include <QFile>
 #include <QFileInfo>
+#include <QTemporaryFile>
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
@@ -78,6 +79,130 @@ QString formatMiBPerSecond(qint64 bytes, qint64 ms)
     constexpr double mib = 1024.0 * 1024.0;
     return QString::number((static_cast<double>(bytes) / mib) / (static_cast<double>(ms) / 1000.0), 'f', 1);
 }
+
+// The reconstruction algorithms consume projections one Z chunk at a time.
+// Keep the preprocessed stack in a temporary, z-major file instead of
+// requiring angleCount*height*width float values to fit in process RAM.
+class ProjectionStore
+{
+public:
+    ProjectionStore(int angleCount, int height, int width, const QString& preferredDirectory,
+        const OfflineTomoReconstruction::LogCallback& log)
+        : angleCount_(angleCount), height_(height), width_(width)
+    {
+        const quint64 elements = static_cast<quint64>(angleCount_) * static_cast<quint64>(height_)
+            * static_cast<quint64>(width_);
+        const quint64 bytes = elements * sizeof(float);
+        if (bytes > static_cast<quint64>(std::numeric_limits<qint64>::max()))
+        {
+            throw std::runtime_error("Temporary projection store exceeds QFile size limit.");
+        }
+        QString directory = preferredDirectory;
+        if (directory.isEmpty() || !QDir(directory).exists())
+        {
+            directory = QDir::tempPath();
+        }
+        file_.setFileTemplate(QDir(directory).filePath(QStringLiteral(".ct_projection_store_XXXXXX.bin")));
+        if (!file_.open())
+        {
+            throw std::runtime_error(("Failed to create temporary projection store: " + file_.errorString()).toStdString());
+        }
+        file_.setAutoRemove(true);
+        if (!file_.resize(static_cast<qint64>(bytes)))
+        {
+            throw std::runtime_error(("Failed to size temporary projection store: " + file_.errorString()).toStdString());
+        }
+        path_ = file_.fileName();
+        log(QStringLiteral("Offline projection store: %1 GiB on disk, path=%2; RAM stack allocation disabled.")
+            .arg(formatGiB(static_cast<size_t>(bytes)))
+            .arg(QDir::toNativeSeparators(path_)));
+    }
+
+    bool writeBatch(const std::vector<float>& reconLayout, const std::vector<int>& logicalIndices, int validCount)
+    {
+        if (validCount <= 0 || static_cast<int>(logicalIndices.size()) < validCount)
+        {
+            return false;
+        }
+        bool contiguous = true;
+        for (int i = 1; i < validCount; ++i)
+        {
+            if (logicalIndices[static_cast<size_t>(i)] != logicalIndices[0] + i)
+            {
+                contiguous = false;
+                break;
+            }
+        }
+        if (contiguous)
+        {
+            const int firstLogical = logicalIndices[0];
+            if (firstLogical < 0 || firstLogical + validCount > angleCount_)
+            {
+                return false;
+            }
+            const qint64 rowBytes = static_cast<qint64>(validCount) * width_ * sizeof(float);
+            for (int z = 0; z < height_; ++z)
+            {
+                const size_t sourceOffset = static_cast<size_t>(z) * validCount * width_;
+                const qint64 targetOffset = static_cast<qint64>(
+                    (static_cast<size_t>(z) * angleCount_ + firstLogical) * width_ * sizeof(float));
+                if (!file_.seek(targetOffset)
+                    || file_.write(reinterpret_cast<const char*>(reconLayout.data() + sourceOffset), rowBytes)
+                        != rowBytes)
+                {
+                    return false;
+                }
+            }
+            return true;
+        }
+
+        for (int z = 0; z < height_; ++z)
+        {
+            for (int localAngle = 0; localAngle < validCount; ++localAngle)
+            {
+                const int logical = logicalIndices[static_cast<size_t>(localAngle)];
+                if (logical < 0 || logical >= angleCount_)
+                {
+                    return false;
+                }
+                const size_t sourceOffset = (static_cast<size_t>(z) * validCount + localAngle)
+                    * static_cast<size_t>(width_);
+                const qint64 targetOffset = static_cast<qint64>(
+                    (static_cast<size_t>(z) * angleCount_ + logical) * width_ * sizeof(float));
+                if (!file_.seek(targetOffset)
+                    || file_.write(reinterpret_cast<const char*>(reconLayout.data() + sourceOffset),
+                        static_cast<qint64>(width_) * sizeof(float))
+                        != static_cast<qint64>(width_) * sizeof(float))
+                {
+                    return false;
+                }
+            }
+        }
+        return true;
+    }
+
+    bool readSinogramChunk(int zStart, int zCount, std::vector<float>& out)
+    {
+        if (zStart < 0 || zCount < 0 || zStart + zCount > height_)
+        {
+            return false;
+        }
+        const size_t elements = static_cast<size_t>(zCount) * angleCount_ * width_;
+        out.resize(elements);
+        const qint64 offset = static_cast<qint64>(
+            (static_cast<size_t>(zStart) * angleCount_ * width_) * sizeof(float));
+        const qint64 bytes = static_cast<qint64>(elements * sizeof(float));
+        return file_.seek(offset)
+            && file_.read(reinterpret_cast<char*>(out.data()), bytes) == bytes;
+    }
+
+private:
+    int angleCount_ = 0;
+    int height_ = 0;
+    int width_ = 0;
+    QTemporaryFile file_;
+    QString path_;
+};
 
 void validateGeometryImageSize(const cv::Mat& image, const QString& label, const AppConfig& config)
 {
@@ -1108,7 +1233,7 @@ int nearestFlatGroupIndex(const std::vector<ResolvedFlatGroup>& groups, int proj
 }
 
 void preprocessAllProjections(AppConfig& config, FileProjectionSource& source, const cv::Mat& flat, const cv::Mat& dark,
-    std::vector<float>& projectionStack, std::atomic_bool& stopRequested,
+    ProjectionStore& projectionStore, std::atomic_bool& stopRequested,
     const OfflineTomoReconstruction::LogCallback& log,
     const OfflineTomoReconstruction::ProgressCallback& progress)
 {
@@ -1116,9 +1241,6 @@ void preprocessAllProjections(AppConfig& config, FileProjectionSource& source, c
     const int height = config.geometry.volH;
     const int width = config.geometry.volW;
     (void)flat;
-    const size_t projectionElements = static_cast<size_t>(angleCount) * height * width;
-    projectionStack.assign(projectionElements, 0.0f);
-
     HostPinnedProjectionBatch hostBatches[2];
     GpuProjectionBatch gpuBatch;
     PaganinProcessor paganin;
@@ -1230,15 +1352,9 @@ void preprocessAllProjections(AppConfig& config, FileProjectionSource& source, c
         ensureCuda(cudaMemcpy(reconLayout.data(), gpuBatch.reconLayout(),
             reconLayout.size() * sizeof(float), cudaMemcpyDeviceToHost), "download offline preprocessed batch");
 
-        for (int localAngle = 0; localAngle < validCount; ++localAngle)
+        if (!projectionStore.writeBatch(reconLayout, inputBatch.logicalIndices, validCount))
         {
-            const int logical = inputBatch.logicalIndices[static_cast<size_t>(localAngle)];
-            for (int z = 0; z < height; ++z)
-            {
-                const float* src = reconLayout.data() + (static_cast<size_t>(z) * validCount + localAngle) * width;
-                float* dst = projectionStack.data() + (static_cast<size_t>(logical) * height + z) * width;
-                std::memcpy(dst, src, static_cast<size_t>(width) * sizeof(float));
-            }
+            throw std::runtime_error("Failed to write offline preprocessed projection batch to temporary store.");
         }
         processed += validCount;
         progress(processed, angleCount);
@@ -1257,18 +1373,12 @@ void preprocessAllProjections(AppConfig& config, FileProjectionSource& source, c
     }
 }
 
-void fillSinogramChunk(const std::vector<float>& projectionStack, int angleCount, int height, int width,
-    int zStart, int zCount, std::vector<float>& out)
+void fillSinogramChunk(ProjectionStore& projectionStore, int zStart, int zCount,
+    std::vector<float>& out)
 {
-    out.resize(static_cast<size_t>(zCount) * angleCount * width);
-    for (int z = 0; z < zCount; ++z)
+    if (!projectionStore.readSinogramChunk(zStart, zCount, out))
     {
-        for (int a = 0; a < angleCount; ++a)
-        {
-            const float* src = projectionStack.data() + (static_cast<size_t>(a) * height + (zStart + z)) * width;
-            float* dst = out.data() + (static_cast<size_t>(z) * angleCount + a) * width;
-            std::memcpy(dst, src, static_cast<size_t>(width) * sizeof(float));
-        }
+        throw std::runtime_error("Failed to read offline sinogram chunk from temporary projection store.");
     }
 }
 
@@ -1557,7 +1667,7 @@ void applyStripeRemovalFwIfEnabled(const AppConfig& config, float* deviceSino,
     ensureCuda(cudaStreamSynchronize(stream), "FW stripe removal sync");
 }
 
-qint64 runOfflineFbp(const AppConfig& config, const std::vector<float>& projectionStack,
+qint64 runOfflineFbp(const AppConfig& config, ProjectionStore& projectionStore,
     std::atomic_bool& stopRequested,
     const OfflineTomoReconstruction::LogCallback& log,
     const OfflineTomoReconstruction::ProgressCallback& progress,
@@ -1651,7 +1761,7 @@ qint64 runOfflineFbp(const AppConfig& config, const std::vector<float>& projecti
         }
         QElapsedTimer cpuTimer;
         cpuTimer.start();
-        fillSinogramChunk(projectionStack, angleCount, height, width, zStart, currH, hostSino);
+        fillSinogramChunk(projectionStore, zStart, currH, hostSino);
         fillMs += cpuTimer.elapsed();
         CudaEvent evStart(true);
         CudaEvent evAfterUpload(true);
@@ -1794,7 +1904,7 @@ qint64 runOfflineFbp(const AppConfig& config, const std::vector<float>& projecti
     return reconstructionMs;
 }
 
-qint64 runOfflineGridrec(const AppConfig& config, const std::vector<float>& projectionStack,
+qint64 runOfflineGridrec(const AppConfig& config, ProjectionStore& projectionStore,
     std::atomic_bool& stopRequested,
     const OfflineTomoReconstruction::LogCallback& log,
     const OfflineTomoReconstruction::ProgressCallback& progress,
@@ -1900,7 +2010,7 @@ qint64 runOfflineGridrec(const AppConfig& config, const std::vector<float>& proj
         }
         QElapsedTimer cpuTimer;
         cpuTimer.start();
-        fillSinogramChunk(projectionStack, angleCount, height, width, zStart, currH, hostSino);
+        fillSinogramChunk(projectionStore, zStart, currH, hostSino);
         fillMs += cpuTimer.elapsed();
         CudaEvent evStart(true);
         CudaEvent evAfterUpload(true);
@@ -2156,7 +2266,7 @@ OfflineTomoResult OfflineTomoReconstruction::run(const AppConfig& inputConfig,
         * config.geometry.volW * config.geometry.volW * sizeof(float);
     const size_t saveChunkBytes = static_cast<size_t>(std::min(config.compute.zChunkSize, config.geometry.volH))
         * config.geometry.volW * config.geometry.volW * sizeof(uint16_t);
-    log(QStringLiteral("Offline memory estimate: preprocessed projection stack=%1 GiB, calibration float chunk=%2 GiB, TIFF uint16 chunk=%3 GiB; full CPU volume is not allocated.")
+    log(QStringLiteral("Offline memory estimate: projection store on disk=%1 GiB (no full RAM stack), calibration float chunk=%2 GiB, TIFF uint16 chunk=%3 GiB; full CPU volume is not allocated.")
         .arg(formatGiB(projectionStackBytes), formatGiB(chunkBytes), formatGiB(saveChunkBytes)));
     if (config.geometry.corAuto)
     {
@@ -2177,8 +2287,9 @@ OfflineTomoResult OfflineTomoReconstruction::run(const AppConfig& inputConfig,
 
     QElapsedTimer stageTimer;
     stageTimer.start();
-    std::vector<float> projectionStack;
-    preprocessAllProjections(config, source, flat, dark, projectionStack, stopRequested, log, progress);
+    ProjectionStore projectionStore(config.geometry.totalAngles, config.geometry.volH, config.geometry.volW,
+        config.io.saveDir, log);
+    preprocessAllProjections(config, source, flat, dark, projectionStore, stopRequested, log, progress);
     if (stopRequested.load())
     {
         return OfflineTomoResult{ nullptr, config };
@@ -2189,11 +2300,11 @@ OfflineTomoResult OfflineTomoReconstruction::run(const AppConfig& inputConfig,
     qint64 algorithmReconstructionMs = 0;
     if (config.io.reconMethod == ReconMethod::OfflineFBP)
     {
-        algorithmReconstructionMs = runOfflineFbp(config, projectionStack, stopRequested, log, progress, directPreview);
+        algorithmReconstructionMs = runOfflineFbp(config, projectionStore, stopRequested, log, progress, directPreview);
     }
     else if (config.io.reconMethod == ReconMethod::OfflineGridrec)
     {
-        algorithmReconstructionMs = runOfflineGridrec(config, projectionStack, stopRequested, log, progress, directPreview);
+        algorithmReconstructionMs = runOfflineGridrec(config, projectionStore, stopRequested, log, progress, directPreview);
     }
     else
     {

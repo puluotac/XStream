@@ -75,6 +75,10 @@ add_library(ct_workstation_core STATIC
     src/core/acq/CtAcquisitionTypes.h
     src/core/acq/ContinuousTiming.h
     src/core/acq/ContinuousTiming.cpp
+    src/core/acq/TimingProfileCache.h
+    src/core/acq/TimingProfileCache.cpp
+    src/core/acq/PvcamRingDiagnostics.h
+    src/core/acq/PvcamRingDiagnostics.cpp
     src/core/acq/ContinuousFrameSink.h
     src/core/acq/ContinuousFrameRouter.h
     src/core/acq/ContinuousFrameRouter.cpp

@@ -24,7 +24,7 @@ CtTiffWriter::~CtTiffWriter()
 
 void CtTiffWriter::configure(int threadCount, int maxQueuedFrames)
 {
-    threadCount_ = std::clamp(threadCount, 1, 64);
+    threadCount_ = std::clamp(threadCount, 1, kAcquisitionWriterThreadLimit);
     maxQueuedFrames_ = std::max(1, maxQueuedFrames);
 }
 

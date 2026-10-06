@@ -711,7 +711,7 @@ void replayOne(const ReplaySpec& spec, const ReplayOptions& options)
         }
         ct::CtFrameSaveItem saveItem;
         saveItem.filePath = item.targetPath;
-        saveItem.image = image;
+        saveItem.ownedImage = std::make_shared<cv::Mat>(std::move(image));
         writer.enqueue(saveItem);
         ++submitted;
         if (!options.maxSpeed && options.frameIntervalMs > 0)

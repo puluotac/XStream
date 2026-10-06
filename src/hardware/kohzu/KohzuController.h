@@ -37,6 +37,7 @@ public slots:
     void setIdlePollingEnabled(bool enabled);
     void stopAxis(int axis, const QString& label);
     void stopAllAxes();
+    void recoverAfterInterruptedSession();
 
 signals:
     void connectionChanged(bool connected);
@@ -63,6 +64,9 @@ private:
     bool isConnected() const;
     void closeConnection();
     QString query(const QString& command, QString* error = nullptr, int timeoutMs = 1500);
+    bool waitForAxisIdle(int axis, int timeoutMs, QString* statusRaw = nullptr);
+    QString writeSpeedTable(int axis, int speedTable, int startSpeedPps, int topSpeedPps,
+        int accelTime10ms, int decelTime10ms, int accelPattern, QString* error = nullptr);
     bool speedTableCacheMatches(int axis, int speedTable, int startSpeedPps, int topSpeedPps,
         int accelTime10ms, int decelTime10ms, int accelPattern) const;
     void updateSpeedTableCache(int axis, int speedTable, int startSpeedPps, int topSpeedPps,
@@ -83,11 +87,18 @@ private:
     QHash<int, qint64> activeReleaseAfterMs_;
     QHash<int, int> activeStableCount_;
     QHash<int, int> activeReadMissCount_;
+    // Last decoded STR state for an active axis.  This is used only to emit
+    // transition diagnostics (not to drive motion decisions); the decision
+    // itself is always based on the current STR response.
+    QHash<int, int> activeLastMotionState_;
     QHash<int, SpeedTableCache> speedTableCache_;
     QTimer idlePollTimer_;
     QTimer activePollTimer_;
     qint64 lastPollFailureLogMs_ = 0;
+    qint64 lastRdpTraceLogMs_ = 0;
+    quint64 suppressedRdpTraceCount_ = 0;
     bool idlePollingEnabled_ = true;
+    quint64 commandSequence_ = 0;
 };
 
 } // namespace ct

@@ -132,12 +132,14 @@ struct CtAcquisitionUiConfig
     int modeIndex = 0;
     QString savePath;
     int projectionNum = 1080;
-    int flatGap = 0;
-    double flatMoveUm = 0.0;
-    int flatNum = 10;
+    int stepFlatGap = 0;
+    double stepFlatMoveUm = 0.0;
+    int stepFlatNum = 10;
+    double flyFlatMoveUm = 0.0;
+    int flyFlatNum = 10;
     double flyLeadAngleDeg = 2.0;
     int rawFrameStride = 1;
-    int tiffThreads = 24;
+    int tiffThreads = 16;
 };
 
 struct KohzuUiConfig

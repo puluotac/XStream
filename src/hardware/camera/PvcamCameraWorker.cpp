@@ -1,4 +1,5 @@
 #include "hardware/camera/PvcamCameraWorker.h"
+#include "core/acq/PvcamRingDiagnostics.h"
 
 #include "core/io/ImageFileIo.h"
 
@@ -199,6 +200,23 @@ std::vector<EnumValue> enumValues(int16 hcam, uns32 paramId)
         }
     }
     return values;
+}
+
+QString currentEnumValueName(int16 hcam, uns32 paramId)
+{
+    int32 currentValue = 0;
+    if (!getParam(hcam, paramId, ATTR_CURRENT, currentValue))
+    {
+        return {};
+    }
+    for (const EnumValue& value : enumValues(hcam, paramId))
+    {
+        if (value.value == currentValue)
+        {
+            return value.name;
+        }
+    }
+    return QString::number(currentValue);
 }
 
 QString readStringParam(int16 hcam, uns32 paramId, int maxLength)
@@ -1512,6 +1530,31 @@ void PvcamCameraWorker::calibrateContinuousTiming(const PvcamTimingCalibrationSe
         result.roiWidth = roiWidth(roi);
         result.roiHeight = roiHeight(roi);
         result.exposureMs = std::max(0.001, exposureMilliseconds(settings.exposureValue, settings.exposureUnit));
+        result.cameraName = cameraName_;
+        result.readoutMode = QStringLiteral("16-bit Dynamic Range");
+        result.triggerMode = QStringLiteral("internal_timed");
+        result.binningX = 1;
+        result.binningY = 1;
+        if (paramAvailable(hcam_, PARAM_CAMERA_PART_NUMBER))
+        {
+            result.cameraPartNumber = readStringParam(hcam_, PARAM_CAMERA_PART_NUMBER, MAX_CAM_PART_NUM_LEN);
+        }
+        if (paramAvailable(hcam_, PARAM_HEAD_SER_NUM_ALPHA))
+        {
+            result.cameraSerial = readStringParam(hcam_, PARAM_HEAD_SER_NUM_ALPHA, MAX_ALPHA_SER_NUM_LEN);
+        }
+        if (paramAvailable(hcam_, PARAM_READOUT_PORT))
+        {
+            result.readoutPort = currentEnumValueName(hcam_, PARAM_READOUT_PORT);
+        }
+        if (paramAvailable(hcam_, PARAM_SPDTAB_NAME))
+        {
+            result.readoutSpeed = readStringParam(hcam_, PARAM_SPDTAB_NAME, MAX_SPDTAB_NAME_LEN);
+        }
+        if (paramAvailable(hcam_, PARAM_GAIN_NAME))
+        {
+            result.gain = readStringParam(hcam_, PARAM_GAIN_NAME, MAX_GAIN_NAME_LEN);
+        }
 
         const ExposureResolution expResolution = configureExposureResolution(hcam_, settings.exposureUnit);
         const uns32 exposureUnits = std::max<uns32>(
@@ -1859,6 +1902,7 @@ void PvcamCameraWorker::startContinuousCapture(const PvcamCaptureSettings& rawSe
     ContinuousTimingTracker timingTracker;
     timingTracker.reset(settings.baselineRawFramePeriodMs, settings.rawFrameStride, 16);
     ContinuousFrameSink* frameSink = continuousFrameSink_;
+    PvcamRingWaterlineTracker ringTracker;
     try
     {
         QElapsedTimer timer;
@@ -1948,6 +1992,8 @@ void PvcamCameraWorker::startContinuousCapture(const PvcamCaptureSettings& rawSe
         }
 
         emit cameraStateChanged(QStringLiteral("CT Continuous"));
+        ringTracker.reset(ringFrameCount);
+        emit continuousRingStatsChanged(0, ringFrameCount, 0);
         emit logMessage(QStringLiteral("Kinetix CT continuous ROI x=%1 y=%2 w=%3 h=%4, bitDepth=%5, frameBytes=%6, ring=%7 frames.")
             .arg(roi.s1)
             .arg(roi.p1)
@@ -2020,6 +2066,8 @@ void PvcamCameraWorker::startContinuousCapture(const PvcamCaptureSettings& rawSe
                 // for hardware BOF timing below. Waiting for it to advance keeps
                 // get_oldest from revisiting a stale slot after a ring wrap.
                 const qint64 driverWaterline = frameInfo->FrameNr;
+                const PvcamRingEstimate ringBeforeRead = ringTracker.update(driverWaterline, lastRetrievedDriverFrame);
+                emit continuousRingStatsChanged(ringBeforeRead.unread, ringBeforeRead.capacity, ringBeforeRead.peakUnread);
                 if (lastRetrievedDriverFrame > 0 && driverWaterline <= lastRetrievedDriverFrame)
                 {
                     QThread::msleep(1);
@@ -2179,6 +2227,8 @@ void PvcamCameraWorker::startContinuousCapture(const PvcamCaptureSettings& rawSe
                     throw std::runtime_error(pvcamError().toStdString());
                 }
                 lastRetrievedDriverFrame = driverRetrievedFrame;
+                const PvcamRingEstimate ringAfterRead = ringTracker.update(driverWaterline, lastRetrievedDriverFrame);
+                emit continuousRingStatsChanged(ringAfterRead.unread, ringAfterRead.capacity, ringAfterRead.peakUnread);
 
                 if (keepFrame)
                 {

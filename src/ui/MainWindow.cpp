@@ -35,11 +35,13 @@
 #include <QProgressBar>
 #include <QPushButton>
 #include <QRegularExpression>
+#include <QSaveFile>
 #include <QScrollArea>
 #include <QSignalBlocker>
 #include <QSizePolicy>
 #include <QSlider>
 #include <QSpinBox>
+#include <QStringList>
 #include <QSplitter>
 #include <QTextEdit>
 #include <QTabWidget>
@@ -71,6 +73,13 @@ constexpr int kMotorSpeedColumnWidth = 92;
 constexpr int kMotorSpeedColumnSpacing = 4;
 constexpr int kMotorManualSpeedTable = 8;
 constexpr int kCtStepSpeedTable = kMotorManualSpeedTable;
+// Kohzu table slots are mutable profiles, not permanently assigned "step" or
+// "fly" modes.  A fly acquisition therefore uses the same slot in two
+// phases: the normal positioning profile is loaded for the initial/lead
+// moves, then the slot is rewritten with the constant-speed profile immediately
+// before the formal sweep.  Keeping these names separate makes that hand-off
+// explicit and prevents the slow scan profile from being used for a several-
+// hundred-degree lead move.
 constexpr int kCtFlySpeedTable = kMotorManualSpeedTable;
 constexpr int kKohzuSpeedPattern = 2;
 constexpr qint64 kReconQueueCameraSettleMs = 1000;
@@ -81,8 +90,13 @@ constexpr int kCtTabStep = 0;
 constexpr int kCtTabTiming = 1;
 constexpr int kCtTabFly = 2;
 constexpr int kCtTabTimeSeries = 3;
-constexpr int kCtFramePoolCapacity = 1024;
-constexpr int kContinuousTiffWriterThreadLimit = 16;
+// The pool contains only frames waiting for/being written by the TIFF
+// pipeline; it is not a projection archive.  A capacity of 128 gives the
+// camera and writer enough burst headroom without reserving tens of GiB for a
+// full-frame (3200x3200x16-bit) acquisition.  The writer queue is derived
+// from this same bound, so a slow disk applies back-pressure instead of
+// turning every projection into a permanent RAM allocation.
+constexpr int kCtFramePoolCapacity = 128;
 
 bool previewWindowProducesClippedImage(const cv::Mat& image, const PreviewWindow& window)
 {
@@ -174,8 +188,112 @@ T* makeSpin(QWidget* parent, double min, double max, double step)
     auto* spin = new T(parent);
     spin->setRange(min, max);
     spin->setSingleStep(step);
+    // Numeric fields are edited directly in the UI.  Hide the native
+    // up/down button column consistently for both QSpinBox and
+    // QDoubleSpinBox (including Padding, Snap, CT mode and reconstruction
+    // controls); keyboard entry and the configured range remain unchanged.
+    spin->setButtonSymbols(QAbstractSpinBox::NoButtons);
     spin->installEventFilter(new IgnoreWheelFilter(spin));
     return spin;
+}
+
+bool isKohzuErrorLog(const QString& text)
+{
+    const QString lower = text.toLower();
+    // Keep only actionable controller failures.  Routine connection,
+    // position/status polling, command traces, successful WTB/APS and normal
+    // idle/recovery messages are intentionally omitted from the run log.
+    static const QStringList errorMarkers = {
+        QStringLiteral(" failed"),
+        QStringLiteral("failure"),
+        QStringLiteral(" error"),
+        QStringLiteral(" timeout"),
+        QStringLiteral("timed out"),
+        QStringLiteral("not connected"),
+        QStringLiteral("not idle"),
+        QStringLiteral("not confirmed"),
+        QStringLiteral("incomplete"),
+        QStringLiteral("blocked"),
+        QStringLiteral("retry"),
+        QStringLiteral("busy"),
+        QStringLiteral("605"),
+        QStringLiteral("803"),
+        QStringLiteral("unavailable"),
+        QStringLiteral("unrecognized"),
+        QStringLiteral("not understood")
+    };
+    for (const QString& marker : errorMarkers)
+    {
+        if (lower.contains(marker))
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool isRoutineMotorLog(const QString& text)
+{
+    const QString lower = text.toLower();
+    // These are high-frequency, successful motion/status messages.  They do
+    // not describe a fault and are intentionally kept out of the UI/run log;
+    // command failures still pass through isKohzuErrorLog above.
+    static const QStringList motorIndicators = {
+        QStringLiteral("kohzu"),
+        QStringLiteral("motor"),
+        QStringLiteral("axis "),
+        QStringLiteral("axes "),
+        QStringLiteral(" rdp"),
+        QStringLiteral(" str"),
+        QStringLiteral(" aps"),
+        QStringLiteral(" wtb"),
+        QStringLiteral(" stp"),
+        QStringLiteral("speed table"),
+        QStringLiteral("position polling")
+    };
+    bool motorMessage = false;
+    for (const QString& marker : motorIndicators)
+    {
+        if (lower.contains(marker))
+        {
+            motorMessage = true;
+            break;
+        }
+    }
+    if (motorMessage && !isKohzuErrorLog(text))
+    {
+        return true;
+    }
+
+    static const QStringList routineMessages = {
+        QStringLiteral("kohzu tcp connected"),
+        QStringLiteral("kohzu idn:"),
+        QStringLiteral("kohzu connected:"),
+        QStringLiteral("kohzu controller verified"),
+        QStringLiteral("kohzu initial position refresh"),
+        QStringLiteral("kohzu command #"),
+        QStringLiteral("kohzu rdp polling trace"),
+        QStringLiteral("axis "),
+        QStringLiteral("ct motor setup:"),
+        QStringLiteral("ct fly scan motor sweep started:"),
+        QStringLiteral("ct fly r scan move completed."),
+        QStringLiteral("ct fly device-frame gate armed"),
+        QStringLiteral("stopping all kohzu axes"),
+        QStringLiteral("kohzu idle all-axis polling paused."),
+        QStringLiteral("kohzu idle all-axis polling resumed."),
+        QStringLiteral("kohzu recovery: issuing controlled stop"),
+        QStringLiteral("kohzu recovery completed"),
+        QStringLiteral("ct recovery: controller connected; checking r/y idle state."),
+        QStringLiteral("ct recovery confirmed; new acquisitions are enabled.")
+    };
+    for (const QString& marker : routineMessages)
+    {
+        if (lower.contains(marker) && !isKohzuErrorLog(text))
+        {
+            return true;
+        }
+    }
+    return false;
 }
 
 QComboBox* makeCombo(QWidget* parent)
@@ -301,6 +419,19 @@ MotorSpeedTableParams makeMotorSpeedTableParams(const QString& axisName, int spe
     qint64 topPps = std::llround(safeTop * safePulsePerUnit);
     startPps = std::clamp<qint64>(startPps, 1, 2500000);
     topPps = std::clamp<qint64>(topPps, 2, 5000000);
+    // ARIES speed tables require the configured top speed to leave enough
+    // headroom above the start speed for the acceleration profile.  In the
+    // field the controller rejects a table with top < 2*start as WTB 605
+    // even though the two values are otherwise positive and ordered (for
+    // example 11110/22219).  The fly-plan calculation is floating point, so
+    // rounding can land exactly one pulse below that boundary.  Normalize
+    // the pair before sending WTB; this changes the commanded speed by at
+    // most one pulse in the usual case and avoids a controller-side reject.
+    const qint64 minimumTopPps = std::min<qint64>(5000000, startPps * 2);
+    if (topPps < minimumTopPps)
+    {
+        topPps = minimumTopPps;
+    }
     if (topPps <= startPps)
     {
         if (startPps < 5000000)
@@ -1002,6 +1133,22 @@ MainWindow::MainWindow(QWidget* parent)
     cameraRoiYSpin_->setValue(0);
     cameraRoiWidthSpin_->setValue(3200);
     cameraRoiHeightSpin_->setValue(3200);
+    auto* cameraRoiXLayout = new QHBoxLayout();
+    cameraRoiXLayout->setContentsMargins(0, 0, 0, 0);
+    cameraRoiXLayout->setSpacing(6);
+    cameraRoiXLayout->addWidget(cameraRoiXSpin_, 1);
+    cameraRoiXLayout->addWidget(new QLabel(QStringLiteral("Width"), cameraGroup));
+    cameraRoiXLayout->addWidget(cameraRoiWidthSpin_, 1);
+    auto* cameraRoiXWidget = new QWidget(cameraGroup);
+    cameraRoiXWidget->setLayout(cameraRoiXLayout);
+    auto* cameraRoiYLayout = new QHBoxLayout();
+    cameraRoiYLayout->setContentsMargins(0, 0, 0, 0);
+    cameraRoiYLayout->setSpacing(6);
+    cameraRoiYLayout->addWidget(cameraRoiYSpin_, 1);
+    cameraRoiYLayout->addWidget(new QLabel(QStringLiteral("Height"), cameraGroup));
+    cameraRoiYLayout->addWidget(cameraRoiHeightSpin_, 1);
+    auto* cameraRoiYWidget = new QWidget(cameraGroup);
+    cameraRoiYWidget->setLayout(cameraRoiYLayout);
     cameraApplyRoiButton_ = new QPushButton(QStringLiteral("Apply ROI"), cameraGroup);
     cameraResetRoiButton_ = new QPushButton(QStringLiteral("Reset Full"), cameraGroup);
     auto* cameraRoiButtonLayout = new QHBoxLayout();
@@ -1015,6 +1162,14 @@ MainWindow::MainWindow(QWidget* parent)
     cameraSnapPaddingSpin_->setValue(6);
     cameraSnapIndexSpin_ = makeSpin<QSpinBox>(cameraGroup, 0, 999999999, 1);
     cameraSnapIndexSpin_->setValue(0);
+    auto* cameraSnapIndexLayout = new QHBoxLayout();
+    cameraSnapIndexLayout->setContentsMargins(0, 0, 0, 0);
+    cameraSnapIndexLayout->setSpacing(6);
+    cameraSnapIndexLayout->addWidget(cameraSnapPaddingSpin_, 1);
+    cameraSnapIndexLayout->addWidget(new QLabel(QStringLiteral("Snap Index"), cameraGroup));
+    cameraSnapIndexLayout->addWidget(cameraSnapIndexSpin_, 1);
+    auto* cameraSnapIndexWidget = new QWidget(cameraGroup);
+    cameraSnapIndexWidget->setLayout(cameraSnapIndexLayout);
     cameraSaveDirEdit_ = new QLineEdit(QStringLiteral("E:/2026_Chun/2026_06_09/pvcam_capture_test"), cameraGroup);
     cameraSaveDirEdit_->setMinimumWidth(120);
     auto* cameraSaveBrowse = new QPushButton(QStringLiteral("..."), cameraGroup);
@@ -1034,14 +1189,11 @@ MainWindow::MainWindow(QWidget* parent)
     cameraButtonWidget->setLayout(cameraButtonLayout);
     cameraForm->addRow(QStringLiteral("State"), cameraStateLabel_);
     cameraForm->addRow(QStringLiteral("Exposure"), cameraExposureWidget);
-    cameraForm->addRow(QStringLiteral("ROI X"), cameraRoiXSpin_);
-    cameraForm->addRow(QStringLiteral("ROI Y"), cameraRoiYSpin_);
-    cameraForm->addRow(QStringLiteral("Width"), cameraRoiWidthSpin_);
-    cameraForm->addRow(QStringLiteral("Height"), cameraRoiHeightSpin_);
+    cameraForm->addRow(QStringLiteral("ROI X"), cameraRoiXWidget);
+    cameraForm->addRow(QStringLiteral("ROI Y"), cameraRoiYWidget);
     cameraForm->addRow(cameraRoiButtonWidget);
     cameraForm->addRow(QStringLiteral("Snap Prefix"), cameraSnapPrefixEdit_);
-    cameraForm->addRow(QStringLiteral("Padding"), cameraSnapPaddingSpin_);
-    cameraForm->addRow(QStringLiteral("Snap Index"), cameraSnapIndexSpin_);
+    cameraForm->addRow(QStringLiteral("Padding"), cameraSnapIndexWidget);
     cameraForm->addRow(QStringLiteral("Save Dir"), cameraSaveWidget);
     cameraForm->addRow(cameraButtonWidget);
     hardwareLayout->addWidget(cameraGroup);
@@ -1060,7 +1212,7 @@ MainWindow::MainWindow(QWidget* parent)
     motorConnectionLabel_->hide();
     motorConnectGroup->hide();
 
-    auto* ctGroup = new QGroupBox(QStringLiteral("CT Acquisition"), hardwareHost);
+    auto* ctGroup = new QGroupBox(QStringLiteral("Acquisition"), hardwareHost);
     auto* ctForm = new QFormLayout(ctGroup);
     ctForm->setContentsMargins(8, 8, 8, 8);
     ctForm->setHorizontalSpacing(6);
@@ -1080,20 +1232,23 @@ MainWindow::MainWindow(QWidget* parent)
     ctSaveWidget->setLayout(ctSaveLayout);
     ctProjectionNumSpin_ = makeSpin<QSpinBox>(ctGroup, 1, 20000, 1);
     ctProjectionNumSpin_->setValue(1080);
-    ctFlatGapSpin_ = makeSpin<QSpinBox>(ctGroup, 0, 20000, 1);
-    ctFlatGapSpin_->setValue(0);
-    ctFlatMoveSpin_ = makeSpin<QDoubleSpinBox>(ctGroup, -500000.0, 500000.0, 100.0);
-    ctFlatMoveSpin_->setDecimals(4);
-    ctFlatMoveSpin_->setValue(0.0);
-    ctFlatNumSpin_ = makeSpin<QSpinBox>(ctGroup, 0, 10000, 1);
-    ctFlatNumSpin_->setValue(10);
     ctModeTabs_ = new QTabWidget(ctGroup);
     auto* ctStepPage = new QWidget(ctModeTabs_);
-    auto* ctStepLayout = new QVBoxLayout(ctStepPage);
+    auto* ctStepLayout = new QFormLayout(ctStepPage);
     ctStepLayout->setContentsMargins(6, 6, 6, 6);
     auto* ctStepLabel = new QLabel(QStringLiteral("Step-and-shoot: move R, expose one projection, repeat."), ctStepPage);
     ctStepLabel->setWordWrap(true);
-    ctStepLayout->addWidget(ctStepLabel);
+    ctStepFlatGapSpin_ = makeSpin<QSpinBox>(ctStepPage, 0, 20000, 1);
+    ctStepFlatGapSpin_->setValue(0);
+    ctStepFlatMoveSpin_ = makeSpin<QDoubleSpinBox>(ctStepPage, -500000.0, 500000.0, 100.0);
+    ctStepFlatMoveSpin_->setDecimals(4);
+    ctStepFlatMoveSpin_->setValue(0.0);
+    ctStepFlatNumSpin_ = makeSpin<QSpinBox>(ctStepPage, 0, 10000, 1);
+    ctStepFlatNumSpin_->setValue(10);
+    ctStepLayout->addRow(ctStepLabel);
+    ctStepLayout->addRow(QStringLiteral("Flat Gap"), ctStepFlatGapSpin_);
+    ctStepLayout->addRow(QStringLiteral("Flat Move um"), ctStepFlatMoveSpin_);
+    ctStepLayout->addRow(QStringLiteral("Flat Num"), ctStepFlatNumSpin_);
     auto* ctTimingPage = new QWidget(ctModeTabs_);
     auto* ctTimingForm = new QFormLayout(ctTimingPage);
     ctTimingForm->setContentsMargins(6, 6, 6, 6);
@@ -1135,6 +1290,11 @@ MainWindow::MainWindow(QWidget* parent)
     ctFlyAllowedBlurSpin_ = makeSpin<QDoubleSpinBox>(ctFlyPage, 0.01, 1000.0, 0.1);
     ctFlyAllowedBlurSpin_->setDecimals(3);
     ctFlyAllowedBlurSpin_->setValue(1.0);
+    ctFlyFlatMoveSpin_ = makeSpin<QDoubleSpinBox>(ctFlyPage, -500000.0, 500000.0, 100.0);
+    ctFlyFlatMoveSpin_->setDecimals(4);
+    ctFlyFlatMoveSpin_->setValue(0.0);
+    ctFlyFlatNumSpin_ = makeSpin<QSpinBox>(ctFlyPage, 0, 10000, 1);
+    ctFlyFlatNumSpin_->setValue(10);
     ctFlyTotalAngleSpin_ = makeSpin<QDoubleSpinBox>(ctFlyPage, 180.0, 180.0, 1.0);
     ctFlyTotalAngleSpin_->setDecimals(4);
     ctFlyTotalAngleSpin_->setValue(180.0);
@@ -1152,6 +1312,8 @@ MainWindow::MainWindow(QWidget* parent)
     auto* ctFlyNote = new QLabel(QStringLiteral("Fly v1 uses start/end flats only; interval Flat Gap is ignored."), ctFlyPage);
     ctFlyNote->setWordWrap(true);
     ctFlyForm->addRow(QStringLiteral("ROI Radius px"), ctFlyRadiusLabel_);
+    ctFlyForm->addRow(QStringLiteral("Flat Move um"), ctFlyFlatMoveSpin_);
+    ctFlyForm->addRow(QStringLiteral("Flat Num"), ctFlyFlatNumSpin_);
     ctFlyForm->addRow(QStringLiteral("Edge Blur px"), ctFlyAllowedBlurSpin_);
     ctFlyForm->addRow(QStringLiteral("Fly Speed deg/s"), ctFlySpeedLabel_);
     ctFlyForm->addRow(QStringLiteral("Scan Time"), ctFlyScanTimeLabel_);
@@ -1187,8 +1349,8 @@ MainWindow::MainWindow(QWidget* parent)
     ctModeTabs_->addTab(ctTimeSeriesPage, QStringLiteral("2D"));
     ctModeTabs_->setTabEnabled(kCtTabFly, false);
     ctModeTabs_->setTabEnabled(kCtTabTimeSeries, false);
-    ctTiffThreadsSpin_ = makeSpin<QSpinBox>(ctGroup, 1, 64, 1);
-    ctTiffThreadsSpin_->setValue(24);
+    ctTiffThreadsSpin_ = makeSpin<QSpinBox>(ctGroup, 1, kAcquisitionWriterThreadLimit, 1);
+    ctTiffThreadsSpin_->setValue(kAcquisitionWriterThreadLimit);
     ctStatusLabel_ = new QLabel(QStringLiteral("Idle"), ctGroup);
     ctTimingLabel_ = new QLabel(QStringLiteral("Elapsed 0:00 / remaining --"), ctGroup);
     ctTimingLabel_->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
@@ -1198,12 +1360,13 @@ MainWindow::MainWindow(QWidget* parent)
     ctProgressBar_->setTextVisible(true);
     ctProgressBar_->setFormat(QStringLiteral("%p%"));
     ctProgressBar_->setMaximumHeight(18);
-    ctWriterLabel_ = new QLabel(QStringLiteral("24 threads, 0.0 MiB/s, saved 0"), ctGroup);
-    ctBufferLabel_ = new QLabel(QStringLiteral("0 / 1024 frames, 0.0 / 20.0 GiB"), ctGroup);
+    ctWriterLabel_ = new QLabel(QStringLiteral("16 threads, 0.0 MiB/s, saved 0"), ctGroup);
+    ctPvcamRingLabel_ = new QLabel(QStringLiteral("Inactive"), ctGroup);
+    ctBufferLabel_ = new QLabel(QStringLiteral("0 / 128 frames, 0.0 / 2.5 GiB"), ctGroup);
     ctFrameTimingLabel_ = new QLabel(QStringLiteral("-"), ctGroup);
     ctFrameTimingLabel_->setWordWrap(true);
-    ctStartButton_ = new QPushButton(QStringLiteral("Start CT"), ctGroup);
-    ctStopButton_ = new QPushButton(QStringLiteral("Stop CT"), ctGroup);
+    ctStartButton_ = new QPushButton(QStringLiteral("Start"), ctGroup);
+    ctStopButton_ = new QPushButton(QStringLiteral("Stop"), ctGroup);
     ctStopButton_->setEnabled(false);
     ctStopButton_->setStyleSheet(QStringLiteral(
         "QPushButton:enabled { background: #b00020; color: white; font-weight: 600; }"
@@ -1225,13 +1388,11 @@ MainWindow::MainWindow(QWidget* parent)
     ctForm->addRow(QStringLiteral("Mode"), ctModeTabs_);
     ctForm->addRow(QStringLiteral("Save Path"), ctSaveWidget);
     ctForm->addRow(QStringLiteral("Projection Num"), ctProjectionNumSpin_);
-    ctForm->addRow(QStringLiteral("Flat Gap"), ctFlatGapSpin_);
-    ctForm->addRow(QStringLiteral("Flat Move um"), ctFlatMoveSpin_);
-    ctForm->addRow(QStringLiteral("Flat Num"), ctFlatNumSpin_);
-    ctForm->addRow(QStringLiteral("CT TIFF Threads"), ctTiffThreadsSpin_);
-    ctForm->addRow(QStringLiteral("CT Status"), ctStatusWidget);
-    ctForm->addRow(QStringLiteral("CT Progress"), ctProgressBar_);
+    ctForm->addRow(QStringLiteral("TIFF Writer Threads"), ctTiffThreadsSpin_);
+    ctForm->addRow(QStringLiteral("Status"), ctStatusWidget);
+    ctForm->addRow(QStringLiteral("Progress"), ctProgressBar_);
     ctForm->addRow(QStringLiteral("Writer"), ctWriterLabel_);
+    ctForm->addRow(QStringLiteral("PVCAM Ring"), ctPvcamRingLabel_);
     ctForm->addRow(QStringLiteral("Buffer"), ctBufferLabel_);
     ctForm->addRow(QStringLiteral("Frame Timing"), ctFrameTimingLabel_);
     ctForm->addRow(ctButtonWidget);
@@ -1854,9 +2015,19 @@ MainWindow::MainWindow(QWidget* parent)
             appendLog(QStringLiteral("Failed to load last_session.json: %1").arg(loadError));
         }
     }
+    QString timingCacheError;
+    if (!timingProfileCache_.load(timingProfileCachePath(), &timingCacheError))
+    {
+        appendLog(QStringLiteral("Timing profile cache unavailable; starting empty: %1").arg(timingCacheError));
+    }
+    else if (restoreTimingProfileForCurrentUi(true))
+    {
+        appendLog(QStringLiteral("Timing profile cache loaded: %1 profile(s).").arg(timingProfileCache_.size()));
+    }
     appendLog(QStringLiteral("App executable: %1").arg(QCoreApplication::applicationFilePath()));
     appendLog(QStringLiteral("Build stamp: %1 %2")
         .arg(QString::fromLatin1(__DATE__), QString::fromLatin1(__TIME__)));
+    inspectInterruptedCtSession();
     writeStartupTrace(QStringLiteral("MainWindow ctor complete"));
     QTimer::singleShot(0, this, &MainWindow::startNextQueuedReconstruction);
     QTimer::singleShot(5000, this, [this]() {
@@ -1889,6 +2060,7 @@ void MainWindow::applyDefaults()
 
 void MainWindow::applyConfig(const AppConfig& config)
 {
+    applyingConfig_ = true;
     sessionConfig_ = config;
     watchDirEdit_->setText(config.io.watchDir);
     saveDirEdit_->setText(config.io.saveDir);
@@ -1943,14 +2115,18 @@ void MainWindow::applyConfig(const AppConfig& config)
     ctBeginningAngleSpin_->setValue(config.ctAcquisitionUi.beginningAngleDeg);
     if (ctModeTabs_)
     {
-        const int tabIndex = config.ctAcquisitionUi.modeIndex == 0 ? kCtTabStep : kCtTabTiming;
+        const int tabIndex = config.ctAcquisitionUi.modeIndex == 1
+            ? kCtTabFly
+            : (config.ctAcquisitionUi.modeIndex == 2 ? kCtTabTimeSeries : kCtTabStep);
         ctModeTabs_->setCurrentIndex(tabIndex);
     }
     ctSavePathEdit_->setText(config.ctAcquisitionUi.savePath);
     ctProjectionNumSpin_->setValue(config.ctAcquisitionUi.projectionNum);
-    ctFlatGapSpin_->setValue(config.ctAcquisitionUi.flatGap);
-    ctFlatMoveSpin_->setValue(config.ctAcquisitionUi.flatMoveUm);
-    ctFlatNumSpin_->setValue(config.ctAcquisitionUi.flatNum);
+    ctStepFlatGapSpin_->setValue(config.ctAcquisitionUi.stepFlatGap);
+    ctStepFlatMoveSpin_->setValue(config.ctAcquisitionUi.stepFlatMoveUm);
+    ctStepFlatNumSpin_->setValue(config.ctAcquisitionUi.stepFlatNum);
+    ctFlyFlatMoveSpin_->setValue(config.ctAcquisitionUi.flyFlatMoveUm);
+    ctFlyFlatNumSpin_->setValue(config.ctAcquisitionUi.flyFlatNum);
     if (ctTimeSeriesRawFrameStrideSpin_)
     {
         ctTimeSeriesRawFrameStrideSpin_->setValue(config.ctAcquisitionUi.rawFrameStride);
@@ -1993,6 +2169,12 @@ void MainWindow::applyConfig(const AppConfig& config)
     updateCtModeUiState();
     updateReconMethodUiState();
     updateCtFlyDerivedParams();
+    applyingConfig_ = false;
+    if (!restoreTimingProfileForCurrentUi(false))
+    {
+        timingCalibrationValid_ = false;
+        timingCalibrationFromCache_ = false;
+    }
 }
 
 AppConfig MainWindow::configFromUi() const
@@ -2060,9 +2242,11 @@ AppConfig MainWindow::configFromUi() const
         : (selectedTab == kCtTabTimeSeries ? 2 : 0);
     cfg.ctAcquisitionUi.savePath = ctSavePathEdit_->text();
     cfg.ctAcquisitionUi.projectionNum = ctProjectionNumSpin_->value();
-    cfg.ctAcquisitionUi.flatGap = ctFlatGapSpin_->value();
-    cfg.ctAcquisitionUi.flatMoveUm = ctFlatMoveSpin_->value();
-    cfg.ctAcquisitionUi.flatNum = ctFlatNumSpin_->value();
+    cfg.ctAcquisitionUi.stepFlatGap = ctStepFlatGapSpin_->value();
+    cfg.ctAcquisitionUi.stepFlatMoveUm = ctStepFlatMoveSpin_->value();
+    cfg.ctAcquisitionUi.stepFlatNum = ctStepFlatNumSpin_->value();
+    cfg.ctAcquisitionUi.flyFlatMoveUm = ctFlyFlatMoveSpin_->value();
+    cfg.ctAcquisitionUi.flyFlatNum = ctFlyFlatNumSpin_->value();
     cfg.ctAcquisitionUi.flyLeadAngleDeg = ctFlyDerivedLeadAngleDeg_;
     cfg.ctAcquisitionUi.rawFrameStride = ctTimeSeriesRawFrameStrideSpin_
         ? ctTimeSeriesRawFrameStrideSpin_->value()
@@ -2102,6 +2286,148 @@ bool MainWindow::saveSessionConfig()
 QString MainWindow::sessionConfigPath() const
 {
     return QDir(QCoreApplication::applicationDirPath()).filePath(QStringLiteral("last_session.json"));
+}
+
+QString MainWindow::timingProfileCachePath() const
+{
+    return QDir(QCoreApplication::applicationDirPath()).filePath(QStringLiteral("timing_profiles.json"));
+}
+
+QString MainWindow::ctRecoveryStatePath() const
+{
+    return QDir(QCoreApplication::applicationDirPath()).filePath(QStringLiteral("ct_recovery_state.json"));
+}
+
+void MainWindow::writeCtRecoveryState(const QString& state, const QString& detail)
+{
+    QJsonObject stateObject;
+    stateObject[QStringLiteral("STATE")] = state;
+    stateObject[QStringLiteral("DETAIL")] = detail;
+    stateObject[QStringLiteral("UPDATED_AT")] = QDateTime::currentDateTime().toString(Qt::ISODateWithMs);
+    if (!writeJsonFileAtomic(ctRecoveryStatePath(), stateObject))
+    {
+        appendLog(QStringLiteral("CT recovery state write failed: %1").arg(ctRecoveryStatePath()));
+    }
+}
+
+void MainWindow::inspectInterruptedCtSession()
+{
+    QJsonObject state;
+    QString error;
+    if (!readJsonFile(ctRecoveryStatePath(), &state, &error))
+    {
+        if (QFileInfo::exists(ctRecoveryStatePath()))
+        {
+            appendLog(QStringLiteral("CT recovery state unreadable: %1").arg(error));
+        }
+        return;
+    }
+    const QString value = state.value(QStringLiteral("STATE")).toString();
+    if (value == QStringLiteral("RUNNING") || value == QStringLiteral("STOPPING"))
+    {
+        ctRecoveryPending_ = true;
+        appendLog(QStringLiteral("Previous CT session was interrupted at %1. Hardware recovery is required before a new CT.")
+            .arg(state.value(QStringLiteral("UPDATED_AT")).toString()));
+    }
+}
+
+TimingProfileKey MainWindow::timingProfileKeyFromUi() const
+{
+    TimingProfileKey key;
+    key.cameraIdentity = QStringLiteral("Kinetix/PVCAM");
+    key.readoutMode = QStringLiteral("16-bit Dynamic Range");
+    key.triggerMode = QStringLiteral("internal_timed");
+    const PvcamTimingCalibrationSettings settings = timingCalibrationSettingsFromUi();
+    PvcamCaptureSettings exposureSettings;
+    exposureSettings.exposureValue = settings.exposureValue;
+    exposureSettings.exposureUnit = settings.exposureUnit;
+    key.exposureMs = exposureMsFromSettings(exposureSettings);
+    key.roiX = cameraRoiXSpin_ ? cameraRoiXSpin_->value() : 0;
+    key.roiY = cameraRoiYSpin_ ? cameraRoiYSpin_->value() : 0;
+    key.roiWidth = cameraRoiWidthSpin_ ? cameraRoiWidthSpin_->value() : 3200;
+    key.roiHeight = cameraRoiHeightSpin_ ? cameraRoiHeightSpin_->value() : 3200;
+    return key;
+}
+
+bool MainWindow::restoreTimingProfileForCurrentUi(bool logHit)
+{
+    const TimingProfileKey key = timingProfileKeyFromUi();
+    const TimingProfile* profile = timingProfileCache_.find(key);
+    if (profile == nullptr)
+    {
+        return false;
+    }
+    timingCalibrationSettings_ = timingCalibrationSettingsFromUi();
+    timingCalibrationResult_ = {};
+    timingCalibrationResult_.ok = profile->analysis.valid;
+    timingCalibrationResult_.message = QStringLiteral("Timing restored from cached profile.");
+    timingCalibrationResult_.timingSource = profile->timingSource;
+    timingCalibrationResult_.exposureMs = key.exposureMs;
+    timingCalibrationResult_.roiX = key.roiX;
+    timingCalibrationResult_.roiY = key.roiY;
+    timingCalibrationResult_.roiWidth = key.roiWidth;
+    timingCalibrationResult_.roiHeight = key.roiHeight;
+    timingCalibrationResult_.bitDepth = profile->bitDepth;
+    timingCalibrationResult_.metadataVersion = profile->metadataVersion;
+    timingCalibrationResult_.cameraName = profile->cameraName;
+    timingCalibrationResult_.cameraPartNumber = profile->cameraPartNumber;
+    timingCalibrationResult_.cameraSerial = profile->cameraSerial;
+    timingCalibrationResult_.readoutMode = profile->key.readoutMode;
+    timingCalibrationResult_.readoutPort = profile->readoutPort;
+    timingCalibrationResult_.readoutSpeed = profile->readoutSpeed;
+    timingCalibrationResult_.gain = profile->gain;
+    timingCalibrationResult_.triggerMode = profile->key.triggerMode;
+    timingCalibrationResult_.binningX = profile->key.binningX;
+    timingCalibrationResult_.binningY = profile->key.binningY;
+    timingCalibrationResult_.analysis = profile->analysis;
+    timingCalibrationFromCache_ = true;
+    if (logHit)
+    {
+        appendLog(QStringLiteral("Timing cache hit: %1 fps, period=%2 ms, ROI=%3x%4, exposure=%5 ms.")
+            .arg(profile->analysis.rawFrameRateFps, 0, 'f', 3)
+            .arg(profile->analysis.fittedPeriodMs, 0, 'f', 6)
+            .arg(key.roiWidth)
+            .arg(key.roiHeight)
+            .arg(key.exposureMs, 0, 'f', 3));
+    }
+    handleTimingCalibrationResult(timingCalibrationResult_);
+    if (timingProfileCache_.markUsed(key, QDateTime::currentDateTime().toString(Qt::ISODateWithMs)))
+    {
+        QString error;
+        if (!timingProfileCache_.saveAtomic(timingProfileCachePath(), &error))
+        {
+            appendLog(QStringLiteral("Failed to update timing_profiles.json last-used time: %1").arg(error));
+        }
+    }
+    return timingCalibrationValid_;
+}
+
+void MainWindow::storeTimingProfile(const PvcamTimingCalibrationResult& result)
+{
+    if (!result.ok || !result.analysis.valid)
+    {
+        return;
+    }
+    TimingProfile profile;
+    profile.key = timingProfileKeyFromUi();
+    profile.cameraName = result.cameraName;
+    profile.cameraPartNumber = result.cameraPartNumber;
+    profile.cameraSerial = result.cameraSerial;
+    profile.bitDepth = result.bitDepth;
+    profile.metadataVersion = result.metadataVersion;
+    profile.timingSource = result.timingSource;
+    profile.readoutPort = result.readoutPort;
+    profile.readoutSpeed = result.readoutSpeed;
+    profile.gain = result.gain;
+    profile.analysis = result.analysis;
+    profile.calibratedAt = QDateTime::currentDateTime().toString(Qt::ISODateWithMs);
+    profile.lastUsedAt = profile.calibratedAt;
+    timingProfileCache_.upsert(std::move(profile));
+    QString error;
+    if (!timingProfileCache_.saveAtomic(timingProfileCachePath(), &error))
+    {
+        appendLog(QStringLiteral("Failed to save timing_profiles.json: %1").arg(error));
+    }
 }
 
 void MainWindow::setBusy(bool busy)
@@ -2164,6 +2490,7 @@ void MainWindow::invalidateTimingCalibration(const QString& reason)
 {
     const bool wasValid = timingCalibrationValid_;
     timingCalibrationValid_ = false;
+    timingCalibrationFromCache_ = false;
     timingInvalidReason_ = reason;
     if (ctTimingStatusValueLabel_)
     {
@@ -2188,6 +2515,11 @@ void MainWindow::invalidateTimingCalibration(const QString& reason)
             .arg(cameraRoiHeightSpin_ ? cameraRoiHeightSpin_->value() : 0)
             .arg(cameraRoiXSpin_ ? cameraRoiXSpin_->value() : 0)
             .arg(cameraRoiYSpin_ ? cameraRoiYSpin_->value() : 0));
+    }
+    if (!applyingConfig_ && !timingCalibrationRunning_ && !ctRunning_
+        && restoreTimingProfileForCurrentUi(true))
+    {
+        return;
     }
     if (wasValid)
     {
@@ -2232,6 +2564,7 @@ void MainWindow::startTimingCalibration()
     timingCalibrationSettings_ = timingCalibrationSettingsFromUi();
     timingCalibrationRunning_ = true;
     timingCalibrationValid_ = false;
+    timingCalibrationFromCache_ = false;
     timingInvalidReason_.clear();
     if (ctTimingStatusValueLabel_)
     {
@@ -2274,11 +2607,13 @@ void MainWindow::handleTimingCalibrationResult(const PvcamTimingCalibrationResul
     if (ctTimingStatusValueLabel_)
     {
         ctTimingStatusValueLabel_->setText(timingCalibrationValid_
-            ? (result.analysis.stable ? QStringLiteral("Ready") : QStringLiteral("Ready (warning)"))
+            ? (timingCalibrationFromCache_ ? QStringLiteral("Cached")
+                : (result.analysis.stable ? QStringLiteral("Ready") : QStringLiteral("Ready (warning)")))
             : QStringLiteral("Failed"));
         ctTimingStatusValueLabel_->setStyleSheet(!timingCalibrationValid_
             ? QStringLiteral("color:#b00020;")
-            : (result.analysis.stable ? QStringLiteral("color:#1b7f3a;") : QStringLiteral("color:#9a6700;")));
+            : (timingCalibrationFromCache_ || result.analysis.stable
+                ? QStringLiteral("color:#1b7f3a;") : QStringLiteral("color:#9a6700;")));
     }
     if (ctTimingSourceValueLabel_)
     {
@@ -2378,10 +2713,20 @@ void MainWindow::handleTimingCalibrationResult(const PvcamTimingCalibrationResul
     cameraRoiYSpin_->setEnabled(!ctRunning_);
     cameraRoiWidthSpin_->setEnabled(!ctRunning_);
     cameraRoiHeightSpin_->setEnabled(!ctRunning_);
-    if (ctTimingCalibrateButton_) { ctTimingCalibrateButton_->setEnabled(!ctRunning_); }
+    if (ctTimingCalibrateButton_)
+    {
+        ctTimingCalibrateButton_->setEnabled(!ctRunning_);
+        ctTimingCalibrateButton_->setText(timingCalibrationFromCache_
+            ? QStringLiteral("Re-test Timing") : QStringLiteral("Calibrate Timing"));
+    }
     updateCtModeUiState();
     updateCtFlyDerivedParams();
     updateCtTimeSeriesDerivedParams();
+
+    if (timingCalibrationValid_ && !timingCalibrationFromCache_)
+    {
+        storeTimingProfile(result);
+    }
 
     const bool startSmokeAcquisition = ctSmokeWaitingForTiming_;
     const bool restoreLive = timingRestoreLiveAfterFinish_ && !startSmokeAcquisition;
@@ -2444,17 +2789,25 @@ void MainWindow::updateCtModeUiState()
     {
         ctBeginningAngleSpin_->setEnabled(controlsEnabled && (stepMode || flyMode));
     }
-    if (ctFlatGapSpin_)
+    if (ctStepFlatGapSpin_)
     {
-        ctFlatGapSpin_->setEnabled(controlsEnabled && stepMode);
+        ctStepFlatGapSpin_->setEnabled(controlsEnabled && stepMode);
     }
-    if (ctFlatMoveSpin_)
+    if (ctStepFlatMoveSpin_)
     {
-        ctFlatMoveSpin_->setEnabled(controlsEnabled && (stepMode || flyMode));
+        ctStepFlatMoveSpin_->setEnabled(controlsEnabled && stepMode);
     }
-    if (ctFlatNumSpin_)
+    if (ctStepFlatNumSpin_)
     {
-        ctFlatNumSpin_->setEnabled(controlsEnabled && (stepMode || flyMode));
+        ctStepFlatNumSpin_->setEnabled(controlsEnabled && stepMode);
+    }
+    if (ctFlyFlatMoveSpin_)
+    {
+        ctFlyFlatMoveSpin_->setEnabled(controlsEnabled && flyMode);
+    }
+    if (ctFlyFlatNumSpin_)
+    {
+        ctFlyFlatNumSpin_->setEnabled(controlsEnabled && flyMode);
     }
     if (ctTimeSeriesRawFrameStrideSpin_)
     {
@@ -2855,6 +3208,10 @@ void MainWindow::updateCtProgressUi()
 
 void MainWindow::appendLog(const QString& text)
 {
+    if (isRoutineMotorLog(text))
+    {
+        return;
+    }
     const QDateTime now = QDateTime::currentDateTime();
     const QString uiText = QStringLiteral("[%1] %2").arg(now.toString(QStringLiteral("HH:mm:ss.zzz")), text);
     logEdit_->append(uiText);
@@ -2986,6 +3343,22 @@ void MainWindow::startCameraWorker()
                     .arg(ctFramePoolPeak_)
                     .arg(inUseGiB, 0, 'f', 1)
                     .arg(capacityGiB, 0, 'f', 1));
+            }
+        });
+    connect(cameraWorker_, &PvcamCameraWorker::continuousRingStatsChanged, this,
+        [this](int estimatedUnread, int capacity, int peakEstimatedUnread) {
+            ctPvcamRingEstimatedUnread_ = estimatedUnread;
+            ctPvcamRingCapacity_ = capacity;
+            ctPvcamRingPeakEstimatedUnread_ = std::max(ctPvcamRingPeakEstimatedUnread_, peakEstimatedUnread);
+            const qint64 nowMs = QDateTime::currentMSecsSinceEpoch();
+            if (ctPvcamRingLabel_ && (ctPvcamRingLastUiUpdateMs_ == 0
+                || nowMs - ctPvcamRingLastUiUpdateMs_ >= 100))
+            {
+                ctPvcamRingLastUiUpdateMs_ = nowMs;
+                ctPvcamRingLabel_->setText(QStringLiteral("estimated unread %1 / %2 | peak %3")
+                    .arg(estimatedUnread)
+                    .arg(capacity)
+                    .arg(ctPvcamRingPeakEstimatedUnread_));
             }
         });
     connect(cameraWorker_, &PvcamCameraWorker::continuousTimingStatsChanged, this,
@@ -3774,6 +4147,11 @@ void MainWindow::startCtAcquisition()
         appendLog(QStringLiteral("CT acquisition is already running."));
         return;
     }
+    if (ctRecoveryPending_ && !ctRecoveryConfirmed_)
+    {
+        appendLog(QStringLiteral("CT acquisition blocked: previous interrupted session has not been confirmed idle. Wait for CT recovery or reconnect Kohzu."));
+        return;
+    }
     if (!cameraWorker_ || !ctWriter_)
     {
         appendLog(QStringLiteral("CT acquisition failed: camera or writer is unavailable."));
@@ -3830,6 +4208,32 @@ void MainWindow::startCtAcquisition()
     }
     updateCtFlyDerivedParams();
 
+    // The derived Fly speed is constrained by the configured R-axis top
+    // speed.  updateCtFlyDerivedParams() already exposes this as a red
+    // validation warning, but the acquisition path must enforce it before
+    // arming PVCAM or sending WTB/APS.  Otherwise short exposures or very
+    // small projection counts can produce multi-megapulse/s tables that the
+    // ARIES controller rejects with WTB 607.
+    if (requestedFlyMode)
+    {
+        const auto rIt = motorAxes_.constFind(QStringLiteral("R"));
+        const double configuredTopSpeed = rIt != motorAxes_.constEnd() && rIt->speedSpin
+            ? rIt->speedSpin->value()
+            : 0.0;
+        if (rIt == motorAxes_.constEnd() || configuredTopSpeed <= 0.0)
+        {
+            appendLog(QStringLiteral("CT acquisition failed: R Top Speed/s is not configured."));
+            return;
+        }
+        if (ctFlyDerivedSpeedDegPerSec_ > configuredTopSpeed * (1.0 + 1e-9))
+        {
+            appendLog(QStringLiteral("CT acquisition failed: derived Fly speed %1 deg/s exceeds R Top Speed/s %2 deg/s; WTB was not sent.")
+                .arg(ctFlyDerivedSpeedDegPerSec_, 0, 'f', 6)
+                .arg(configuredTopSpeed, 0, 'f', 6));
+            return;
+        }
+    }
+
     const MotorAxisUi* rAxis = requestedTimeSeriesMode ? nullptr : &motorAxes_[QStringLiteral("R")];
     const MotorAxisUi* yAxis = requestedTimeSeriesMode ? nullptr : &motorAxes_[QStringLiteral("Y")];
     ctSettings_ = {};
@@ -3841,9 +4245,9 @@ void MainWindow::startCtAcquisition()
     ctSettings_.savePath = savePath;
     ctSettings_.beginningAngleDeg = ctBeginningAngleSpin_->value();
     ctSettings_.projectionCount = ctProjectionNumSpin_->value();
-    ctSettings_.flatGap = ctFlatGapSpin_->value();
-    ctSettings_.flatMoveDistanceUm = ctFlatMoveSpin_->value();
-    ctSettings_.flatCount = ctFlatNumSpin_->value();
+    ctSettings_.flatGap = requestedFlyMode ? 0 : ctStepFlatGapSpin_->value();
+    ctSettings_.flatMoveDistanceUm = requestedFlyMode ? ctFlyFlatMoveSpin_->value() : ctStepFlatMoveSpin_->value();
+    ctSettings_.flatCount = requestedFlyMode ? ctFlyFlatNumSpin_->value() : ctStepFlatNumSpin_->value();
     ctSettings_.flySpeedDegPerSec = std::max(1e-6, ctFlyDerivedSpeedDegPerSec_);
     ctSettings_.flyLeadAngleDeg = std::max(0.0, ctFlyDerivedLeadAngleDeg_);
     ctSettings_.flyFrameIntervalMs = ctFlyDerivedFrameIntervalMs_;
@@ -4022,6 +4426,14 @@ void MainWindow::startCtAcquisition()
     ctContinuousIntervalFallbackReason_.clear();
     ctContinuousTimingStats_ = {};
     ctContinuousTimingDriftLevel_ = 0;
+    ctPvcamRingEstimatedUnread_ = 0;
+    ctPvcamRingCapacity_ = 0;
+    ctPvcamRingPeakEstimatedUnread_ = 0;
+    ctPvcamRingLastUiUpdateMs_ = 0;
+    if (ctPvcamRingLabel_)
+    {
+        ctPvcamRingLabel_->setText(QStringLiteral("Inactive"));
+    }
     ctPendingFinishErrorMessage_.clear();
     ctFlyFlatStage_ = 0;
     ctFlyContinuousFramesReceived_ = 0;
@@ -4063,6 +4475,8 @@ void MainWindow::startCtAcquisition()
     ctEstimatedTotalFrames_ = estimateCtTotalFrames();
     ctEstimatedTotalSeconds_ = estimateCtAcquisitionSeconds(ctEstimatedTotalFrames_);
     ctRunning_ = true;
+    writeCtRecoveryState(QStringLiteral("RUNNING"), QStringLiteral("%1 acquisition started.")
+        .arg(ctSettings_.mode == CtAcquisitionMode::FlyScan ? QStringLiteral("FlyScan") : QStringLiteral("StepAndShoot")));
 
     ctStartButton_->setEnabled(false);
     ctStopButton_->setEnabled(true);
@@ -4088,9 +4502,11 @@ void MainWindow::startCtAcquisition()
     if (ctModeTabs_) { ctModeTabs_->setEnabled(false); }
     ctSavePathEdit_->setEnabled(false);
     ctProjectionNumSpin_->setEnabled(false);
-    ctFlatGapSpin_->setEnabled(false);
-    ctFlatMoveSpin_->setEnabled(false);
-    ctFlatNumSpin_->setEnabled(false);
+    ctStepFlatGapSpin_->setEnabled(false);
+    ctStepFlatMoveSpin_->setEnabled(false);
+    ctStepFlatNumSpin_->setEnabled(false);
+    ctFlyFlatMoveSpin_->setEnabled(false);
+    ctFlyFlatNumSpin_->setEnabled(false);
     ctTiffThreadsSpin_->setEnabled(false);
     if (ctFlyAllowedBlurSpin_) { ctFlyAllowedBlurSpin_->setEnabled(false); }
     if (ctTimeSeriesRawFrameStrideSpin_) { ctTimeSeriesRawFrameStrideSpin_->setEnabled(false); }
@@ -4102,15 +4518,11 @@ void MainWindow::startCtAcquisition()
     // while a writer thread is writing it. Keep one slot free for the camera
     // thread itself, otherwise a full writer queue can exhaust the frame pool
     // before the next ring frame has been copied and unlocked.
-    const bool continuousMode = ctSettings_.mode == CtAcquisitionMode::FlyScan
-        || ctSettings_.mode == CtAcquisitionMode::TimeSeries2D;
     const int requestedWriterThreads = std::max(1, ctSettings_.tiffThreads);
-    ctWriterThreads_ = continuousMode
-        ? std::min(requestedWriterThreads, kContinuousTiffWriterThreadLimit)
-        : requestedWriterThreads;
-    if (continuousMode && ctWriterThreads_ != requestedWriterThreads)
+    ctWriterThreads_ = std::min(requestedWriterThreads, kAcquisitionWriterThreadLimit);
+    if (ctWriterThreads_ != requestedWriterThreads)
     {
-        appendLog(QStringLiteral("Continuous Fly/2D capture limits TIFF writers to %1 threads (requested %2) to protect PVCAM ring readout.")
+        appendLog(QStringLiteral("Acquisition limits TIFF writers to %1 threads (requested %2).")
             .arg(ctWriterThreads_)
             .arg(requestedWriterThreads));
     }
@@ -4158,7 +4570,9 @@ void MainWindow::startCtAcquisition()
             routeSettings.previewIntervalMs = 50;
             ctContinuousRouter_->configure(routeSettings, ctWriter_);
             ctContinuousRouter_->start();
-            ctContinuousFrameBaseCount_ = ctFrameSavedCount_;
+            // The actual base is captured immediately before the continuous
+            // camera starts. Fly may save start flats after this router setup.
+            ctContinuousFrameBaseCount_ = 0;
             cameraWorker_->setContinuousFrameSink(ctContinuousRouter_);
             appendLog(routeSettings.previewEnabled
                 ? QStringLiteral("Continuous frame router enabled: direct writer path, latest preview every 50 ms.")
@@ -4221,6 +4635,7 @@ void MainWindow::stopCtAcquisition()
         return;
     }
     ctStopRequested_ = true;
+    writeCtRecoveryState(QStringLiteral("STOPPING"), QStringLiteral("User requested CT stop; hardware shutdown in progress."));
     ctRestoreLiveAfterFinish_ = false;
     ++liveRestoreGeneration_;
     appendLog(QStringLiteral("Stopping CT acquisition."));
@@ -4247,6 +4662,7 @@ void MainWindow::stopCtAcquisition()
     }
     if (kohzuController_ && ctSettings_.mode != CtAcquisitionMode::TimeSeries2D)
     {
+        ctHardwareStopPending_ = true;
         QMetaObject::invokeMethod(kohzuController_, "stopAllAxes", Qt::QueuedConnection);
     }
     if (ctWriter_)
@@ -4349,13 +4765,13 @@ void MainWindow::maybeStartCtSmokeAutostart()
     ctProjectionNumSpin_->setValue(qEnvironmentVariableIntValue("CT_SMOKE_PROJECTIONS") > 0
             ? qEnvironmentVariableIntValue("CT_SMOKE_PROJECTIONS")
             : 5);
-    ctFlatGapSpin_->setValue(qEnvironmentVariableIntValue("CT_SMOKE_FLAT_GAP") > 0
+    ctStepFlatGapSpin_->setValue(qEnvironmentVariableIntValue("CT_SMOKE_FLAT_GAP") > 0
             ? qEnvironmentVariableIntValue("CT_SMOKE_FLAT_GAP")
             : 2);
-    ctFlatMoveSpin_->setValue(qEnvironmentVariable("CT_SMOKE_FLAT_MOVE_UM").isEmpty()
+    ctStepFlatMoveSpin_->setValue(qEnvironmentVariable("CT_SMOKE_FLAT_MOVE_UM").isEmpty()
             ? (flyMode ? 10000.0 : 10.0)
             : qEnvironmentVariable("CT_SMOKE_FLAT_MOVE_UM").toDouble());
-    ctFlatNumSpin_->setValue(qEnvironmentVariableIntValue("CT_SMOKE_FLAT_NUM") > 0
+    ctStepFlatNumSpin_->setValue(qEnvironmentVariableIntValue("CT_SMOKE_FLAT_NUM") > 0
             ? qEnvironmentVariableIntValue("CT_SMOKE_FLAT_NUM")
             : (flyMode ? 2 : 1));
     ctTiffThreadsSpin_->setValue(qEnvironmentVariableIntValue("CT_SMOKE_TIFF_THREADS") > 0
@@ -4385,8 +4801,8 @@ void MainWindow::maybeStartCtSmokeAutostart()
         .arg(cameraRoiHeightSpin_->value())
         .arg(cameraExposureSpin_->value(), 0, 'f', 4)
         .arg(ctProjectionNumSpin_->value())
-        .arg(ctFlatGapSpin_->value())
-        .arg(ctFlatMoveSpin_->value(), 0, 'f', 4));
+        .arg(ctStepFlatGapSpin_->value())
+        .arg(ctStepFlatMoveSpin_->value(), 0, 'f', 4));
     if (stepMode)
     {
         ctSmokeAcquisitionStarted_ = true;
@@ -4662,7 +5078,7 @@ void MainWindow::startInternalCtReplay()
     cameraPreviewView_->resetTransform();
     cameraPreviewFitInitialized_ = false;
 
-    ctWriterThreads_ = ctSettings_.tiffThreads;
+    ctWriterThreads_ = std::min(std::max(1, ctSettings_.tiffThreads), kAcquisitionWriterThreadLimit);
     ctWriterQueueCapacity_ = kCtFramePoolCapacity;
     ctWriterFrameBytes_ = static_cast<qint64>(std::max(1, ctSettings_.camera.roiWidth))
         * static_cast<qint64>(std::max(1, ctSettings_.camera.roiHeight)) * static_cast<qint64>(2);
@@ -4671,7 +5087,7 @@ void MainWindow::startInternalCtReplay()
     ctBufferLabel_->setText(QStringLiteral("0 / %1 frames, 0.0 / %2 GiB")
         .arg(ctWriterQueueCapacity_)
         .arg(static_cast<double>(ctWriterQueueCapacity_) * static_cast<double>(ctWriterFrameBytes_) / (1024.0 * 1024.0 * 1024.0), 0, 'f', 1));
-    QMetaObject::invokeMethod(ctWriter_, [writer = ctWriter_, threads = ctSettings_.tiffThreads]() {
+    QMetaObject::invokeMethod(ctWriter_, [writer = ctWriter_, threads = ctWriterThreads_]() {
         writer->configure(threads, kCtFramePoolCapacity);
         writer->start();
     }, Qt::QueuedConnection);
@@ -4953,6 +5369,8 @@ void MainWindow::startCtFlyScanMove()
     flySettings.rawFrameLimit = 0;
     ctFlyRawFramePlan_ = 1 + std::max(0, keptFrameCount - 1) * std::max(1, ctSettings_.rawFrameStride);
     ctCurrentFrameBatchStartedMs_ = QDateTime::currentMSecsSinceEpoch();
+    // Preserve frames saved before free-run begins, notably the Fly start-flat group.
+    ctContinuousFrameBaseCount_ = ctFrameSavedCount_;
     QMetaObject::invokeMethod(cameraWorker_, "endPreparedCapture", Qt::QueuedConnection);
     QMetaObject::invokeMethod(cameraWorker_, "startContinuousCapture", Qt::QueuedConnection,
         Q_ARG(ct::PvcamCaptureSettings, flySettings));
@@ -5051,6 +5469,7 @@ void MainWindow::startCtTimeSeriesCapture()
     settings.ringFrameCount = 192;
     settings.waitForFrameGate = false;
     settings.rawFrameLimit = 0;
+    ctContinuousFrameBaseCount_ = ctFrameSavedCount_;
 
     appendLog(QStringLiteral("2D time series camera arming: frames=%1, exposure=%2 ms, raw period=%3 ms, raw stride=%4, actual interval=%5 ms, estimated total=%6.")
         .arg(settings.frameCount)
@@ -5082,7 +5501,10 @@ void MainWindow::startCtMotorSpeedTableSetup()
         QMetaObject::invokeMethod(kohzuController_, "setIdlePollingEnabled", Qt::QueuedConnection,
             Q_ARG(bool, false));
     }
-    appendLog(QStringLiteral("CT motor setup: preloading R/Y speed table %1 once for this acquisition.").arg(kCtStepSpeedTable));
+    appendLog(ctSettings_.mode == CtAcquisitionMode::FlyScan
+        ? QStringLiteral("CT motor setup: preloading R/Y positioning profiles; Fly R profile will be written after lead idle.")
+        : QStringLiteral("CT motor setup: preloading R/Y step speed table %1 once for this acquisition.")
+            .arg(kCtStepSpeedTable));
     sendNextCtMotorSpeedTableSetup();
 }
 
@@ -5120,14 +5542,42 @@ void MainWindow::sendNextCtMotorSpeedTableSetup()
         return;
     }
 
+    const double configuredBaseSpeed = it->baseSpeedSpin ? it->baseSpeedSpin->value() : 1.0;
+    const double configuredTopSpeed = it->speedSpin ? it->speedSpin->value() : 2.0;
+    double configuredAccel = it->accelSpin ? it->accelSpin->value() : 0.5;
+    // A normal 1.5 s ramp is appropriate for long positioning moves and for
+    // the Fly lead/sweep.  It is pathological for fine step-and-shoot CT:
+    // at 1080 projections each R move is only 0.1667 deg, so the axis spends
+    // almost the entire move accelerating and decelerating and never reaches
+    // the configured top speed.  Use a bounded short ramp only for the fine
+    // step profile; Fly and larger step angles retain the configured ramp.
+    if (ctSettings_.mode == CtAcquisitionMode::StepAndShoot
+        && axisName == QStringLiteral("R")
+        && ctSettings_.projectionCount > 0
+        && (180.0 / static_cast<double>(ctSettings_.projectionCount)) <= 1.0)
+    {
+        // 0.50 s is the conservative fine-step setting used by the other
+        // positioning axes; it materially reduces the triangular-move time
+        // without introducing the very high acceleration of a 0.10 s ramp.
+        constexpr double kFineStepAccelSeconds = 0.50;
+        configuredAccel = std::min(configuredAccel, kFineStepAccelSeconds);
+        appendLog(QStringLiteral("CT fine-step R profile: angle step=%1 deg, accel/decel=%2 s (configured=%3 s).")
+            .arg(180.0 / static_cast<double>(ctSettings_.projectionCount), 0, 'f', 6)
+            .arg(configuredAccel, 0, 'f', 2)
+            .arg(it->accelSpin ? it->accelSpin->value() : 0.5, 0, 'f', 2));
+    }
+    // All setup/lead/flat moves use the ordinary positioning profile.  The
+    // formal Fly R sweep calls configureSpeedTableAndMoveAbsolute() below and
+    // performs the one intentional WTB transition to the Fly profile after
+    // the lead move has completed and the axis has been confirmed idle.
     const MotorSpeedTableParams speedParams = makeMotorSpeedTableParams(
         QStringLiteral("CT %1").arg(axisName),
         kCtStepSpeedTable,
         it->pulsePerUnit,
         it->unit,
-        it->baseSpeedSpin ? it->baseSpeedSpin->value() : 1.0,
-        it->speedSpin ? it->speedSpin->value() : 2.0,
-        it->accelSpin ? it->accelSpin->value() : 0.5);
+        configuredBaseSpeed,
+        configuredTopSpeed,
+        configuredAccel);
     ++ctMotorSpeedSetupStage_;
     QMetaObject::invokeMethod(kohzuController_, "configureSpeedTable", Qt::QueuedConnection,
         Q_ARG(int, it->axis),
@@ -5205,10 +5655,14 @@ bool MainWindow::moveCtAxisAbsolute(const QString& axisName, double targetValue,
     ctWaitingForMotor_ = true;
     ctPendingMotorAction_ = action;
     startCtMotorTiming(action);
+    // Initial positioning and the Fly lead move deliberately retain the
+    // normal positioning table.  Only startCtFlyScanMotorSweep() changes R
+    // to the slower, exposure-defined Fly profile.
+    const int speedTable = kCtStepSpeedTable;
     QMetaObject::invokeMethod(kohzuController_, "moveAbsolutePulse", Qt::QueuedConnection,
         Q_ARG(int, it->axis),
         Q_ARG(qint64, pulse),
-        Q_ARG(int, kCtStepSpeedTable),
+        Q_ARG(int, speedTable),
         Q_ARG(QString, label));
     return true;
 }
@@ -5241,10 +5695,11 @@ bool MainWindow::moveCtAxisRelative(const QString& axisName, double deltaValue, 
     ctWaitingForMotor_ = true;
     ctPendingMotorAction_ = action;
     startCtMotorTiming(action);
+    const int speedTable = kCtStepSpeedTable;
     QMetaObject::invokeMethod(kohzuController_, "jogRelativePulse", Qt::QueuedConnection,
         Q_ARG(int, it->axis),
         Q_ARG(qint64, pulse),
-        Q_ARG(int, kCtStepSpeedTable),
+        Q_ARG(int, speedTable),
         Q_ARG(QString, label));
     return true;
 }
@@ -5707,6 +6162,12 @@ void MainWindow::finishCtAcquisition(bool ok, const QString& message)
         ++liveRestoreGeneration_;
     }
     ctRunning_ = false;
+    const bool motorNeedsStop = !ok && kohzuController_ && ctSettings_.mode != CtAcquisitionMode::TimeSeries2D;
+    const QString recoveryState = ok
+        ? QStringLiteral("COMPLETED")
+        : (motorNeedsStop ? QStringLiteral("STOPPING") : QStringLiteral("STOPPED"));
+    writeCtRecoveryState(recoveryState, message);
+    ctHardwareStopPending_ = motorNeedsStop;
     ctReplayRunning_ = false;
     ctMotorSpeedTablesReady_ = false;
     ctMotorSpeedSetupStage_ = 0;
@@ -5782,9 +6243,7 @@ void MainWindow::finishCtAcquisition(bool ok, const QString& message)
     if (ctModeTabs_) { ctModeTabs_->setEnabled(true); }
     ctSavePathEdit_->setEnabled(true);
     ctProjectionNumSpin_->setEnabled(true);
-    ctFlatGapSpin_->setEnabled(true);
-    ctFlatMoveSpin_->setEnabled(true);
-    ctFlatNumSpin_->setEnabled(true);
+    updateCtModeUiState();
     ctTiffThreadsSpin_->setEnabled(true);
     if (ctFlyAllowedBlurSpin_) { ctFlyAllowedBlurSpin_->setEnabled(true); }
     if (ctTimeSeriesRawFrameStrideSpin_) { ctTimeSeriesRawFrameStrideSpin_->setEnabled(true); }
@@ -6066,6 +6525,9 @@ void MainWindow::writeCtManifest(bool completed, const QString& errorMessage)
         : 0.0;
     timing["FRAME_POOL_CAPACITY"] = kCtFramePoolCapacity;
     timing["FRAME_POOL_PEAK"] = ctFramePoolPeak_;
+    timing["PVCAM_RING_CAPACITY"] = ctPvcamRingCapacity_;
+    timing["PVCAM_RING_ESTIMATED_UNREAD_FINAL"] = ctPvcamRingEstimatedUnread_;
+    timing["PVCAM_RING_ESTIMATED_UNREAD_PEAK"] = ctPvcamRingPeakEstimatedUnread_;
     if (ctSettings_.mode == CtAcquisitionMode::FlyScan)
     {
         timing["FLY_RAW_FRAME_PLAN"] = ctFlyRawFramePlan_;
@@ -7452,23 +7914,43 @@ void MainWindow::startMotorWorker()
         motorConnected_ = connected;
         motorConnectionLabel_->setText(connected ? QStringLiteral("Connected") : QStringLiteral("Disconnected"));
         updateMotorUiEnabled();
+        if (connected && ctRecoveryPending_ && !ctRecoveryConfirmed_)
+        {
+            appendLog(QStringLiteral("CT recovery: controller connected; checking R/Y idle state."));
+            QMetaObject::invokeMethod(kohzuController_, "recoverAfterInterruptedSession", Qt::QueuedConnection);
+        }
     });
     connect(kohzuController_, &KohzuController::axisUpdated, this, &MainWindow::updateMotorAxisPosition);
     connect(kohzuController_, &KohzuController::axisActiveChanged, this, &MainWindow::updateMotorAxisActive);
-    connect(kohzuController_, &KohzuController::logMessage, this, &MainWindow::appendLog);
+    connect(kohzuController_, &KohzuController::logMessage, this, [this](const QString& text) {
+        if (isKohzuErrorLog(text))
+        {
+            appendLog(text);
+        }
+    });
+    connect(kohzuController_, &KohzuController::commandFinished, this, [this](const QString& label, bool ok, const QString& response) {
+        if (ctHardwareStopPending_ && label == QStringLiteral("Kohzu stop all") && ok)
+        {
+            ctHardwareStopPending_ = false;
+            writeCtRecoveryState(QStringLiteral("STOPPED"), QStringLiteral("Kohzu controlled stop acknowledged."));
+        }
+        if (ctRecoveryPending_ && label == QStringLiteral("Kohzu recovery") && ok)
+        {
+            ctRecoveryConfirmed_ = true;
+            ctRecoveryPending_ = false;
+            writeCtRecoveryState(QStringLiteral("RECOVERED"), QStringLiteral("Controlled stop and idle polling completed."));
+            appendLog(QStringLiteral("CT recovery confirmed; new acquisitions are enabled."));
+        }
+        else if (ctRecoveryPending_ && label == QStringLiteral("Kohzu recovery") && !ok)
+        {
+            appendLog(QStringLiteral("CT recovery remains blocked: %1").arg(response));
+        }
+    });
     connect(kohzuController_, &KohzuController::commandFinished, this, [this](const QString& label, bool ok, const QString& response) {
         if (shuttingDown_) { return; }
-        const bool speedTableLabel = label.contains(QStringLiteral("speed"), Qt::CaseInsensitive);
-        if (!(ok && response == QStringLiteral("speed table unchanged")))
+        if (!ok)
         {
-            if (ok)
-            {
-                appendLog(speedTableLabel ? label : QStringLiteral("%1 ok").arg(label));
-            }
-            else
-            {
-                appendLog(QStringLiteral("%1 failed: %2").arg(label, response));
-            }
+            appendLog(QStringLiteral("%1 failed: %2").arg(label, response));
         }
         if (ctRunning_ && label.startsWith(QStringLiteral("CT speed table ")))
         {
