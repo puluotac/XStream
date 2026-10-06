@@ -97,6 +97,11 @@ constexpr int kCtTabTimeSeries = 3;
 // from this same bound, so a slow disk applies back-pressure instead of
 // turning every projection into a permanent RAM allocation.
 constexpr int kCtFramePoolCapacity = 128;
+// Temporary high-capacity profile for the 6500-frame full-frame 2D experiment.
+// At 3200x3200x16-bit this reserves about 133 GiB (binary).  It is deliberately
+// restricted to TimeSeries2D; Step/Fly and ordinary camera capture keep the
+// bounded pool so an accidental mode change cannot consume that memory.
+constexpr int kCtTimeSeriesFramePoolCapacity = 7000;
 
 bool previewWindowProducesClippedImage(const cv::Mat& image, const PreviewWindow& window)
 {
@@ -3335,11 +3340,12 @@ void MainWindow::startCameraWorker()
             {
                 const double inUseGiB = static_cast<double>(poolInUse) * static_cast<double>(ctWriterFrameBytes_)
                     / (1024.0 * 1024.0 * 1024.0);
-                const double capacityGiB = static_cast<double>(kCtFramePoolCapacity) * static_cast<double>(ctWriterFrameBytes_)
+                const int activeFramePoolCapacity = std::max(1, ctSettings_.camera.framePoolCapacity);
+                const double capacityGiB = static_cast<double>(activeFramePoolCapacity) * static_cast<double>(ctWriterFrameBytes_)
                     / (1024.0 * 1024.0 * 1024.0);
                 ctBufferLabel_->setText(QStringLiteral("%1 / %2 frames, peak %3, %4 / %5 GiB")
                     .arg(poolInUse)
-                    .arg(kCtFramePoolCapacity)
+                    .arg(activeFramePoolCapacity)
                     .arg(ctFramePoolPeak_)
                     .arg(inUseGiB, 0, 'f', 1)
                     .arg(capacityGiB, 0, 'f', 1));
@@ -4288,7 +4294,9 @@ void MainWindow::startCtAcquisition()
     ctSettings_.camera.roiWidth = cameraRoiWidthSpin_->value();
     ctSettings_.camera.roiHeight = cameraRoiHeightSpin_->value();
     ctSettings_.camera.queueCapacity = 1;
-    ctSettings_.camera.framePoolCapacity = kCtFramePoolCapacity;
+    ctSettings_.camera.framePoolCapacity = requestedTimeSeriesMode
+        ? kCtTimeSeriesFramePoolCapacity
+        : kCtFramePoolCapacity;
     ctSettings_.camera.ringFrameCount = 192;
     ctSettings_.camera.baselineRawFramePeriodMs = ctSettings_.rawFramePeriodMs;
     ctSettings_.camera.saveRaw = false;
@@ -4526,7 +4534,8 @@ void MainWindow::startCtAcquisition()
             .arg(ctWriterThreads_)
             .arg(requestedWriterThreads));
     }
-    const int maxQueued = std::max(1, kCtFramePoolCapacity - ctWriterThreads_ - 2);
+    const int activeFramePoolCapacity = ctSettings_.camera.framePoolCapacity;
+    const int maxQueued = std::max(1, activeFramePoolCapacity - ctWriterThreads_ - 2);
     ctWriterQueueCapacity_ = maxQueued;
     ctWriterFrameBytes_ = static_cast<qint64>(std::max(1, ctSettings_.camera.roiWidth))
         * static_cast<qint64>(std::max(1, ctSettings_.camera.roiHeight)) * static_cast<qint64>(2);
@@ -4540,7 +4549,7 @@ void MainWindow::startCtAcquisition()
     if (ctBufferLabel_)
     {
         ctBufferLabel_->setText(QStringLiteral("0 / %1 frame pool slots, 0.0 / %2 GiB")
-            .arg(kCtFramePoolCapacity)
+            .arg(activeFramePoolCapacity)
             .arg(capacityGiB, 0, 'f', 1));
     }
     // The first PVCAM frame can arrive as soon as continuous capture starts.
@@ -4597,9 +4606,9 @@ void MainWindow::startCtAcquisition()
         .arg(ctSettings_.flatCount)
         .arg(ctSettings_.autoCor ? QStringLiteral("on") : QStringLiteral("off")));
     appendLog(QStringLiteral("CT frame pool: capacity=%1 slots, frame=%2 MiB, total=%3 GiB; writer queue capacity=%4 frames.")
-        .arg(kCtFramePoolCapacity)
+        .arg(activeFramePoolCapacity)
         .arg(static_cast<double>(ctWriterFrameBytes_) / (1024.0 * 1024.0), 0, 'f', 2)
-        .arg(static_cast<double>(kCtFramePoolCapacity) * static_cast<double>(ctWriterFrameBytes_)
+        .arg(static_cast<double>(activeFramePoolCapacity) * static_cast<double>(ctWriterFrameBytes_)
             / (1024.0 * 1024.0 * 1024.0), 0, 'f', 1)
         .arg(ctWriterQueueCapacity_));
     appendLog(QStringLiteral("CT estimate: frames=%1, total=%2.")
@@ -5079,7 +5088,7 @@ void MainWindow::startInternalCtReplay()
     cameraPreviewFitInitialized_ = false;
 
     ctWriterThreads_ = std::min(std::max(1, ctSettings_.tiffThreads), kAcquisitionWriterThreadLimit);
-    ctWriterQueueCapacity_ = kCtFramePoolCapacity;
+    ctWriterQueueCapacity_ = std::max(1, ctSettings_.camera.framePoolCapacity);
     ctWriterFrameBytes_ = static_cast<qint64>(std::max(1, ctSettings_.camera.roiWidth))
         * static_cast<qint64>(std::max(1, ctSettings_.camera.roiHeight)) * static_cast<qint64>(2);
     ctWriterStartedMs_ = QDateTime::currentMSecsSinceEpoch();
@@ -5087,8 +5096,8 @@ void MainWindow::startInternalCtReplay()
     ctBufferLabel_->setText(QStringLiteral("0 / %1 frames, 0.0 / %2 GiB")
         .arg(ctWriterQueueCapacity_)
         .arg(static_cast<double>(ctWriterQueueCapacity_) * static_cast<double>(ctWriterFrameBytes_) / (1024.0 * 1024.0 * 1024.0), 0, 'f', 1));
-    QMetaObject::invokeMethod(ctWriter_, [writer = ctWriter_, threads = ctWriterThreads_]() {
-        writer->configure(threads, kCtFramePoolCapacity);
+    QMetaObject::invokeMethod(ctWriter_, [writer = ctWriter_, threads = ctWriterThreads_, queueCapacity = ctWriterQueueCapacity_]() {
+        writer->configure(threads, queueCapacity);
         writer->start();
     }, Qt::QueuedConnection);
     writeCtManifest(false, QStringLiteral("Internal CT replay running."));
@@ -5458,14 +5467,14 @@ void MainWindow::startCtTimeSeriesCapture()
 
     PvcamCaptureSettings settings = ctSettings_.camera;
     settings.frameCount = std::max(1, ctSettings_.projectionCount);
-    settings.queueCapacity = kCtFramePoolCapacity;
+    settings.queueCapacity = ctSettings_.camera.framePoolCapacity;
     settings.previewIntervalMs = 0;
     settings.selectedFrameIndices.clear();
     settings.frameIntervalMs = 0.0;
     settings.firstKeepDelayMs = 0.0;
     settings.allowFrameIntervalDecimation = false;
     settings.rawFrameStride = std::max(1, ctSettings_.rawFrameStride);
-    settings.framePoolCapacity = kCtFramePoolCapacity;
+    settings.framePoolCapacity = ctSettings_.camera.framePoolCapacity;
     settings.ringFrameCount = 192;
     settings.waitForFrameGate = false;
     settings.rawFrameLimit = 0;
@@ -6523,7 +6532,7 @@ void MainWindow::writeCtManifest(bool completed, const QString& errorMessage)
     timing["FLY_MAX_ANGLE_TIMING_ERROR_DEG"] = ctSettings_.mode == CtAcquisitionMode::FlyScan
         ? ctSettings_.flySpeedDegPerSec * ctContinuousTimingStats_.maxAbsPhaseErrorMs / 1000.0
         : 0.0;
-    timing["FRAME_POOL_CAPACITY"] = kCtFramePoolCapacity;
+    timing["FRAME_POOL_CAPACITY"] = ctSettings_.camera.framePoolCapacity;
     timing["FRAME_POOL_PEAK"] = ctFramePoolPeak_;
     timing["PVCAM_RING_CAPACITY"] = ctPvcamRingCapacity_;
     timing["PVCAM_RING_ESTIMATED_UNREAD_FINAL"] = ctPvcamRingEstimatedUnread_;

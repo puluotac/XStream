@@ -1015,7 +1015,7 @@ void PvcamCameraWorker::startCapture(const PvcamCaptureSettings& rawSettings)
     settings.roiWidth = std::max(1, settings.roiWidth);
     settings.roiHeight = std::max(1, settings.roiHeight);
     settings.queueCapacity = std::max(1, settings.queueCapacity);
-    settings.framePoolCapacity = std::clamp(settings.framePoolCapacity, 1, 4096);
+    settings.framePoolCapacity = std::clamp(settings.framePoolCapacity, 1, 7000);
     settings.filePadding = std::clamp(settings.filePadding, 1, 12);
     if (settings.previewIntervalMs > 0)
     {
@@ -1875,7 +1875,7 @@ void PvcamCameraWorker::startContinuousCapture(const PvcamCaptureSettings& rawSe
     settings.firstKeepDelayMs = std::max(0.0, settings.firstKeepDelayMs);
     settings.rawFrameStride = std::clamp(settings.rawFrameStride, 1, 1000000);
     settings.baselineRawFramePeriodMs = std::max(0.0, settings.baselineRawFramePeriodMs);
-    settings.framePoolCapacity = std::clamp(settings.framePoolCapacity, 1, 4096);
+    settings.framePoolCapacity = std::clamp(settings.framePoolCapacity, 1, 7000);
     settings.ringFrameCount = std::clamp(settings.ringFrameCount, 4, 256);
 
     stopRequested_.store(false);
