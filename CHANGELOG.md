@@ -1,5 +1,17 @@
 # Changelog
 
+## 2026-10-15 — open-source release preparation
+
+- Added `LICENSE` (Apache-2.0), `NOTICE` (third-party components and their licenses) and
+  `CITATION.cff`.
+- Rewrote `README.md`: feature overview (acquisition modes, deterministic continuous-rotation
+  timing, data path, reconstruction, provenance), requirements, build/run instructions,
+  repository layout, configuration and citation guidance.
+- Replaced the internal `docs/agent_notes.md` with a sanitised `docs/ENGINEERING_NOTES.md`
+  (camera and build pitfalls retained; internal paths and hosts removed).
+- Motor-controller default host changed from the beamline address to a loopback placeholder;
+  the BL16U2 address is documented in the README instead.
+
 ## 2026-06-23
 
 - Imported the CT Stream workstation source tree for Git-based version control.

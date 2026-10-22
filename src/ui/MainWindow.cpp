@@ -1051,7 +1051,7 @@ MainWindow::MainWindow(QWidget* parent)
     motorConnectForm->setContentsMargins(8, 8, 8, 8);
     motorConnectForm->setHorizontalSpacing(6);
     motorConnectForm->setVerticalSpacing(4);
-    motorHostEdit_ = new QLineEdit(QStringLiteral("10.30.92.201"), motorConnectGroup);
+    motorHostEdit_ = new QLineEdit(QStringLiteral("127.0.0.1"), motorConnectGroup);
     motorPortSpin_ = makeSpin<QSpinBox>(motorConnectGroup, 1, 65535, 1);
     motorPortSpin_->setValue(12321);
     motorHostEdit_->hide();

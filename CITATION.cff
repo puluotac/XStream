@@ -1,0 +1,45 @@
+cff-version: 1.2.0
+message: "If you use XStream in academic work, please cite the accompanying paper."
+title: "XStream: an integrated CT acquisition and reconstruction workstation with software-defined continuous-rotation timing"
+abstract: >-
+  XStream is a single-workstation system that integrates motorized CT acquisition,
+  pipelined storage, local GPU reconstruction and automated provenance recording for
+  parallel-beam CT at a synchrotron fast-imaging beamline. For continuous-rotation
+  (fly) scanning with a commercial free-running sCMOS camera that provides no
+  position-synchronized triggering, it implements a deterministic timing plan:
+  on-line calibration of the frame period, derivation of the maximum angular velocity
+  from an explicit edge-blur constraint, and alignment of the frame stride to an
+  integer multiple of the calibrated period.
+type: software
+license: Apache-2.0
+repository-code: "https://github.com/puluotac/XStream"
+url: "https://github.com/puluotac/XStream"
+version: 1.0.0
+date-released: 2026-10-15
+keywords:
+  - X-ray computed tomography
+  - synchrotron radiation
+  - GPU reconstruction
+  - fly scan
+  - continuous rotation
+  - sCMOS
+  - acquisition software
+authors:
+  - family-names: Zhao
+    given-names: Nixi
+    affiliation: "Shanghai Institute of Applied Physics, Chinese Academy of Sciences; Shanghai Synchrotron Radiation Facility, Shanghai Advanced Research Institute, Chinese Academy of Sciences; University of Chinese Academy of Sciences"
+  - family-names: Du
+    given-names: Kang
+    affiliation: "Shanghai Synchrotron Radiation Facility, Shanghai Advanced Research Institute, Chinese Academy of Sciences"
+  - family-names: Li
+    given-names: Ke
+    affiliation: "Shanghai Synchrotron Radiation Facility, Shanghai Advanced Research Institute, Chinese Academy of Sciences"
+  - family-names: Tao
+    given-names: Fen
+    affiliation: "Shanghai Synchrotron Radiation Facility, Shanghai Advanced Research Institute, Chinese Academy of Sciences"
+  - family-names: Du
+    given-names: Guohao
+    affiliation: "Shanghai Synchrotron Radiation Facility, Shanghai Advanced Research Institute, Chinese Academy of Sciences"
+  - family-names: Xiao
+    given-names: Tiqiao
+    affiliation: "Shanghai Synchrotron Radiation Facility, Shanghai Advanced Research Institute, Chinese Academy of Sciences"

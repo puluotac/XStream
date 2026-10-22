@@ -1,0 +1,42 @@
+XStream (formerly CT_Stream)
+Copyright 2026 The XStream Authors
+
+This product includes software developed at the Shanghai Synchrotron
+Radiation Facility (SSRF), Shanghai Advanced Research Institute, Chinese
+Academy of Sciences, and the Shanghai Institute of Applied Physics,
+Chinese Academy of Sciences.
+
+--------------------------------------------------------------------------------
+Third-party components
+--------------------------------------------------------------------------------
+
+The following components are NOT bundled with this repository. The user must
+obtain and install them separately, under their own license terms:
+
+  * Qt 6 (Widgets)          - LGPL-3.0 or commercial license, The Qt Company
+                              https://www.qt.io/
+  * OpenCV 4                - Apache License 2.0
+                              https://opencv.org/
+  * NVIDIA CUDA Toolkit,
+    cuFFT, CUDA Runtime     - NVIDIA Software License Agreement
+                              Only the runtime redistributables may be
+                              redistributed; no NVIDIA binaries are included
+                              in this repository.
+                              https://developer.nvidia.com/cuda-toolkit
+  * PVCAM SDK               - Proprietary, Teledyne Photometrics.
+                              Required only for camera acquisition; the
+                              reconstruction targets build and run without it
+                              (see the CT_HAS_PVCAM build switch).
+                              https://www.photometrics.com/
+
+Optional, used for development only:
+
+  * Visual Studio 2022 / MSVC x64
+  * CMake 3.21 or newer
+
+--------------------------------------------------------------------------------
+Citation
+--------------------------------------------------------------------------------
+
+If you use this software in academic work, please cite the accompanying paper;
+see CITATION.cff for the machine-readable record.

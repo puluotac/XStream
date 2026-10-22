@@ -142,7 +142,9 @@ struct CtAcquisitionUiConfig
 
 struct KohzuUiConfig
 {
-    QString host = "10.30.92.201";
+    // Loopback placeholder: set host/port to your own controller in the Motor panel
+    // (at BL16U2 the Kohzu ARIES controller listens on 10.30.92.201:12321).
+    QString host = "127.0.0.1";
     int port = 12321;
 };
 

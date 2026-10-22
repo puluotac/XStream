@@ -342,7 +342,7 @@ int main()
     sessionConfig.ctAcquisitionUi.rawFrameStride = 5;
     sessionConfig.ctAcquisitionUi.tiffThreads = 24;
     sessionConfig.ctFly.allowedBlurPx = 1.25;
-    sessionConfig.kohzuUi.host = "10.30.92.202";
+    sessionConfig.kohzuUi.host = "127.0.0.1";
     sessionConfig.kohzuUi.port = 12322;
     sessionConfig.io.watchDir = "E:/demo/watch";
     sessionConfig.io.saveDir = "E:/demo/save";
