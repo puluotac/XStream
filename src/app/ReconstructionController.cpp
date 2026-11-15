@@ -159,23 +159,6 @@ void ReconstructionController::stopReconstruction()
     }
 }
 
-void ReconstructionController::setPreviewSliceIndex(int index)
-{
-    latestConfig_.preview.liveSliceIndex = index;
-
-    if (reconstructionWorker_ != nullptr)
-    {
-        reconstructionWorker_->setPreviewSliceIndex(index);
-    }
-
-    if (busy_ && !latestConfig_.preview.enableLive)
-    {
-        return;
-    }
-
-    requestPreviewRender(false);
-}
-
 void ReconstructionController::startSave(const SaveRequest& request)
 {
     if (busy_ || !request.volume)
@@ -236,10 +219,8 @@ void ReconstructionController::requestPreviewRender(bool updateHistogram)
         return;
     }
 
-    const int maxSlice = std::max(0, latestVolume_->depth() - 1);
-    const int clampedIndex = std::clamp(latestConfig_.preview.liveSliceIndex, 0, maxSlice);
-    QMetaObject::invokeMethod(previewWorker_, [worker = previewWorker_, clampedIndex, updateHistogram]() {
-        worker->enqueueRender(clampedIndex, updateHistogram);
+    QMetaObject::invokeMethod(previewWorker_, [worker = previewWorker_, updateHistogram]() {
+        worker->enqueueRender(updateHistogram);
     }, Qt::QueuedConnection);
 }
 

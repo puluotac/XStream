@@ -20,7 +20,7 @@ public:
 
     void setSource(const std::shared_ptr<IReconstructionVolume>& volume, int depth);
     void clearSource();
-    void enqueueRender(int sliceIndex, bool updateHistogram);
+    void enqueueRender(bool updateHistogram);
 
 signals:
     void previewSliceReady(cv::Mat slice, bool updateHistogram);

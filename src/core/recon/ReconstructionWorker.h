@@ -26,7 +26,6 @@ public:
 
     std::shared_ptr<IReconstructionVolume> volumeBuffer() const;
     AppConfig config() const;
-    void setPreviewSliceIndex(int index);
 
 public slots:
     void process();
@@ -45,7 +44,6 @@ signals:
 private:
     AppConfig config_;
     std::atomic_bool stopRequested_ = false;
-    std::atomic_int previewSliceIndex_ = 0;
     std::shared_ptr<IReconstructionVolume> volumeBuffer_;
     std::shared_ptr<ReconstructionRuntimeCache> runtimeCache_;
 };

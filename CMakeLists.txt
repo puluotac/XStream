@@ -1,6 +1,6 @@
 ﻿cmake_minimum_required(VERSION 3.26)
 
-project(ct_workstation LANGUAGES CXX CUDA)
+project(ct_workstation VERSION 0.1.0 LANGUAGES CXX CUDA)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -168,6 +168,11 @@ qt_add_executable(ct_workstation_app
     src/ui/MainWindow.cpp
     src/ui/ZoomPanImageView.h
     src/ui/ZoomPanImageView.cpp
+)
+
+target_compile_definitions(ct_workstation_app
+    PRIVATE
+        CT_STREAM_VERSION=\"${PROJECT_VERSION}\"
 )
 
 target_link_libraries(ct_workstation_app

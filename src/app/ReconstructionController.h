@@ -29,7 +29,6 @@ public:
     void startReconstruction(const AppConfig& config);
     void stopReconstruction();
     void startSave(const SaveRequest& request);
-    void setPreviewSliceIndex(int index);
     void shutdown();
 
     bool isBusy() const;

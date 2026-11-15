@@ -23,14 +23,12 @@ class QLineEdit;
 class QTextEdit;
 class QProgressBar;
 class QPushButton;
-class QSlider;
 class QSpinBox;
 class QDoubleSpinBox;
 class QComboBox;
 class QCheckBox;
 class QCloseEvent;
 class QListWidget;
-class QFileSystemWatcher;
 class QTimer;
 class QTabWidget;
 
@@ -72,6 +70,7 @@ private:
 
     void browseWatchDir();
     void browseSaveDir();
+    void importScanManifestForUi(const QString& path);
     void browseCameraSaveDir();
     void browseCtSavePath();
     void startCameraWorker();
@@ -114,13 +113,8 @@ private:
     void writeCtManifest(bool completed, const QString& errorMessage);
     void enqueueCtReconJob();
     void enqueueCurrentReconJob();
-    QString reconQueueRoot() const;
-    void ensureReconQueueDirs();
-    void recoverStaleRunningReconJobs();
     void scheduleReconQueueRefresh();
     void refreshReconQueue();
-    void normalizePendingReconQueue(bool scheduleRefresh = true);
-    void importReconJobs();
     void moveSelectedReconQueueJob(int direction);
     void removeSelectedReconQueueJob();
     void startNextQueuedReconstruction();
@@ -135,10 +129,6 @@ private:
     void saveSlices();
     void updatePreviewSlice(const cv::Mat& slice, bool updateHistogram);
     void renderPreviewWithCurrentWindow();
-    void setPreviewSliceRange(int depth);
-    void syncPreviewSliceControls(int value);
-    void requestPreviewSlice(int value);
-    void updatePreviewSliceLabel(int value);
     void updateReconMethodUiState();
     void autoSelectZChunk();
     void startMotorWorker();
@@ -192,6 +182,9 @@ private:
     cv::Mat lastRawReconPreviewSlice_;
     PreviewWindow currentCameraPreviewWindow_;
     PreviewWindow currentReconPreviewWindow_;
+    // Camera preview starts in per-frame auto-window mode.  A user drag on the
+    // camera histogram locks the window until Live is closed and reopened.
+    bool cameraPreviewAutoWindow_ = true;
     qint64 cameraPreviewFrameCount_ = 0;
     qint64 lastCameraPreviewRenderMs_ = 0;
     double cameraPreviewScaleX_ = 1.0;
@@ -222,6 +215,9 @@ private:
     QString ctPendingMotorAction_;
     int ctProjectionIndex_ = 0;
     int ctFlatIndex_ = 0;
+    int actualCtImageWidth_ = 0;
+    int actualCtImageHeight_ = 0;
+    bool actualCtImageSizeKnown_ = false;
     int ctFlatFramesRemaining_ = 0;
     int ctFlatAfterProjectionCount_ = 0;
     int ctLastFlatAfterProjectionCount_ = -1;
@@ -230,6 +226,10 @@ private:
     QVector<QString> ctReplayJobQueue_;
     QVector<QString> ctReplayTargetQueue_;
     QVector<QString> ctReplayOutputQueue_;
+    // Reconstruction order is intentionally process-local. Each entry points
+    // directly to a reconstruction.json inside its output directory; no
+    // pending/running/done/failed queue mirror is used.
+    QVector<QString> reconQueuePaths_;
     QString activeQueueJobPath_;
     QString activeQueueProjectionDir_;
     QString activeQueueOutputDir_;
@@ -355,8 +355,6 @@ private:
     QPushButton* autoZChunkButton_ = nullptr;
     QSpinBox* gpuSpin_ = nullptr;
     QSpinBox* zBlockSpin_ = nullptr;
-    QCheckBox* livePreviewCheck_ = nullptr;
-    QSpinBox* liveSliceSpin_ = nullptr;
     QComboBox* saveDepthCombo_ = nullptr;
     QComboBox* saveFormatCombo_ = nullptr;
     QSpinBox* tiffThreadsSpin_ = nullptr;
@@ -367,7 +365,6 @@ private:
     QPushButton* reconQueueRemoveButton_ = nullptr;
     QPushButton* reconQueueCurrentButton_ = nullptr;
     QPushButton* reconQueueImportButton_ = nullptr;
-    QFileSystemWatcher* reconQueueWatcher_ = nullptr;
     QTimer* reconQueueRefreshTimer_ = nullptr;
     QTimer* reconQueuePollTimer_ = nullptr;
 
@@ -440,8 +437,6 @@ private:
 
     ZoomPanImageView* cameraPreviewView_ = nullptr;
     ZoomPanImageView* reconPreviewView_ = nullptr;
-    QSlider* previewSliceSlider_ = nullptr;
-    QLabel* previewSliceValueLabel_ = nullptr;
     QLabel* reconPixelLabel_ = nullptr;
     ContrastHistogramWidget* cameraHistogramWidget_ = nullptr;
     ContrastHistogramWidget* reconHistogramWidget_ = nullptr;

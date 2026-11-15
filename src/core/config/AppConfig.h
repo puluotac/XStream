@@ -101,12 +101,6 @@ struct ComputeConfig
     int zBlockSplit = 1;
 };
 
-struct PreviewConfig
-{
-    bool enableLive = true;
-    int liveSliceIndex = 512;
-};
-
 struct CtFlyConfig
 {
     double allowedBlurPx = 1.0;
@@ -157,10 +151,10 @@ struct IoConfig
     QString tomoPrefix = "Tomo_";
     QString flatPrefix = "Flat_";
     QString darkPrefix = "Dark_";
-    int inputPadding = 4;
-    QString inputExt = "tiff";
-    QString filePattern0 = "Tomo_0001.tiff";
-    QString filePattern180 = "alignment180.tiff";
+    int inputPadding = 7;
+    QString inputExt = "tif";
+    QString filePattern0 = "Tomo_0000001.tif";
+    QString filePattern180 = "alignment180.tif";
     QString filePrefix = "Slice";
     SaveDepth saveDepth = SaveDepth::Bit16;
     QString saveFormat = "tiff";
@@ -187,7 +181,6 @@ struct AppConfig
     StripeConfig stripe;
     PreprocessConfig preprocess;
     ComputeConfig compute;
-    PreviewConfig preview;
     CtFlyConfig ctFly;
     CameraUiConfig cameraUi;
     CtAcquisitionUiConfig ctAcquisitionUi;

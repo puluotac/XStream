@@ -281,7 +281,6 @@ ReconstructionWorker::ReconstructionWorker(
 {
     appendReconDebug(QStringLiteral("worker ctor enter method=%1 watch=%2 save=%3")
         .arg(toString(config_.io.reconMethod), config_.io.watchDir, config_.io.saveDir));
-    previewSliceIndex_.store(config_.preview.liveSliceIndex);
     appendReconDebug(QStringLiteral("worker ctor exit"));
 }
 
@@ -293,12 +292,6 @@ std::shared_ptr<IReconstructionVolume> ReconstructionWorker::volumeBuffer() cons
 AppConfig ReconstructionWorker::config() const
 {
     return config_;
-}
-
-void ReconstructionWorker::setPreviewSliceIndex(int index)
-{
-    previewSliceIndex_.store(index);
-    config_.preview.liveSliceIndex = index;
 }
 
 void ReconstructionWorker::requestStop()
@@ -373,12 +366,6 @@ void ReconstructionWorker::process()
         if (cudaSetDevice(config_.compute.gpuIndex) != cudaSuccess)
         {
             throw std::runtime_error("Failed to select CUDA device.");
-        }
-
-        const bool previewEnabledDuringRun = config_.preview.enableLive;
-        if (!previewEnabledDuringRun)
-        {
-            emit logMessage(QStringLiteral("Live preview disabled: rendering suspended during reconstruction."));
         }
 
         if (config_.io.watchDir.isEmpty())
@@ -540,8 +527,6 @@ void ReconstructionWorker::process()
             throw std::runtime_error("Failed to create slab pipeline streams/events.");
         }
 
-        previewSliceIndex_.store(std::clamp(previewSliceIndex_.load(), 0, config_.geometry.volH - 1));
-        config_.preview.liveSliceIndex = previewSliceIndex_.load();
         emit volumeGeometryResolved(config_.geometry.volW, config_.geometry.volH);
 
         Bp3dCudaBackend backend;
@@ -556,7 +541,7 @@ void ReconstructionWorker::process()
         std::vector<bool> processedFlags(static_cast<size_t>(config_.geometry.totalAngles), false);
         int processedAngles = 0;
         int batchCount = 0;
-        bool firstLivePreviewPending = previewEnabledDuringRun;
+        bool firstLivePreviewPending = true;
         QElapsedTimer previewTimer;
         previewTimer.start();
         qint64 lastPreviewMs = -kLivePreviewMinIntervalMs;
@@ -931,20 +916,17 @@ void ReconstructionWorker::process()
                 .arg(slabDownloadIssueMs)
                 .arg(slabWaitWriteMs));
 
-            if (previewEnabledDuringRun)
-            {
-                const qint64 nowMs = previewTimer.elapsed();
-                const bool shouldInitializePreview = firstLivePreviewPending;
-                const bool shouldEmitPeriodicPreview =
-                    (batchCount % kLivePreviewEveryNBatches) == 0
-                    && (nowMs - lastPreviewMs) >= kLivePreviewMinIntervalMs;
+            const qint64 nowMs = previewTimer.elapsed();
+            const bool shouldInitializePreview = firstLivePreviewPending;
+            const bool shouldEmitPeriodicPreview =
+                (batchCount % kLivePreviewEveryNBatches) == 0
+                && (nowMs - lastPreviewMs) >= kLivePreviewMinIntervalMs;
 
-                if (shouldInitializePreview || shouldEmitPeriodicPreview)
-                {
-                    emit previewRefreshSuggested(shouldInitializePreview);
-                    firstLivePreviewPending = false;
-                    lastPreviewMs = nowMs;
-                }
+            if (shouldInitializePreview || shouldEmitPeriodicPreview)
+            {
+                emit previewRefreshSuggested(shouldInitializePreview);
+                firstLivePreviewPending = false;
+                lastPreviewMs = nowMs;
             }
         }
 

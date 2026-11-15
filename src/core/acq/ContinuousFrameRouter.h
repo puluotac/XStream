@@ -30,6 +30,8 @@ struct ContinuousFrameRouteSettings
 
 struct ContinuousFrameMetadata
 {
+    int width = 0;
+    int height = 0;
     qint64 rawFrameIndex = 0;
     qint64 logicalIndex = -1;
     qint64 deviceFrameNumber = 0;

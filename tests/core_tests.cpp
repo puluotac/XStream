@@ -336,7 +336,6 @@ int main()
     sessionConfig.stripe.level = 1;
     sessionConfig.stripe.sigma = 2.5f;
     sessionConfig.compute.batchSize = 32;
-    sessionConfig.preview.enableLive = false;
     sessionConfig.cameraUi.exposureValue = 123.0;
     sessionConfig.cameraUi.exposureUnit = "ms";
     sessionConfig.cameraUi.roiX = 11;
@@ -411,7 +410,6 @@ int main()
         || std::abs(loadedConfig.stripe.sigma - sessionConfig.stripe.sigma) > 1e-6f
         || loadedConfig.io.watchDir != sessionConfig.io.watchDir
         || std::abs(loadedConfig.geometry.corShift - sessionConfig.geometry.corShift) > 1e-6f
-        || loadedConfig.preview.enableLive != sessionConfig.preview.enableLive
         || std::abs(loadedConfig.cameraUi.exposureValue - sessionConfig.cameraUi.exposureValue) > 1e-9
         || loadedConfig.cameraUi.exposureUnit != sessionConfig.cameraUi.exposureUnit
         || loadedConfig.cameraUi.roiX != sessionConfig.cameraUi.roiX

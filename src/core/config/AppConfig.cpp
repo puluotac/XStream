@@ -121,10 +121,6 @@ AppConfig AppConfig::fromJsonObject(const QJsonObject& object)
     cfg.compute.gpuIndex = readValue(computeObj, "GPU_INDEX", cfg.compute.gpuIndex);
     cfg.compute.zBlockSplit = readValue(computeObj, "Z_BLOCK_SPLIT", cfg.compute.zBlockSplit);
 
-    const auto previewObj = object.value("VIS").toObject();
-    cfg.preview.enableLive = readValue(previewObj, "ENABLE_LIVE", cfg.preview.enableLive);
-    cfg.preview.liveSliceIndex = readValue(previewObj, "LIVE_SLICE_INDEX", cfg.preview.liveSliceIndex);
-
     const auto ctFlyObj = object.value("CT_FLY").toObject();
     cfg.ctFly.allowedBlurPx = std::clamp(
         readValue(ctFlyObj, "ALLOWED_BLUR_PX", cfg.ctFly.allowedBlurPx),
@@ -347,11 +343,6 @@ QJsonObject AppConfig::toJsonObject() const
     computeObj["GPU_INDEX"] = compute.gpuIndex;
     computeObj["Z_BLOCK_SPLIT"] = compute.zBlockSplit;
     root["COMPUTE"] = computeObj;
-
-    QJsonObject previewObj;
-    previewObj["ENABLE_LIVE"] = preview.enableLive;
-    previewObj["LIVE_SLICE_INDEX"] = preview.liveSliceIndex;
-    root["VIS"] = previewObj;
 
     QJsonObject ctFlyObj;
     ctFlyObj["ALLOWED_BLUR_PX"] = ctFly.allowedBlurPx;

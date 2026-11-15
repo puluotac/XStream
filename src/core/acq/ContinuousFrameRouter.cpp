@@ -89,7 +89,10 @@ bool ContinuousFrameRouter::submitContinuousFrame(const CameraFrame& frame, QStr
         : routedFrames_.size());
     const bool cor180 = settings_.flyScan && settings_.autoCor
         && logicalIndex == settings_.projectionCount;
-    const int fileIndex = cor180 ? -1 : logicalIndex;
+    // CT files use the fixed human-readable one-based format.  The logical
+    // frame index remains zero-based in metadata; only the filename index is
+    // shifted.
+    const int fileIndex = cor180 ? -1 : (settings_.flyScan ? logicalIndex + 1 : logicalIndex);
     const QString filePath = cor180
         ? settings_.alignment180Path
         : numberedPath(settings_.flyScan ? settings_.tomoPrefix : settings_.timeSeriesPrefix, fileIndex);
@@ -117,6 +120,8 @@ bool ContinuousFrameRouter::submitContinuousFrame(const CameraFrame& frame, QStr
     }
 
     ContinuousFrameMetadata metadata;
+    metadata.width = frame.width > 0 ? frame.width : frame.image.cols;
+    metadata.height = frame.height > 0 ? frame.height : frame.image.rows;
     metadata.rawFrameIndex = frame.frameIndex;
     metadata.logicalIndex = frame.logicalIndex;
     metadata.deviceFrameNumber = frame.deviceFrameNumber;

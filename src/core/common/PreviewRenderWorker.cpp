@@ -31,14 +31,15 @@ void PreviewRenderWorker::clearSource()
     renderScheduled_ = false;
 }
 
-void PreviewRenderWorker::enqueueRender(int sliceIndex, bool updateHistogram)
+void PreviewRenderWorker::enqueueRender(bool updateHistogram)
 {
     if (!volume_ || depth_ <= 0)
     {
         return;
     }
 
-    pendingSliceIndex_ = std::clamp(sliceIndex, 0, depth_ - 1);
+    // For even depths use the lower middle slice (256 layers -> index 127).
+    pendingSliceIndex_ = (depth_ - 1) / 2;
     pendingUpdateHistogram_ = updateHistogram;
     scheduleDrain();
 }

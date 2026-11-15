@@ -153,7 +153,6 @@ int main(int argc, char** argv)
         }
     }
 
-    config.preview.enableLive = false;
     appendHeadlessDebug(QStringLiteral("config ready method=%1 watch=%2 save=%3 angles=%4")
         .arg(ct::toString(config.io.reconMethod), config.io.watchDir, config.io.saveDir)
         .arg(config.geometry.totalAngles));

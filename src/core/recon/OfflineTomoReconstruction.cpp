@@ -1441,7 +1441,7 @@ cv::Mat makePreviewSliceFromChunk(const std::vector<float>& chunk, int zCount, i
     {
         return {};
     }
-    const int localZ = zCount / 2;
+    const int localZ = (zCount - 1) / 2;
     const size_t slicePixels = static_cast<size_t>(width) * width;
     const float* src = chunk.data() + static_cast<size_t>(localZ) * slicePixels;
     cv::Mat slice(width, width, CV_32F);
@@ -1456,7 +1456,7 @@ cv::Mat makePreviewSliceFromChunk(const std::vector<uint16_t>& chunk, int zCount
     {
         return {};
     }
-    const int localZ = zCount / 2;
+    const int localZ = (zCount - 1) / 2;
     const size_t slicePixels = static_cast<size_t>(width) * width;
     const uint16_t* src = chunk.data() + static_cast<size_t>(localZ) * slicePixels;
     cv::Mat slice(width, width, CV_32F);

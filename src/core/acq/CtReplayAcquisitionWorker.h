@@ -24,7 +24,7 @@ struct CtReplayAcquisitionSettings
     QString inputExt = QStringLiteral("tiff");
     QString filePattern0;
     QString filePattern180;
-    int inputPadding = 4;
+    int inputPadding = 7;
     int projectionCount = 0;
     int imageWidth = 0;
     int imageHeight = 0;
