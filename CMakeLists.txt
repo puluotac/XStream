@@ -2,6 +2,13 @@
 
 project(ct_workstation VERSION 0.1.0 LANGUAGES CXX CUDA)
 
+# Allow an explicit UTF-8 prefix when CMake compiler detection used a different
+# Windows code page. This host only has the Chinese MSVC language pack.
+set(CT_MSVC_INCLUDE_PREFIX "" CACHE STRING "Override localized MSVC showIncludes prefix")
+if(MSVC AND NOT CT_MSVC_INCLUDE_PREFIX STREQUAL "")
+    set(CMAKE_CL_SHOWINCLUDES_PREFIX "${CT_MSVC_INCLUDE_PREFIX}")
+endif()
+
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CUDA_STANDARD 17)
@@ -88,6 +95,8 @@ add_library(ct_workstation_core STATIC
     src/core/acq/CtReplayAcquisitionWorker.cpp
     src/core/acq/CtTiffWriter.h
     src/core/acq/CtTiffWriter.cpp
+    src/core/stitch/Mosaic.h
+    src/core/stitch/Mosaic.cpp
     src/core/config/AppConfig.h
     src/core/config/AppConfig.cpp
     src/core/common/GeometryVectorGenerator.h
@@ -166,13 +175,20 @@ qt_add_executable(ct_workstation_app
     src/ui/ContrastHistogramWidget.cpp
     src/ui/MainWindow.h
     src/ui/MainWindow.cpp
+    src/ui/MainWindowMosaic.cpp
     src/ui/ZoomPanImageView.h
     src/ui/ZoomPanImageView.cpp
 )
 
+execute_process(COMMAND git describe --always --dirty
+    WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+    OUTPUT_VARIABLE CT_SOURCE_REVISION OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
+if(CT_SOURCE_REVISION STREQUAL "")
+    set(CT_SOURCE_REVISION "unknown")
+endif()
 target_compile_definitions(ct_workstation_app
     PRIVATE
-        CT_STREAM_VERSION=\"${PROJECT_VERSION}\"
+        CT_STREAM_VERSION=\"${PROJECT_VERSION}+${CT_SOURCE_REVISION}\"
 )
 
 target_link_libraries(ct_workstation_app
@@ -295,3 +311,12 @@ if (PVCAM_FOUND)
 else()
     message(WARNING "PVCAM SDK not found. Set PVCAM_SDK_ROOT to build pvcam_smoke_test.")
 endif()
+
+add_executable(ct_mosaic tools/ct_mosaic.cpp)
+target_link_libraries(ct_mosaic PRIVATE ct_workstation_core Qt6::Core)
+add_dependencies(ct_workstation_app ct_mosaic)
+add_test(NAME ct_mosaic_tests COMMAND ct_mosaic --test)
+add_executable(ct_mosaic_motion_tests tests/mosaic_motion_tests.cpp)
+target_link_libraries(ct_mosaic_motion_tests PRIVATE ct_workstation_core Qt6::Core Qt6::Network)
+add_test(NAME ct_mosaic_motion_tests COMMAND ct_mosaic_motion_tests)
+set_tests_properties(ct_mosaic_motion_tests PROPERTIES TIMEOUT 40)

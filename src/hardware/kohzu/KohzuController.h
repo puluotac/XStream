@@ -38,6 +38,7 @@ public slots:
     void stopAxis(int axis, const QString& label);
     void stopAllAxes();
     void recoverAfterInterruptedSession();
+    void verifyAxisPosition(int axis, qint64 target, qint64 tolerance, const QString& label);
 
 signals:
     void connectionChanged(bool connected);

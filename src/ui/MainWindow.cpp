@@ -1307,6 +1307,7 @@ MainWindow::MainWindow(QWidget* parent)
     ctModeTabs_->addTab(ctTimingPage, QStringLiteral("Timing"));
     ctModeTabs_->addTab(ctFlyPage, QStringLiteral("Fly"));
     ctModeTabs_->addTab(ctTimeSeriesPage, QStringLiteral("2D"));
+    ctModeTabs_->addTab(createMosaicPage(), QStringLiteral("Mosaic"));
     ctModeTabs_->setTabEnabled(kCtTabFly, false);
     ctModeTabs_->setTabEnabled(kCtTabTimeSeries, false);
     ctTiffThreadsSpin_ = makeSpin<QSpinBox>(ctGroup, 1, kAcquisitionWriterThreadLimit, 1);
@@ -1781,7 +1782,7 @@ MainWindow::MainWindow(QWidget* parent)
     startMotorWorker();
     writeStartupTrace(QStringLiteral("Motor worker started; scheduling motor connect"));
     updateMotorUiEnabled();
-    QTimer::singleShot(0, this, &MainWindow::requestMotorConnect);
+    if (!qEnvironmentVariableIsSet("CT_UI_SMOKE")) QTimer::singleShot(0, this, &MainWindow::requestMotorConnect);
 
     writeStartupTrace(QStringLiteral("Connecting UI signals"));
     connect(cameraSnapButton_, &QPushButton::clicked, this, &MainWindow::snapCameraFrame);
@@ -1923,6 +1924,7 @@ MainWindow::MainWindow(QWidget* parent)
     connect(reconQueuePollTimer_, &QTimer::timeout, this, [this]() {
         refreshReconQueue();
         startNextQueuedReconstruction();
+        maybeStartMosaicFusion();
     });
     reconQueuePollTimer_->start();
     refreshReconQueue();
@@ -1954,7 +1956,7 @@ MainWindow::MainWindow(QWidget* parent)
     appendLog(QStringLiteral("App executable: %1").arg(QCoreApplication::applicationFilePath()));
     appendLog(QStringLiteral("Build stamp: %1 %2")
         .arg(QString::fromLatin1(__DATE__), QString::fromLatin1(__TIME__)));
-    inspectInterruptedCtSession();
+    if (!qEnvironmentVariableIsSet("CT_UI_SMOKE")) inspectInterruptedCtSession();
     writeStartupTrace(QStringLiteral("MainWindow ctor complete"));
     QTimer::singleShot(0, this, &MainWindow::startNextQueuedReconstruction);
     QTimer::singleShot(5000, this, [this]() {
@@ -2038,12 +2040,13 @@ void MainWindow::applyConfig(const AppConfig& config)
     cameraSaveDirEdit_->setText(config.cameraUi.saveDir);
     motorHostEdit_->setText(config.kohzuUi.host);
     motorPortSpin_->setValue(config.kohzuUi.port);
+    applyMosaicConfig(config.mosaic);
     ctBeginningAngleSpin_->setValue(config.ctAcquisitionUi.beginningAngleDeg);
     if (ctModeTabs_)
     {
         const int tabIndex = config.ctAcquisitionUi.modeIndex == 1
             ? kCtTabFly
-            : (config.ctAcquisitionUi.modeIndex == 2 ? kCtTabTimeSeries : kCtTabStep);
+            : (config.ctAcquisitionUi.modeIndex == 3 ? 4 : (config.ctAcquisitionUi.modeIndex == 2 ? kCtTabTimeSeries : kCtTabStep));
         ctModeTabs_->setCurrentIndex(tabIndex);
     }
     ctSavePathEdit_->setText(config.ctAcquisitionUi.savePath);
@@ -2164,7 +2167,8 @@ AppConfig MainWindow::configFromUi() const
     const int selectedTab = ctModeTabs_ ? ctModeTabs_->currentIndex() : kCtTabStep;
     cfg.ctAcquisitionUi.modeIndex = selectedTab == kCtTabFly
         ? 1
-        : (selectedTab == kCtTabTimeSeries ? 2 : 0);
+        : (selectedTab == 4 ? 3 : (selectedTab == kCtTabTimeSeries ? 2 : 0));
+    cfg.mosaic = mosaicConfigFromUi();
     cfg.ctAcquisitionUi.savePath = ctSavePathEdit_->text();
     cfg.ctAcquisitionUi.projectionNum = ctProjectionNumSpin_->value();
     cfg.ctAcquisitionUi.stepFlatGap = ctStepFlatGapSpin_->value();
@@ -2199,6 +2203,7 @@ AppConfig MainWindow::configFromUi() const
 
 bool MainWindow::saveSessionConfig()
 {
+    if (qEnvironmentVariableIsSet("CT_UI_SMOKE")) return true;
     sessionConfig_ = configFromUi();
     const bool saved = sessionConfig_.saveToJsonFile(sessionConfigPath());
     if (!saved)
@@ -2465,6 +2470,7 @@ void MainWindow::invalidateTimingCalibration(const QString& reason)
 
 void MainWindow::startTimingCalibration()
 {
+    if (mosaicRunning_) return;
     if (timingCalibrationRunning_ || ctRunning_ || !cameraWorker_)
     {
         return;
@@ -2686,9 +2692,9 @@ void MainWindow::handleTimingCalibrationResult(const PvcamTimingCalibrationResul
 void MainWindow::updateCtModeUiState()
 {
     const int modeIndex = ctModeTabs_ ? ctModeTabs_->currentIndex() : kCtTabStep;
-    const bool controlsEnabled = !ctRunning_ && !timingCalibrationRunning_;
+    const bool controlsEnabled = !ctRunning_ && !mosaicRunning_ && !timingCalibrationRunning_;
     const bool timingReady = timingCalibrationValid_ && timingCalibrationMatchesCurrentUi();
-    const bool stepMode = modeIndex == kCtTabStep;
+    const bool stepMode = modeIndex == kCtTabStep || modeIndex == 4;
     const bool timingMode = modeIndex == kCtTabTiming;
     const bool flyMode = modeIndex == kCtTabFly;
     const bool timeSeriesMode = modeIndex == kCtTabTimeSeries;
@@ -2720,7 +2726,7 @@ void MainWindow::updateCtModeUiState()
     }
     if (ctStartButton_)
     {
-        ctStartButton_->setEnabled(controlsEnabled
+        ctStartButton_->setEnabled(controlsEnabled && !ctHardwareStopPending_ && !ctRecoveryPending_
             && !timingMode
             && (stepMode || ((flyMode || timeSeriesMode) && timingReady)));
     }
@@ -3676,6 +3682,7 @@ void MainWindow::startCameraWorker()
 
 void MainWindow::snapCameraFrame()
 {
+    if (mosaicRunning_) return;
     if (!cameraWorker_)
     {
         appendLog(QStringLiteral("Kinetix worker is unavailable."));
@@ -3799,6 +3806,7 @@ void MainWindow::snapCameraFrame()
 
 void MainWindow::toggleCameraLivePreview()
 {
+    if (mosaicRunning_) return;
     ++liveRestoreGeneration_;
     if (!cameraWorker_)
     {
@@ -3887,6 +3895,7 @@ void MainWindow::stopCameraLivePreview(bool restartAfterStop)
 
 void MainWindow::applyCameraRoi()
 {
+    if (mosaicRunning_) return;
     const int sensorWidth = 3200;
     const int sensorHeight = 3200;
     const int x = std::clamp(cameraRoiXSpin_->value(), 0, sensorWidth - 1);
@@ -3906,6 +3915,7 @@ void MainWindow::applyCameraRoi()
 
 void MainWindow::resetCameraRoiFullFrame()
 {
+    if (mosaicRunning_) return;
     cameraRoiXSpin_->setValue(0);
     cameraRoiYSpin_->setValue(0);
     cameraRoiWidthSpin_->setValue(3200);
@@ -4134,6 +4144,11 @@ void MainWindow::updateReconPixelHover(int x, int y)
 
 void MainWindow::startReconstruction()
 {
+    if (mosaicProcess_ && mosaicProcess_->state() != QProcess::NotRunning)
+    {
+        appendLog(QStringLiteral("Wait for mosaic processing to finish."));
+        return;
+    }
     saveSessionConfig();
     progressBar_->setValue(0);
     lastRawReconPreviewSlice_.release();
@@ -4148,12 +4163,19 @@ void MainWindow::startReconstruction()
 
 void MainWindow::startCtAcquisition()
 {
+    if (mosaicProcess_ && mosaicProcess_->state() != QProcess::NotRunning) { appendLog(QStringLiteral("Wait for mosaic processing to finish.")); return; }
+    if (ctModeTabs_->currentIndex() == 4 && !mosaicLaunchingTile_)
+    {
+        startMosaicAcquisition();
+        return;
+    }
+
     if (ctRunning_)
     {
         appendLog(QStringLiteral("CT acquisition is already running."));
         return;
     }
-    if (ctRecoveryPending_ && !ctRecoveryConfirmed_)
+    if (ctHardwareStopPending_ || (ctRecoveryPending_ && !ctRecoveryConfirmed_))
     {
         appendLog(QStringLiteral("CT acquisition blocked: previous interrupted session has not been confirmed idle. Wait for CT recovery or reconnect Kohzu."));
         return;
@@ -4347,7 +4369,8 @@ void MainWindow::startCtAcquisition()
             return;
         }
     }
-    ctSettings_.reconConfig = configFromUi();
+    ctSettings_.reconConfig = mosaicRunning_ ? mosaicSnapshot_ : configFromUi();
+    if (mosaicRunning_) ctSettings_.reconConfig.io.saveDepth = SaveDepth::Bit32;
     if (ctSettings_.reconConfig.io.reconMethod == ReconMethod::RealTimeFBP)
     {
         ctSettings_.reconConfig.io.reconMethod = ReconMethod::OfflineFBP;
@@ -4403,6 +4426,15 @@ void MainWindow::startCtAcquisition()
         }
     }
 
+    if (mosaicRunning_ && !mosaicDarkSnapshot_.isEmpty())
+    {
+        const QString destination = QDir(savePath).filePath(QStringLiteral("Dark_0000001.tif"));
+        if (!QFile::copy(mosaicDarkSnapshot_, destination))
+        {
+            appendLog(QStringLiteral("Mosaic tile dark copy failed."));
+            return;
+        }
+    }
     ctRestoreLiveAfterFinish_ = cameraLiveRunning_;
     if (cameraLiveRunning_)
     {
@@ -4653,6 +4685,8 @@ void MainWindow::startCtAcquisition()
 
 void MainWindow::stopCtAcquisition()
 {
+    if (mosaicRunning_ && !ctRunning_) { abortMosaic(QStringLiteral("Mosaic stopped by user.")); return; }
+
     if (!ctRunning_)
     {
         return;
@@ -6211,7 +6245,7 @@ void MainWindow::finishCtAcquisition(bool ok, const QString& message)
         ctCurrentFrameBatchStartedMs_ = 0;
     }
     const bool wasReplay = ctReplayRunning_;
-    const bool shouldRestoreLive = ok && ctRestoreLiveAfterFinish_;
+    const bool shouldRestoreLive = ok && ctRestoreLiveAfterFinish_ && !mosaicRunning_;
     ctRestoreLiveAfterFinish_ = false;
     if (!shouldRestoreLive)
     {
@@ -6222,8 +6256,8 @@ void MainWindow::finishCtAcquisition(bool ok, const QString& message)
     const QString recoveryState = ok
         ? QStringLiteral("COMPLETED")
         : (motorNeedsStop ? QStringLiteral("STOPPING") : QStringLiteral("STOPPED"));
-    writeCtRecoveryState(recoveryState, message);
-    ctHardwareStopPending_ = motorNeedsStop;
+    writeCtRecoveryState(ok && mosaicRunning_ ? QStringLiteral("RUNNING") : recoveryState, message);
+    ctHardwareStopPending_ = motorNeedsStop || ctRecoveryPending_;
     ctReplayRunning_ = false;
     ctMotorSpeedTablesReady_ = false;
     ctMotorSpeedSetupStage_ = 0;
@@ -6336,6 +6370,7 @@ void MainWindow::finishCtAcquisition(bool ok, const QString& message)
         }
     }
     ctPendingFinishErrorMessage_.clear();
+    if (mosaicRunning_) finishMosaicTile(ok, message);
     if (shouldRestoreLive && !shuttingDown_ && !cameraLiveRunning_ && cameraWorker_)
     {
         const int restoreGeneration = ++liveRestoreGeneration_;
@@ -6359,6 +6394,11 @@ void MainWindow::writeCtManifest(bool completed, const QString& errorMessage)
     }
     QJsonObject root;
     root["TYPE"] = "CT_STREAM_SCAN_MANIFEST";
+    if (mosaicRunning_ && mosaicIndex_ < mosaicTileRecords_.size())
+    {
+        root["MOSAIC_TILE"] = mosaicTileRecords_[mosaicIndex_];
+        root["MOSAIC_ROOT"] = mosaicRoot_;
+    }
     root["VERSION"] = 4;
     root["COMPLETED"] = completed;
     root["ERROR"] = errorMessage;
@@ -6849,6 +6889,7 @@ void MainWindow::removeSelectedReconQueueJob()
 
 void MainWindow::startNextQueuedReconstruction()
 {
+    if (mosaicProcess_ && mosaicProcess_->state() != QProcess::NotRunning) return;
     if (!cameraWarmOpenComplete_)
     {
         reconStartDeferredForCameraWarmOpen_ = true;
@@ -6877,7 +6918,8 @@ void MainWindow::startNextQueuedReconstruction()
         refreshReconQueue();
         return;
     }
-    startQueuedReconstruction(reconQueuePaths_.first());
+    const QString next = reconQueuePaths_.first();
+    if (!startQueuedReconstruction(next)) { reconQueuePaths_.removeAll(next); mosaicAutoFusionManifest_.clear(); }
 }
 
 bool MainWindow::startQueuedReconstruction(const QString& jobPath)
@@ -7211,6 +7253,7 @@ void MainWindow::finishQueuedReconstruction(bool ok, const QString& message, con
     }
     QJsonObject job;
     readJsonFile(activeQueueJobPath_, &job);
+    if (!ok) mosaicAutoFusionManifest_.clear();
     const bool cancelled = activeQueueFinishedStatusOverride_ == QStringLiteral("cancelled");
     const QString status = cancelled ? QStringLiteral("cancelled") : (ok ? QStringLiteral("done") : QStringLiteral("failed"));
     const QString stage = cancelled
@@ -7338,6 +7381,7 @@ void MainWindow::renderPreviewWithCurrentWindow()
 
 void MainWindow::updateReconMethodUiState()
 {
+    if (mosaicCalibrated_ && !applyingConfig_) mosaicCalibrated_->setChecked(false);
     if (reconMethodCombo_ == nullptr)
     {
         return;
@@ -7467,6 +7511,7 @@ void MainWindow::startMotorWorker()
     connect(kohzuController_, &KohzuController::connectionChanged, this, [this](bool connected) {
         if (shuttingDown_) { return; }
         motorConnected_ = connected;
+        if (!connected && mosaicRunning_) abortMosaic(QStringLiteral("Kohzu disconnected during mosaic."));
         motorConnectionLabel_->setText(connected ? QStringLiteral("Connected") : QStringLiteral("Disconnected"));
         updateMotorUiEnabled();
         if (connected && ctRecoveryPending_ && !ctRecoveryConfirmed_)
@@ -7486,13 +7531,19 @@ void MainWindow::startMotorWorker()
     connect(kohzuController_, &KohzuController::commandFinished, this, [this](const QString& label, bool ok, const QString& response) {
         if (ctHardwareStopPending_ && label == QStringLiteral("Kohzu stop all") && ok)
         {
-            ctHardwareStopPending_ = false;
-            writeCtRecoveryState(QStringLiteral("STOPPED"), QStringLiteral("Kohzu controlled stop acknowledged."));
+            if (!ctRecoveryPending_)
+            {
+                ctHardwareStopPending_ = false;
+                if (!mosaicRunning_ && !ctRunning_) setMosaicLocked(false);
+                writeCtRecoveryState(QStringLiteral("STOPPED"), QStringLiteral("Kohzu controlled stop acknowledged."));
+            }
         }
         if (ctRecoveryPending_ && label == QStringLiteral("Kohzu recovery") && ok)
         {
             ctRecoveryConfirmed_ = true;
             ctRecoveryPending_ = false;
+            ctHardwareStopPending_ = false;
+            if (!mosaicRunning_ && !ctRunning_) setMosaicLocked(false);
             writeCtRecoveryState(QStringLiteral("RECOVERED"), QStringLiteral("Controlled stop and idle polling completed."));
             appendLog(QStringLiteral("CT recovery confirmed; new acquisitions are enabled."));
         }
@@ -7506,6 +7557,23 @@ void MainWindow::startMotorWorker()
         if (!ok)
         {
             appendLog(QStringLiteral("%1 failed: %2").arg(label, response));
+        }
+        if (mosaicRunning_ && label == mosaicPendingLabel_ + " verify")
+        {
+            if (!ok) { abortMosaic(response); return; }
+            mosaicPendingAxis_.clear();
+            mosaicPendingLabel_.clear();
+            mosaicVerifyingPosition_ = false;
+            const int generation = mosaicGeneration_;
+            QTimer::singleShot(mosaicPlan_.config.settleMs, this, [this, generation]() {
+                if (mosaicRunning_ && generation == mosaicGeneration_) advanceMosaicPositioning();
+            });
+            return;
+        }
+        if (mosaicRunning_ && label == mosaicPendingLabel_)
+        {
+            if (!ok) { abortMosaic(QStringLiteral("Mosaic positioning failed: %1").arg(response)); return; }
+            mosaicMoveAccepted_ = true;
         }
         if (ctRunning_ && label.startsWith(QStringLiteral("CT speed table ")))
         {
@@ -7590,9 +7658,20 @@ void MainWindow::updateMotorAxisActive(int axis, bool active)
 
     MotorAxisUi& axisUi = motorAxes_[name];
     axisUi.active = active;
-    axisUi.goButton->setEnabled(motorConnected_ && !active);
-    axisUi.relativeMinusButton->setEnabled(motorConnected_ && !active && !motorSpeedMode_);
-    axisUi.relativePlusButton->setEnabled(motorConnected_ && !active && !motorSpeedMode_);
+    if (mosaicRunning_ && !ctRunning_ && name == mosaicPendingAxis_)
+    {
+        if (active) mosaicMoveActiveSeen_ = true;
+        else if (mosaicMoveAccepted_ && mosaicMoveActiveSeen_ && !mosaicVerifyingPosition_)
+        {
+            mosaicVerifyingPosition_ = true;
+            QMetaObject::invokeMethod(kohzuController_, "verifyAxisPosition", Qt::QueuedConnection,
+                Q_ARG(int, axis), Q_ARG(qint64, mosaicPendingTargetPulse_), Q_ARG(qint64, 1),
+                Q_ARG(QString, mosaicPendingLabel_ + " verify"));
+        }
+    }
+    axisUi.goButton->setEnabled(motorConnected_ && !active && !mosaicRunning_ && !ctRecoveryPending_);
+    axisUi.relativeMinusButton->setEnabled(motorConnected_ && !active && !motorSpeedMode_ && !mosaicRunning_ && !ctRecoveryPending_);
+    axisUi.relativePlusButton->setEnabled(motorConnected_ && !active && !motorSpeedMode_ && !mosaicRunning_ && !ctRecoveryPending_);
     if (ctRunning_ && ctWaitingForMotor_ && !active && (axis == ctSettings_.rAxis || axis == ctSettings_.yAxis))
     {
         const QString action = ctPendingMotorAction_;
@@ -7636,6 +7715,7 @@ void MainWindow::updateMotorAxisActive(int axis, bool active)
 
 void MainWindow::moveMotorAxis(const QString& name)
 {
+    if (mosaicRunning_) return;
     auto it = motorAxes_.find(name);
     if (it == motorAxes_.end())
     {
@@ -7706,6 +7786,7 @@ void MainWindow::moveMotorAxis(const QString& name)
 
 void MainWindow::moveMotorAxisRelative(const QString& name, int direction)
 {
+    if (mosaicRunning_) return;
     auto it = motorAxes_.find(name);
     if (it == motorAxes_.end())
     {
@@ -7789,6 +7870,7 @@ void MainWindow::moveMotorAxisRelative(const QString& name, int direction)
 
 void MainWindow::stopMotorAxis(const QString& name)
 {
+    if (mosaicRunning_) { abortMosaic(QStringLiteral("Axis Stop requested during mosaic.")); return; }
     auto it = motorAxes_.find(name);
     if (it == motorAxes_.end())
     {
@@ -7810,6 +7892,7 @@ void MainWindow::stopMotorAxis(const QString& name)
 
 void MainWindow::stopAllMotorAxes()
 {
+    if (mosaicRunning_) { abortMosaic(QStringLiteral("All-axis Stop requested.")); return; }
     if (!motorConnected_)
     {
         appendLog(QStringLiteral("Kohzu is not connected."));
@@ -7848,13 +7931,13 @@ void MainWindow::updateMotorUiEnabled()
 {
     motorHostEdit_->setEnabled(!motorConnected_);
     motorPortSpin_->setEnabled(!motorConnected_);
-    motorModeButton_->setEnabled(true);
+    motorModeButton_->setEnabled(!mosaicRunning_);
     motorStopAllButton_->setEnabled(motorConnected_);
     for (auto it = motorAxes_.begin(); it != motorAxes_.end(); ++it)
     {
-        it->goButton->setEnabled(motorConnected_ && !it->active);
-        it->relativeMinusButton->setEnabled(motorConnected_ && !it->active && !motorSpeedMode_);
-        it->relativePlusButton->setEnabled(motorConnected_ && !it->active && !motorSpeedMode_);
+        it->goButton->setEnabled(motorConnected_ && !it->active && !mosaicRunning_ && !ctRecoveryPending_);
+        it->relativeMinusButton->setEnabled(motorConnected_ && !it->active && !motorSpeedMode_ && !mosaicRunning_ && !ctRecoveryPending_);
+        it->relativePlusButton->setEnabled(motorConnected_ && !it->active && !motorSpeedMode_ && !mosaicRunning_ && !ctRecoveryPending_);
         it->relativeSpin->setEnabled(!it->active && !motorSpeedMode_);
         it->absoluteSpin->setEnabled(!it->active && !motorSpeedMode_);
         if (it->baseSpeedSpin)
@@ -7883,6 +7966,13 @@ void MainWindow::closeEvent(QCloseEvent* event)
 
 void MainWindow::shutdownWorkers()
 {
+    if (mosaicRunning_) abortMosaic(QStringLiteral("Application closing during mosaic."));
+    if (mosaicProcess_ && mosaicProcess_->state() != QProcess::NotRunning)
+    {
+        mosaicProcess_->write("stop\n");
+        if (!mosaicProcess_->waitForFinished(5000)) { mosaicProcess_->kill(); mosaicProcess_->waitForFinished(3000); }
+    }
+
     if (shuttingDown_)
     {
         return;

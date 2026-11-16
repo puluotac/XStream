@@ -653,6 +653,7 @@ struct ChunkSaveItem
     int zCount = 0;
     int width = 0;
     std::vector<uint16_t> data;
+    std::vector<float> floats;
 };
 
 struct ChunkSaveStats
@@ -736,6 +737,7 @@ public:
 struct TiffSliceTask
 {
     std::shared_ptr<std::vector<uint16_t>> chunk;
+    std::shared_ptr<std::vector<float>> floats;
     int localZ = 0;
     int globalZ = 0;
     int width = 0;
@@ -763,7 +765,7 @@ public:
         {
             QDir().mkpath(config_.io.saveDir);
         }
-        config_.io.saveDepth = SaveDepth::Bit16;
+        if (config_.io.saveDepth != SaveDepth::Bit32) config_.io.saveDepth = SaveDepth::Bit16;
         if (config_.io.saveFormat.isEmpty())
         {
             config_.io.saveFormat = QStringLiteral("tiff");
@@ -776,6 +778,8 @@ public:
         log_(QStringLiteral("Offline save mode: TIFF Slices, %1 writer threads, no compression (requested %2).")
                 .arg(threadCount_)
                 .arg(requestedThreads));
+        if (config_.io.saveDepth == SaveDepth::Bit32)
+            log_(QStringLiteral("Float32 output: unwindowed reconstruction values, including negatives; uint16 window is not applied. Writer backlog is bounded to one chunk."));
     }
 
     ~TiffSlicePoolWriter() override
@@ -791,13 +795,24 @@ public:
 
     void enqueue(ChunkSaveItem item) override
     {
+        // At most one previous chunk may remain resident. Counting queued
+        // slices alone would miss the shared chunk held by active writers.
+        {
+            std::unique_lock<std::mutex> lock(mutex_);
+            cv_.wait(lock, [this]() { return outstandingSlices_ == 0 || stopRequested_.load(); });
+            if (!error_.empty()) throw std::runtime_error(error_);
+            if (stopRequested_.load()) throw std::runtime_error("TIFF writer stopped.");
+        }
         auto chunk = std::make_shared<std::vector<uint16_t>>(std::move(item.data));
+        auto floats = std::make_shared<std::vector<float>>(std::move(item.floats));
         {
             std::lock_guard<std::mutex> lock(mutex_);
+            outstandingSlices_ += item.zCount;
             for (int localZ = 0; localZ < item.zCount; ++localZ)
             {
                 TiffSliceTask task;
                 task.chunk = chunk;
+                task.floats = floats;
                 task.localZ = localZ;
                 task.globalZ = item.zStart + localZ;
                 task.width = item.width;
@@ -870,6 +885,12 @@ private:
                     tasks_.pop_front();
                 }
                 saveTask(task);
+                task = {};
+                {
+                    std::lock_guard<std::mutex> lock(mutex_);
+                    --outstandingSlices_;
+                }
+                cv_.notify_all();
             }
         }
         catch (const std::exception& ex)
@@ -891,14 +912,23 @@ private:
         QElapsedTimer timer;
         timer.start();
         const size_t slicePixels = static_cast<size_t>(task.width) * task.width;
-        const uint16_t* src = task.chunk->data() + static_cast<size_t>(task.localZ) * slicePixels;
-        cv::Mat output(task.width, task.width, CV_16U, const_cast<uint16_t*>(src));
+        cv::Mat output;
         qint64 belowMin = 0;
         qint64 saturated = 0;
-        for (size_t i = 0; i < slicePixels; ++i)
+        if (config_.io.saveDepth == SaveDepth::Bit32)
         {
-            belowMin += (src[i] == 0) ? 1 : 0;
-            saturated += (src[i] == 65535) ? 1 : 0;
+            const float* src = task.floats->data() + static_cast<size_t>(task.localZ) * slicePixels;
+            output = cv::Mat(task.width, task.width, CV_32F, const_cast<float*>(src));
+        }
+        else
+        {
+            const uint16_t* src = task.chunk->data() + static_cast<size_t>(task.localZ) * slicePixels;
+            output = cv::Mat(task.width, task.width, CV_16U, const_cast<uint16_t*>(src));
+            for (size_t i = 0; i < slicePixels; ++i)
+            {
+                belowMin += (src[i] == 0) ? 1 : 0;
+                saturated += (src[i] == 65535) ? 1 : 0;
+            }
         }
 
         QDir saveDir(config_.io.saveDir);
@@ -928,6 +958,7 @@ private:
     mutable std::mutex mutex_;
     std::condition_variable cv_;
     std::deque<TiffSliceTask> tasks_;
+    int outstandingSlices_ = 0;
     std::vector<std::thread> workers_;
     std::atomic_bool stopRequested_ = false;
     bool closed_ = false;
@@ -1827,6 +1858,11 @@ qint64 runOfflineFbp(const AppConfig& config, ProjectionStore& projectionStore,
         ensureCuda(cudaMemcpyAsync(hostOut16.data(), deviceOut16.ptr(),
             chunkVoxels * sizeof(uint16_t), cudaMemcpyDeviceToHost, stream),
             "download offline FBP uint16 chunk");
+        if (config.io.saveDepth == SaveDepth::Bit32 && !needsCalibration)
+        {
+            ensureCuda(cudaMemcpyAsync(hostOut.data(), deviceOut.ptr(), chunkVoxels * sizeof(float),
+                cudaMemcpyDeviceToHost, stream), "download unwindowed mosaic float chunk");
+        }
         ensureCuda(cudaEventRecord(evAfterDownload.get(), stream), "record offline FBP download event");
         ensureCuda(cudaStreamSynchronize(stream), "offline FBP chunk sync");
         float segmentMs = 0.0f;
@@ -1848,13 +1884,16 @@ qint64 runOfflineFbp(const AppConfig& config, ProjectionStore& projectionStore,
         item.zStart = zStart;
         item.zCount = currH;
         item.width = width;
-        item.data.assign(hostOut16.begin(), hostOut16.begin() + static_cast<std::ptrdiff_t>(chunkVoxels));
+        if (config.io.saveDepth == SaveDepth::Bit32)
+            item.floats.assign(hostOut.begin(), hostOut.begin() + static_cast<std::ptrdiff_t>(chunkVoxels));
+        else
+            item.data.assign(hostOut16.begin(), hostOut16.begin() + static_cast<std::ptrdiff_t>(chunkVoxels));
         writer->enqueue(std::move(item));
         enqueueMs += cpuTimer.elapsed();
 
         if (directPreview)
         {
-            if (needsCalibration)
+            if (needsCalibration || config.io.saveDepth == SaveDepth::Bit32)
             {
                 directPreview(makePreviewSliceFromChunk(hostOut, currH, width), processedChunks == 0);
             }
@@ -2081,6 +2120,11 @@ qint64 runOfflineGridrec(const AppConfig& config, ProjectionStore& projectionSto
         ensureCuda(cudaMemcpyAsync(hostOut16.data(), deviceOut16.ptr(),
             chunkVoxels * sizeof(uint16_t), cudaMemcpyDeviceToHost, stream),
             "download offline Gridrec uint16 chunk");
+        if (config.io.saveDepth == SaveDepth::Bit32 && !needsCalibration)
+        {
+            ensureCuda(cudaMemcpyAsync(hostOut.data(), deviceOut.ptr(), chunkVoxels * sizeof(float),
+                cudaMemcpyDeviceToHost, stream), "download unwindowed mosaic float chunk");
+        }
         ensureCuda(cudaEventRecord(evAfterDownload.get(), stream), "record offline Gridrec download event");
         ensureCuda(cudaStreamSynchronize(stream), "offline Gridrec chunk sync");
         float segmentMs = 0.0f;
@@ -2105,13 +2149,16 @@ qint64 runOfflineGridrec(const AppConfig& config, ProjectionStore& projectionSto
         item.zStart = zStart;
         item.zCount = currH;
         item.width = width;
-        item.data.assign(hostOut16.begin(), hostOut16.begin() + static_cast<std::ptrdiff_t>(chunkVoxels));
+        if (config.io.saveDepth == SaveDepth::Bit32)
+            item.floats.assign(hostOut.begin(), hostOut.begin() + static_cast<std::ptrdiff_t>(chunkVoxels));
+        else
+            item.data.assign(hostOut16.begin(), hostOut16.begin() + static_cast<std::ptrdiff_t>(chunkVoxels));
         writer->enqueue(std::move(item));
         enqueueMs += cpuTimer.elapsed();
 
         if (directPreview)
         {
-            if (needsCalibration)
+            if (needsCalibration || config.io.saveDepth == SaveDepth::Bit32)
             {
                 directPreview(makePreviewSliceFromChunk(hostOut, currH, width), processedChunks == 0);
             }

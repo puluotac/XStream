@@ -15,6 +15,8 @@
 #include <QMap>
 #include <QStringList>
 #include <QThread>
+#include <QProcess>
+#include <array>
 
 #include <opencv2/core.hpp>
 
@@ -45,6 +47,7 @@ class MainWindow : public QMainWindow
 public:
     explicit MainWindow(QWidget* parent = nullptr);
     ~MainWindow() override;
+    void runMosaicQueueSmoke();
 
 private:
     enum class CtFrameKind
@@ -86,6 +89,20 @@ private:
     void updateReconPixelHover(int x, int y);
     void startReconstruction();
     void startCtAcquisition();
+    QWidget* createMosaicPage();
+    MosaicConfig mosaicConfigFromUi() const;
+    void applyMosaicConfig(const MosaicConfig&);
+    void updateMosaicPlan();
+    void startMosaicAcquisition();
+    void advanceMosaicPositioning();
+    void finishMosaicTile(bool ok, const QString& message);
+    void abortMosaic(const QString& message);
+    void setMosaicLocked(bool locked);
+    void writeMosaicManifest(bool completed, const QString& error = {});
+    void launchMosaicStitch(bool synthetic);
+    void queueMosaicReconstruction();
+    void maybeStartMosaicFusion();
+
     void stopCtAcquisition();
     void maybeStartCtSmokeAutostart();
     void maybeStartCtReplayAutostart();
@@ -159,6 +176,53 @@ private:
     double estimateAxisMoveSeconds(const QString& axisName, double distanceUnits) const;
     double estimateCtAcquisitionSeconds(int totalFrames) const;
 
+    QDoubleSpinBox* mosaicPixel_ = nullptr;
+    QDoubleSpinBox* mosaicX0_ = nullptr;
+    QDoubleSpinBox* mosaicX90_ = nullptr;
+    QDoubleSpinBox* mosaicZ_ = nullptr;
+    QDoubleSpinBox* mosaicOverlap_ = nullptr;
+    QDoubleSpinBox* mosaicDiameter_ = nullptr;
+    QDoubleSpinBox* mosaicAngle_ = nullptr;
+    QComboBox* mosaicX90Sign_ = nullptr;
+    QComboBox* mosaicZSign_ = nullptr;
+    QCheckBox* mosaicCalibrated_ = nullptr;
+    QSpinBox* mosaicSettle_ = nullptr;
+    QDoubleSpinBox* mosaicFlatMove_ = nullptr;
+    QSpinBox* mosaicFlatCount_ = nullptr;
+    QLabel* mosaicPlanLabel_ = nullptr;
+    QPushButton* mosaicTestButton_ = nullptr;
+    QPushButton* mosaicStitchButton_ = nullptr;
+    QLineEdit* mosaicManifestEdit_ = nullptr;
+    QLineEdit* mosaicOutputName_ = nullptr;
+    QLineEdit* mosaicTileReconName_ = nullptr;
+    QLineEdit* mosaicRegistration_ = nullptr;
+    QLineEdit* mosaicDarkPath_ = nullptr;
+    QCheckBox* mosaicDarkConfirmed_ = nullptr;
+    QString mosaicDarkSnapshot_;
+    QString mosaicAutoFusionManifest_;
+    QString mosaicAutoFusionOutput_;
+    QString mosaicAutoFusionTileRecon_;
+    QString mosaicAutoFusionRegistration_;
+    MosaicPlan mosaicPlan_;
+    QJsonObject mosaicRecord_;
+    QVector<QJsonObject> mosaicTileRecords_;
+    QString mosaicRoot_;
+    QString mosaicPendingAxis_;
+    QString mosaicPendingLabel_;
+    std::array<double, 3> mosaicOrigin_{};
+    double mosaicOriginY_ = 0;
+    int mosaicIndex_ = 0;
+    int mosaicPositionStage_ = 0;
+    int mosaicGeneration_ = 0;
+    bool mosaicRunning_ = false;
+    bool mosaicLaunchingTile_ = false;
+    bool mosaicMoveAccepted_ = false;
+    bool mosaicMoveActiveSeen_ = false;
+    qint64 mosaicPendingTargetPulse_ = 0;
+    bool mosaicVerifyingPosition_ = false;
+    bool mosaicRestoreLive_ = false;
+    AppConfig mosaicSnapshot_;
+    QProcess* mosaicProcess_ = nullptr;
     ReconstructionController controller_;
     QThread cameraThread_;
     PvcamCameraWorker* cameraWorker_ = nullptr;

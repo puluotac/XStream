@@ -153,7 +153,7 @@ AppConfig AppConfig::fromJsonObject(const QJsonObject& object)
         readValue(ctAcqObj, "BEGINNING_ANGLE_DEG", cfg.ctAcquisitionUi.beginningAngleDeg),
         -360.0,
         360.0);
-    cfg.ctAcquisitionUi.modeIndex = std::clamp(readValue(ctAcqObj, "MODE_INDEX", cfg.ctAcquisitionUi.modeIndex), 0, 2);
+    cfg.ctAcquisitionUi.modeIndex = std::clamp(readValue(ctAcqObj, "MODE_INDEX", cfg.ctAcquisitionUi.modeIndex), 0, 3);
     cfg.ctAcquisitionUi.savePath = readValue(ctAcqObj, "SAVE_PATH", cfg.ctAcquisitionUi.savePath);
     cfg.ctAcquisitionUi.projectionNum = std::clamp(readValue(ctAcqObj, "PROJECTION_NUM", cfg.ctAcquisitionUi.projectionNum), 1, 20000);
     const int legacyFlatGap = std::clamp(readValue(ctAcqObj, "FLAT_GAP", cfg.ctAcquisitionUi.stepFlatGap), 0, 20000);
@@ -167,6 +167,8 @@ AppConfig AppConfig::fromJsonObject(const QJsonObject& object)
     cfg.ctAcquisitionUi.flyLeadAngleDeg = std::clamp(readValue(ctAcqObj, "FLY_LEAD_ANGLE_DEG", cfg.ctAcquisitionUi.flyLeadAngleDeg), 0.0, 90.0);
     cfg.ctAcquisitionUi.rawFrameStride = std::clamp(readValue(ctAcqObj, "RAW_FRAME_STRIDE", cfg.ctAcquisitionUi.rawFrameStride), 1, 1000000);
     cfg.ctAcquisitionUi.tiffThreads = std::clamp(readValue(ctAcqObj, "TIFF_THREADS", cfg.ctAcquisitionUi.tiffThreads), 1, 16);
+
+    cfg.mosaic = MosaicConfig::fromJson(object.value("MOSAIC").toObject());
 
     const auto kohzuObj = object.value("KOHZU").toObject();
     cfg.kohzuUi.host = readValue(kohzuObj, "HOST", cfg.kohzuUi.host);
@@ -375,6 +377,7 @@ QJsonObject AppConfig::toJsonObject() const
     ctAcqObj["RAW_FRAME_STRIDE"] = ctAcquisitionUi.rawFrameStride;
     ctAcqObj["TIFF_THREADS"] = ctAcquisitionUi.tiffThreads;
     root["CT_ACQUISITION"] = ctAcqObj;
+    root["MOSAIC"] = mosaic.toJson();
 
     QJsonObject kohzuObj;
     kohzuObj["HOST"] = kohzuUi.host;

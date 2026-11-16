@@ -16,8 +16,9 @@
         "CMAKE_PREFIX_PATH": "E:/Qt/6.10.1/msvc2022_64;E:/OpenCV/build",
         "OpenCV_DIR": "E:/OpenCV/build",
         "CMAKE_CUDA_ARCHITECTURES": "native",
-        "CMAKE_CXX_FLAGS": "/utf-8",
-        "CMAKE_CUDA_FLAGS": "-Xcompiler=/utf-8"
+        "CT_MSVC_INCLUDE_PREFIX": "注意: 包含文件: ",
+        "CMAKE_CXX_FLAGS": "/utf-8 /EHsc",
+        "CMAKE_CUDA_FLAGS": "-Xcompiler=/utf-8 -Xcompiler=/EHsc"
       }
     },
     {

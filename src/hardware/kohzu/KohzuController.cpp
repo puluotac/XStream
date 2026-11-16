@@ -463,6 +463,20 @@ void KohzuController::configureSpeedTableAndMoveAbsolute(int axis, qint64 pulse,
     }
 }
 
+void KohzuController::verifyAxisPosition(int axis, qint64 target, qint64 tolerance, const QString& label)
+{
+    QString status, error;
+    qint64 position = 0;
+    const bool idle = isConnected() && waitForAxisIdle(axis, 5000, &status);
+    const bool read = idle && readAxis(axis, &position, &status, &error, 1500, true);
+    const bool ok = read && parseAxisMotionState(status) == AxisMotionState::Idle
+        && std::abs(position - target) <= std::max<qint64>(0, tolerance);
+    if (read) emit axisUpdated(axis, position, status);
+    emit commandFinished(label, ok, ok ? QStringLiteral("Idle and RDP target confirmed")
+        : QStringLiteral("Position verification failed: target=%1 read=%2 idle=%3 status=%4 error=%5")
+            .arg(target).arg(position).arg(idle).arg(status, error));
+}
+
 void KohzuController::recoverAfterInterruptedSession()
 {
     if (!isConnected())

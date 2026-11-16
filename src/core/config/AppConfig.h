@@ -1,5 +1,6 @@
 #pragma once
 
+#include "core/stitch/Mosaic.h"
 #include <QJsonObject>
 #include <QMap>
 #include <QString>
@@ -184,6 +185,7 @@ struct AppConfig
     CtFlyConfig ctFly;
     CameraUiConfig cameraUi;
     CtAcquisitionUiConfig ctAcquisitionUi;
+    MosaicConfig mosaic;
     KohzuUiConfig kohzuUi;
     IoConfig io;
     QMap<QString, MotorAxisConfig> motorAxes;
