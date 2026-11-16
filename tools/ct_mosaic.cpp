@@ -326,7 +326,7 @@ void makeProjections(QString root)
     cfg.geometry.volH = h;
     cfg.geometry.totalAngles = angles;
     cfg.io.reconMethod = ct::ReconMethod::OfflineFBP;
-    cfg.io.correctionMode = ct::CorrectionMode::FlatDark;
+    cfg.io.correctionMode = ct::CorrectionMode::Flat;
     cfg.io.saveDepth = ct::SaveDepth::Bit32;
     cfg.io.saveFormat = "tiff";
     cfg.io.filePrefix = "Slice";
@@ -386,8 +386,6 @@ void makeProjections(QString root)
         insist(
             ct::writeImageFile(QDir(dir).filePath("Flat_0000001.tif"), cv::Mat(h, w, CV_16U, cv::Scalar(50100)), &err),
             "Flat save failed");
-        insist(ct::writeImageFile(QDir(dir).filePath("Dark_0000001.tif"), cv::Mat(h, w, CV_16U, cv::Scalar(100)), &err),
-               "Dark save failed");
         json(QDir(dir).filePath("scan_manifest.json"), {{"COMPLETED", true},
                                                         {"ACQUISITION", QJsonObject{{"IMAGE_WIDTH", w},
                                                                                     {"IMAGE_HEIGHT", h},
@@ -403,7 +401,7 @@ void makeProjections(QString root)
                                                        {"IMAGE_HEIGHT", h},
                                                        {"CONFIG", mc.toJson()},
                                                        {"TILES", tiles}});
-    std::cout << "Synthetic raw projection fixture created: 2 tiles, 180 angles, flats and darks\n";
+    std::cout << "Synthetic raw projection fixture created: 2 tiles, 180 angles, flats (no dark files)\n";
 }
 } // namespace
 int main(int argc, char **argv)

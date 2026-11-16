@@ -4426,15 +4426,6 @@ void MainWindow::startCtAcquisition()
         }
     }
 
-    if (mosaicRunning_ && !mosaicDarkSnapshot_.isEmpty())
-    {
-        const QString destination = QDir(savePath).filePath(QStringLiteral("Dark_0000001.tif"));
-        if (!QFile::copy(mosaicDarkSnapshot_, destination))
-        {
-            appendLog(QStringLiteral("Mosaic tile dark copy failed."));
-            return;
-        }
-    }
     ctRestoreLiveAfterFinish_ = cameraLiveRunning_;
     if (cameraLiveRunning_)
     {

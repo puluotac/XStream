@@ -196,9 +196,6 @@ private:
     QLineEdit* mosaicOutputName_ = nullptr;
     QLineEdit* mosaicTileReconName_ = nullptr;
     QLineEdit* mosaicRegistration_ = nullptr;
-    QLineEdit* mosaicDarkPath_ = nullptr;
-    QCheckBox* mosaicDarkConfirmed_ = nullptr;
-    QString mosaicDarkSnapshot_;
     QString mosaicAutoFusionManifest_;
     QString mosaicAutoFusionOutput_;
     QString mosaicAutoFusionTileRecon_;

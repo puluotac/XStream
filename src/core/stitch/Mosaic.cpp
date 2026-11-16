@@ -124,7 +124,6 @@ QJsonObject MosaicConfig::toJson() const
             {"SETTLE_MS", settleMs},
             {"FLAT_MOVE_UM", flatMoveUm},
             {"FLAT_COUNT", flatCount},
-            {"DARK_PATH", darkPath},
             {"CALIBRATED", calibrated},
             {"MOTOR_TO_RECON_DEG", motorToReconDeg},
             {"X90_SIGN", x90Sign},
@@ -151,7 +150,6 @@ MosaicConfig MosaicConfig::fromJson(const QJsonObject &o)
 #undef D
     c.settleMs = o.value("SETTLE_MS").toInt(c.settleMs);
     c.flatCount = o.value("FLAT_COUNT").toInt(c.flatCount);
-    c.darkPath = o.value("DARK_PATH").toString();
     c.calibrated = o.value("CALIBRATED").toBool(false);
     c.x90Sign = o.value("X90_SIGN").toInt(c.x90Sign);
     c.zSign = o.value("Z_SIGN").toInt(c.zSign);

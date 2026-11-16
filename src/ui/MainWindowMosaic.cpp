@@ -83,7 +83,7 @@ QWidget *MainWindow::createMosaicPage()
     mosaicCalibrated_ = new QCheckBox("Axis mapping calibrated", page);
     mosaicFlatMove_ = real(-150000, 150000, 2, 0);
     mosaicFlatCount_ = new QSpinBox(page);
-    mosaicFlatCount_->setRange(0, 10000);
+    mosaicFlatCount_->setRange(1, 10000);
     mosaicFlatCount_->setValue(10);
     mosaicFlatCount_->setButtonSymbols(QAbstractSpinBox::NoButtons);
     form->addRow(new QLabel("Local step CT: X0 / X90 / Z", page));
@@ -96,22 +96,6 @@ QWidget *MainWindow::createMosaicPage()
     form->addRow("Settle ms", mosaicSettle_);
     form->addRow("Flat move Y um", mosaicFlatMove_);
     form->addRow("Flats per group", mosaicFlatCount_);
-    mosaicDarkPath_ = new QLineEdit(page);
-    mosaicDarkConfirmed_ = new QCheckBox("Dark matches exposure, ROI and readout", page);
-    connect(mosaicDarkPath_, &QLineEdit::textChanged, this, [this]() { mosaicDarkConfirmed_->setChecked(false); });
-    auto *darkBrowse = new QPushButton("Select measured dark TIFF", page);
-    connect(darkBrowse, &QPushButton::clicked, this, [this]() {
-        auto path = QFileDialog::getOpenFileName(this, "Measured dark (single frame or averaged image)", {},
-                                                 "TIFF (*.tif *.tiff)");
-        if (!path.isEmpty())
-        {
-            mosaicDarkPath_->setText(path);
-            mosaicDarkConfirmed_->setChecked(false);
-        }
-    });
-    form->addRow(darkBrowse);
-    form->addRow("Dark reference", mosaicDarkPath_);
-    form->addRow(mosaicDarkConfirmed_);
     form->addRow("X0 to recon XY deg", mosaicAngle_);
     form->addRow("X90 handedness", mosaicX90Sign_);
     form->addRow("Z image direction", mosaicZSign_);
@@ -120,8 +104,8 @@ QWidget *MainWindow::createMosaicPage()
     mosaicPlanLabel_->setWordWrap(true);
     form->addRow(mosaicPlanLabel_);
     auto *note = new QLabel("Align sample centre before Start. A new tile is acquired only after R, X0, X90 and Z "
-                            "positioning completes. Uses Step flats and 180-degree projections. No automatic dark "
-                            "shutter is configured; dark correction requires measured dark data.",
+                            "positioning completes. Uses step flats and 180-degree projections. Mosaic uses flat-only "
+                            "correction; dark frames are not acquired or required.",
                             page);
     note->setWordWrap(true);
     form->addRow(note);
@@ -168,13 +152,6 @@ QWidget *MainWindow::createMosaicPage()
         });
     for (auto *s : {cameraRoiWidthSpin_, cameraRoiHeightSpin_})
         connect(s, qOverload<int>(&QSpinBox::valueChanged), this, [this]() { updateMosaicPlan(); });
-    for (auto *s : {cameraRoiWidthSpin_, cameraRoiHeightSpin_, cameraRoiXSpin_, cameraRoiYSpin_})
-        connect(s, qOverload<int>(&QSpinBox::valueChanged), this,
-                [this]() { mosaicDarkConfirmed_->setChecked(false); });
-    connect(cameraExposureSpin_, qOverload<double>(&QDoubleSpinBox::valueChanged), this,
-            [this]() { mosaicDarkConfirmed_->setChecked(false); });
-    connect(cameraExposureUnitCombo_, qOverload<int>(&QComboBox::currentIndexChanged), this,
-            [this]() { mosaicDarkConfirmed_->setChecked(false); });
     connect(ctProjectionNumSpin_, qOverload<int>(&QSpinBox::valueChanged), this, [this]() { updateMosaicPlan(); });
     connect(mosaicFlatCount_, qOverload<int>(&QSpinBox::valueChanged), this, [this]() { updateMosaicPlan(); });
     auto *scroll = new QScrollArea(ctModeTabs_);
@@ -200,7 +177,6 @@ MosaicConfig MainWindow::mosaicConfigFromUi() const
     c.settleMs = mosaicSettle_->value();
     c.flatMoveUm = mosaicFlatMove_->value();
     c.flatCount = mosaicFlatCount_->value();
-    c.darkPath = mosaicDarkPath_->text();
     c.calibrated = mosaicCalibrated_->isChecked();
     c.motorToReconDeg = mosaicAngle_->value();
     c.x90Sign = mosaicX90Sign_->currentText().toInt();
@@ -218,8 +194,6 @@ void MainWindow::applyMosaicConfig(const MosaicConfig &c)
     mosaicSettle_->setValue(c.settleMs);
     mosaicFlatMove_->setValue(c.flatMoveUm);
     mosaicFlatCount_->setValue(c.flatCount);
-    mosaicDarkPath_->setText(c.darkPath);
-    mosaicDarkConfirmed_->setChecked(false);
     mosaicAngle_->setValue(c.motorToReconDeg);
     mosaicX90Sign_->setCurrentIndex(c.x90Sign == 1 ? 0 : 1);
     mosaicZSign_->setCurrentIndex(c.zSign == -1 ? 0 : 1);
@@ -336,23 +310,12 @@ void MainWindow::startMosaicAcquisition()
         double flat = y.currentValue + mosaicFlatMove_->value();
         if (mosaicFlatCount_->value() > 0 && (flat < y.softMin || flat > y.softMax || mosaicFlatMove_->value() == 0))
             throw std::runtime_error("Configure a non-zero, in-range flat Y movement.");
-        mosaicDarkSnapshot_ = mosaicDarkPath_->text().trimmed();
-        if (!mosaicDarkSnapshot_.isEmpty())
-        {
-            auto dark = readImageFile(mosaicDarkSnapshot_);
-            if (dark.empty() || dark.channels() != 1 || dark.cols != mosaicPlan_.width ||
-                dark.rows != mosaicPlan_.height || !mosaicDarkConfirmed_->isChecked())
-                throw std::runtime_error("Dark reference dimensions or exposure/ROI confirmation is missing.");
-        }
-        else if (configFromUi().io.correctionMode == CorrectionMode::FlatDark)
-            throw std::runtime_error("Flat-Dark correction requires a measured matching dark TIFF.");
         mosaicSnapshot_ = configFromUi();
         mosaicSnapshot_.io.saveDepth = SaveDepth::Bit32;
         mosaicSnapshot_.io.saveFormat = "tiff";
-        if (mosaicFlatCount_->value() == 0 && mosaicSnapshot_.io.correctionMode != CorrectionMode::None)
-            throw std::runtime_error("Flat correction requires Flats per group greater than zero.");
-        if (!mosaicDarkSnapshot_.isEmpty())
-            mosaicSnapshot_.io.correctionMode = CorrectionMode::FlatDark;
+        if (mosaicFlatCount_->value() <= 0)
+            throw std::runtime_error("Mosaic requires at least one flat-field frame per tile.");
+        mosaicSnapshot_.io.correctionMode = CorrectionMode::Flat;
         mosaicSnapshot_.phase.pixelSizeUm = float(mosaicPlan_.config.pixelUm);
         if (mosaicSnapshot_.io.reconMethod == ReconMethod::RealTimeFBP)
             mosaicSnapshot_.io.reconMethod = ReconMethod::OfflineFBP;
@@ -369,20 +332,6 @@ void MainWindow::startMosaicAcquisition()
         mosaicRecord_["ORIGIN_CONTROLLER_UM"] = QJsonArray{mosaicOrigin_[0], mosaicOrigin_[1], mosaicOrigin_[2]};
         if (!QDir().mkpath(mosaicRoot_))
             throw std::runtime_error("Cannot create mosaic directory.");
-        if (!mosaicDarkSnapshot_.isEmpty())
-        {
-            QString destination = QDir(mosaicRoot_).filePath("measured_dark.tif");
-            if (!QFile::copy(mosaicDarkSnapshot_, destination))
-                throw std::runtime_error("Could not snapshot dark reference.");
-            mosaicDarkSnapshot_ = destination;
-            QFile file(destination);
-            if (!file.open(QIODevice::ReadOnly))
-                throw std::runtime_error("Cannot read dark snapshot for checksum.");
-            mosaicRecord_["DARK_SHA256"] =
-                QString::fromLatin1(QCryptographicHash::hash(file.readAll(), QCryptographicHash::Sha256).toHex());
-            mosaicRecord_["DARK_REFERENCE"] = "measured_dark.tif";
-            mosaicRecord_["DARK_MATCH_CONFIRMED"] = true;
-        }
         mosaicAutoFusionManifest_ = QDir(mosaicRoot_).filePath("mosaic_manifest.json");
         mosaicAutoFusionOutput_ = "MosaicRecon";
         mosaicAutoFusionTileRecon_ = "Recon";
@@ -723,6 +672,7 @@ void MainWindow::queueMosaicReconstruction()
             AppConfig cfg = configFromUi();
             cfg.io.saveDepth = SaveDepth::Bit32;
             cfg.io.saveFormat = "tiff";
+            cfg.io.correctionMode = CorrectionMode::Flat;
             cfg.phase.pixelSizeUm = float(config.pixelUm);
             cfg.geometry.corAuto = true;
             cfg.geometry.corShift = 0;

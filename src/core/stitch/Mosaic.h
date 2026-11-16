@@ -23,7 +23,6 @@ struct MosaicConfig
     int settleMs = 300;
     double flatMoveUm = 0;
     int flatCount = 10;
-    QString darkPath;
     // Mapping from positive MOTOR motion to object coordinates in reconstructed
     // slices at R=0. Must be calibrated on the beamline before acquisition.
     bool calibrated = false;
